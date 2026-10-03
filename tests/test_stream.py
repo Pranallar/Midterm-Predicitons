@@ -781,10 +781,6 @@ class TestResync:
         await s._resync(MID)
         assert [(t.data["id"], t.data["exchangeId"]) for t in of_kind(events, "trade")] == [("70", "37")]
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="BUG: _resync pops the pending reasons before the REST read; on failure a gap's resync/backfill is dropped for good",
-    )
     @async_test
     async def test_failed_gap_resync_is_not_forgotten(self, client, fake):
         fake.add("GET", OB_PATH, OB_36, (404, error_body("NOT_FOUND", "transient")), OB_36)
@@ -879,7 +875,8 @@ class TestTimers:
 
     @async_test
     async def test_failed_token_refresh_retries_later(self, client, fake):
-        fake.add("POST", "/realtime/token", (403, error_body("FORBIDDEN")))
+        fake.add("POST", "/realtime/token", (503, error_body("SERVICE_UNAVAILABLE")))
+        client.max_retries = 0
         rt = FakeRealtime("http://rt.invalid", "anon", log=[])
         s, events = make_stream(client, token_refresh_margin=600)
         s._rt = rt
@@ -1062,10 +1059,6 @@ class TestRunWithFakeRealtime:
         assert len(factory.instances) == 1
         assert "reconnecting" not in statuses(events)
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="BUG: a failed reconnect leaves _rt None, and _timers only checks liveness when _rt is set, so it never retries",
-    )
     @async_test
     async def test_failed_reconnect_is_retried(self, client, fake):
         fake.add("POST", "/realtime/token", token_body("https://rt.example.test"))
@@ -1309,3 +1302,76 @@ class TestRealWebsocket:
             assert fake.calls_to(OB_PATH) == []
             s.stop()
             await asyncio.wait_for(task, 2)
+
+
+
+class TestReviewFixes:
+    @async_test
+    async def test_refused_token_refresh_is_fatal(self, client, fake):
+        fake.add("POST", "/realtime/token", (401, error_body("API_KEY_REVOKED", "revoked")))
+        s, events = make_stream(client)
+        s._rt = FakeRealtime("http://rt.invalid", "anon", log=[])
+        await s._refresh_token()
+        assert s._fatal is not None and s._fatal.code == "API_KEY_REVOKED"
+        assert s._stop_requested
+        assert "fatal" in statuses(events)
+
+    @async_test
+    async def test_token_refresh_updates_rejoin_payloads(self, client, fake):
+        fake.add("POST", "/realtime/token", token_body("https://rt.example.test"))
+
+        class Push:
+            def __init__(self):
+                self.payload = {"access_token": "old"}
+
+            def update_payload(self, p):
+                self.payload = {**self.payload, **p}
+
+        rt = FakeRealtime("http://rt.invalid", "anon", log=[])
+        ch = type("Ch", (), {})()
+        ch.join_push = Push()
+        rt.channels = {"realtime:x": ch}
+        s, _ = make_stream(client)
+        s._rt = rt
+        await s._refresh_token()
+        assert ch.join_push.payload["access_token"] == "jwt-token"
+
+    @async_test
+    async def test_backfill_pages_until_known_trades(self, client, fake):
+        fake.add("GET", OB_PATH, OB_36)
+        page1 = {**tape("36", [rest_trade("9", 0.5, 1), rest_trade("8", 0.5, 1)]), "pagination": {"limit": 200, "hasMore": True, "nextCursor": "c2"}}
+        page2 = {**tape("36", [rest_trade("7", 0.5, 1)]), "pagination": {"limit": 200, "hasMore": False, "nextCursor": None}}
+        fake.add("GET", TAPE_36, page1, page2)
+        s, events = make_stream(client)
+        s.request_resync(MID, "gap")
+        await s._resync(MID)
+        assert [t.data["id"] for t in of_kind(events, "trade")] == ["7", "8", "9"]
+        calls = fake.calls_to(TAPE_36)
+        assert len(calls) == 2 and calls[1].params.get("cursor") == "c2"
+
+    @async_test
+    async def test_book_dirty_bursts_are_coalesced(self, client, fake):
+        fake.add("GET", OB_PATH, OB_36)
+        s, _ = make_stream(client, min_dirty_interval=10.0)
+        worker = asyncio.create_task(s._rest_worker())
+        s.request_resync(MID, "book_dirty")
+        await s._dispatch(*s._queue.get_nowait())
+        await until(lambda: len(fake.calls_to(OB_PATH)) == 1, what="first refetch")
+        for _ in range(5):
+            s.request_resync(MID, "book_dirty")
+            while not s._queue.empty():
+                await s._dispatch(*s._queue.get_nowait())
+        await asyncio.sleep(0.1)
+        assert len(fake.calls_to(OB_PATH)) == 1  # held back until the interval passes
+        s.stop()
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+
+    def test_construct_outside_loop_then_run(self, client, fake):
+        fake.add("POST", "/realtime/token", token_body("https://rt.example.test"))
+        fake.add("GET", OB_PATH, OB_36)
+        factory = FakeFactory()
+        s, _ = make_stream(client, realtime_factory=factory)  # built outside any loop (as the CLI used to)
+        asyncio.run(asyncio.wait_for(s.run(duration=0.2), 3))
+        assert factory.instances[0].closed
+        assert not client.cancelled  # the shared client is usable again after shutdown

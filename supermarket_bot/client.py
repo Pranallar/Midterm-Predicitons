@@ -31,7 +31,7 @@ import httpx
 
 from . import __version__
 from .config import DEFAULT_BASE_URL, DEFAULT_READS_PER_MIN, DEFAULT_WRITES_PER_MIN, Settings
-from .errors import ApiError, NetworkError, RequestCancelled
+from .errors import ApiError, InvalidPathParam, NetworkError, RequestCancelled
 from .ratelimit import SlidingWindowLimiter
 
 log = logging.getLogger("supermarket_bot")
@@ -48,10 +48,10 @@ def _seg(value: Id) -> str:
     """Quote one path segment (IDs and slugs)."""
     text = str(value).strip()
     if not text:
-        raise ValueError("path parameter must not be empty")
+        raise InvalidPathParam("path parameter must not be empty")
     if text in (".", ".."):
-        # httpx would normalise these away and silently hit a different endpoint
-        raise ValueError(f"invalid path parameter {text!r}")
+        # httpx (and servers) would normalise these away and hit a different endpoint
+        raise InvalidPathParam(f"invalid path parameter {text!r}")
     return quote(text, safe="")
 
 

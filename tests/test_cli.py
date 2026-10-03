@@ -505,7 +505,7 @@ def test_markets_limit_follows_cursor_across_pages(run, cup, fake):
     code, out = run("-t", TOURNAMENT_SLUG, "--json", "markets", "--limit", "2")
     assert code == 0
     assert [m["id"] for m in json.loads(out)] == ["1", "2"]
-    assert "Pokémon odds" in out  # JSON is written unescaped (ensure_ascii=False)
+    assert "Pok\\u00e9mon odds" in out and json.loads(out)[0]["title"] == "Pokémon odds"  # ASCII-escaped, lossless
     calls = fake.calls_to(T_MARKETS)
     assert "cursor" not in calls[0].params and calls[1].params["cursor"] == "c2"
 

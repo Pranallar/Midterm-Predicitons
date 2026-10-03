@@ -141,7 +141,8 @@ class App:
         print(text, file=self.out, flush=True)
 
     def dump(self, data: Any) -> None:
-        self.print(json.dumps(data, indent=2, ensure_ascii=False, default=str))
+        # ASCII-escaped so no character is lost on a cp1252 console or pipe
+        self.print(json.dumps(data, indent=2, ensure_ascii=True, default=str))
 
     @property
     def context(self) -> Context:
@@ -510,11 +511,16 @@ class App:
             elif event.kind != "status" or self.args.verbose:
                 self.print(describe_event(event))
 
-        stream = MarketStream(self.client, ctx, market_ids, on_event=on_event, resync_interval=interval, log_path=log_path)
         if not self.args.json:
             self.header()
             self.print(f"Streaming {len(market_ids)} market(s); REST resync every {interval:.0f}s. Ctrl-C to stop.")
-        asyncio.run(stream.run(self.args.duration))
+
+        async def run_stream() -> None:
+            # Built inside the running loop so asyncio objects bind to it (Python 3.9).
+            stream = MarketStream(self.client, ctx, market_ids, on_event=on_event, resync_interval=interval, log_path=log_path)
+            await stream.run(self.args.duration)
+
+        asyncio.run(run_stream())
 
 
 def _tree_lines(node: Dict[str, Any], depth: int = 0) -> List[str]:
@@ -533,8 +539,11 @@ def configure_logging(verbosity: int) -> None:
     level = logging.WARNING if verbosity <= 0 else logging.INFO if verbosity == 1 else logging.DEBUG
     logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(name)s: %(message)s", stream=sys.stderr)
     if verbosity < 2:
-        for noisy in ("httpx", "httpcore", "realtime", "websockets"):
+        for noisy in ("httpx", "httpcore"):
             logging.getLogger(noisy).setLevel(logging.WARNING)
+    # realtime-py logs every frame at DEBUG, including the access token; only -vvv shows them.
+    for chatty in ("realtime", "websockets"):
+        logging.getLogger(chatty).setLevel(logging.DEBUG if verbosity >= 3 else logging.WARNING)
 
 
 def _safe_console() -> None:

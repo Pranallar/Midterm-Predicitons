@@ -50,10 +50,21 @@ def parse_env_file(text: str) -> Dict[str, str]:
 
 
 def load_env_file(path: Path) -> Dict[str, str]:
+    """Read a ``.env`` file. Handles UTF-8 with or without BOM and UTF-16 (Windows Notepad)."""
     try:
-        return parse_env_file(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
+        raw = path.read_bytes()
+    except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
         return {}
+    except PermissionError as exc:
+        raise ConfigError(f"cannot read {path}: {exc}") from exc
+    try:
+        if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+            text = raw.decode("utf-16")
+        else:
+            text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise ConfigError(f"{path} is not UTF-8 text; re-save it as UTF-8") from exc
+    return parse_env_file(text)
 
 
 def _int(value: Optional[str], default: int, name: str) -> int:

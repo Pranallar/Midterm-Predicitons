@@ -42,6 +42,10 @@ class NetworkError(SuperMarketError):
     """The request never got an HTTP response (DNS, TLS, timeout, connection reset)."""
 
 
+class InvalidPathParam(SuperMarketError, ValueError):
+    """A path parameter (ID or slug) is empty or a dot segment that would change the URL."""
+
+
 class RequestCancelled(SuperMarketError):
     """The client was cancelled (shutdown) while a request was waiting or retrying."""
 

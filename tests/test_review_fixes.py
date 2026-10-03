@@ -159,3 +159,30 @@ def test_cli_survives_cp1252_output(fake, monkeypatch, tmp_path) -> None:
     out.flush()
     assert code == 0
     assert b"Exchange 36" in raw.getvalue()
+
+
+def test_env_file_with_utf8_bom_and_utf16(tmp_path: Path) -> None:
+    from supermarket_bot.config import load_env_file
+
+    bom = tmp_path / "bom.env"
+    bom.write_bytes(b"\xef\xbb\xbfSUPERMARKET_API_KEY=ace_bom_key\n")
+    assert load_env_file(bom) == {"SUPERMARKET_API_KEY": "ace_bom_key"}
+    utf16 = tmp_path / "u16.env"
+    utf16.write_bytes("SUPERMARKET_API_KEY=ace_u16_key\r\n".encode("utf-16"))
+    assert load_env_file(utf16) == {"SUPERMARKET_API_KEY": "ace_u16_key"}
+    bad = tmp_path / "bad.env"
+    bad.write_bytes(b"SUPERMARKET_API_KEY=\xff\xff\xfe")
+    with pytest.raises(ConfigError, match="not UTF-8"):
+        load_env_file(bad)
+
+
+def test_realtime_frames_hidden_below_vvv() -> None:
+    import logging
+
+    from supermarket_bot.cli import configure_logging
+
+    configure_logging(2)
+    assert logging.getLogger("realtime").getEffectiveLevel() >= logging.WARNING
+    configure_logging(3)
+    assert logging.getLogger("realtime").getEffectiveLevel() == logging.DEBUG
+    configure_logging(0)

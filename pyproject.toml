@@ -11,8 +11,8 @@ requires-python = ">=3.9"
 dependencies = ["httpx>=0.25"]
 
 [project.optional-dependencies]
-realtime = ["realtime>=2.0"]
-dev = ["pytest>=7", "websockets>=12", "realtime>=2.0"]
+realtime = ["realtime>=2.4,<3"]
+dev = ["pytest>=7", "websockets>=12", "realtime>=2.4,<3"]
 
 [project.scripts]
 supermarket-bot = "supermarket_bot.cli:main"

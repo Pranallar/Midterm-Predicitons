@@ -24,6 +24,8 @@ import asyncio
 import enum
 import json
 import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -32,7 +34,8 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, 
 from .books import Book, BookStore, Level, books_from_market_orderbook, format_level, parse_time
 from .bot import Context, iso
 from .client import SuperMarketClient
-from .errors import SuperMarketError
+from .errors import ApiError, RequestCancelled, SuperMarketError
+from .ratelimit import SlidingWindowLimiter
 
 log = logging.getLogger("supermarket_bot")
 
@@ -120,7 +123,12 @@ def safe_resync_interval(markets: int, reads_per_min: int, requested: float = 90
 
 
 class MarketStream:
-    """Subscribe to live market batches for a set of markets and keep books current."""
+    """Subscribe to live market batches for a set of markets and keep books current.
+
+    Broadcasts are handled on the event loop as they arrive; REST resyncs and trade
+    backfills run in a separate worker so a slow or rate-limited REST read never delays
+    the live feed. REST reads share ``rest_share`` of the client's read budget.
+    """
 
     def __init__(
         self,
@@ -137,6 +145,10 @@ class MarketStream:
         realtime_factory: RealtimeFactory = default_realtime_factory,
         tick: float = 1.0,
         reconnect_after: float = 30.0,
+        rest_share: float = 0.5,
+        min_dirty_interval: float = 5.0,
+        max_backfill_pages: int = 5,
+        cancel_client_on_exit: bool = True,
     ) -> None:
         if not market_ids:
             raise ValueError("at least one market id is required")
@@ -152,37 +164,91 @@ class MarketStream:
         self.realtime_factory = realtime_factory
         self.tick = tick
         self.reconnect_after = reconnect_after
+        self.min_dirty_interval = min_dirty_interval
+        self.max_backfill_pages = max_backfill_pages
+        self.cancel_client_on_exit = cancel_client_on_exit
 
         self.books = BookStore()
         self.trackers: Dict[str, RevisionTracker] = {m: RevisionTracker() for m in self.market_ids}
         self.seen_trades: Dict[str, None] = {}
+        self.last_trade_ts: Dict[str, float] = {}
         self.market_exchanges: Dict[str, List[str]] = {}
         self.exchange_market: Dict[str, str] = {}
         self.next_periodic: Dict[str, float] = {}
+        self.last_rest: Dict[str, float] = {}
         self.started_at = datetime.now(timezone.utc)
         self.resyncs = 0
         self.batches = 0
 
-        self._queue: "asyncio.Queue[Tuple[str, Any]]" = asyncio.Queue()
         self._pending: Dict[str, Set[str]] = {}
+        self._retry_delay: Dict[str, float] = {}
         self._subscribed_once: Set[str] = set()
         self._rt: Any = None
         self._token: Optional[Dict[str, Any]] = None
         self._token_expires: Optional[datetime] = None
+        self._want_connected = False
         self._down_since: Optional[float] = None
-        self._stop = asyncio.Event()
+        self._channel_error = False
+        self._reconnect_failures = 0
+        self._reconnect_pending = False
+        self._fatal: Optional[BaseException] = None
+        # asyncio objects are created lazily inside the running loop (Python 3.9 binds
+        # them to the loop current at construction time).
+        self._queue_obj: Optional["asyncio.Queue[Tuple[str, Any]]"] = None
+        self._rest_queue_obj: Optional["asyncio.Queue[str]"] = None
+        self._stop_obj: Optional[asyncio.Event] = None
+        self._stop_requested = False
+        self._executor: Optional[ThreadPoolExecutor] = None
+        self._shutdown = threading.Event()
+        share = max(1, int(getattr(client.read_limiter, "limit", 90) * rest_share))
+        self._rest_limiter = SlidingWindowLimiter(share, sleep=self._interruptible_sleep)
 
     # ------------------------------------------------------------ helpers
 
-    async def _call(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
-        """Run a blocking REST call (which may wait on the rate limiter) off the loop."""
-        return await asyncio.to_thread(fn, *args, **kwargs)
+    @property
+    def _queue(self) -> "asyncio.Queue[Tuple[str, Any]]":
+        if self._queue_obj is None:
+            self._queue_obj = asyncio.Queue()
+        return self._queue_obj
+
+    @property
+    def _rest_queue(self) -> "asyncio.Queue[str]":
+        if self._rest_queue_obj is None:
+            self._rest_queue_obj = asyncio.Queue()
+        return self._rest_queue_obj
+
+    @property
+    def _stop(self) -> asyncio.Event:
+        if self._stop_obj is None:
+            self._stop_obj = asyncio.Event()
+            if self._stop_requested:
+                self._stop_obj.set()
+        return self._stop_obj
+
+    def _interruptible_sleep(self, seconds: float) -> None:
+        if self._shutdown.wait(max(0.0, seconds)):
+            raise RequestCancelled("stream is shutting down")
+
+    async def _call(self, fn: Callable[..., Any], *args: Any, _budget: bool = True, **kwargs: Any) -> Any:
+        """Run a blocking REST call off the loop, inside the stream's share of the read budget."""
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="supermarket-stream")
+
+        def call() -> Any:
+            if _budget:
+                self._rest_limiter.acquire()
+            return fn(*args, **kwargs)
+
+        return await asyncio.get_running_loop().run_in_executor(self._executor, call)
 
     def _emit(self, event: StreamEvent) -> None:
         if self.log_path is not None:
-            self.log_path.parent.mkdir(parents=True, exist_ok=True)
-            with self.log_path.open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps(event.to_json(), separators=(",", ":"), default=str) + "\n")
+            try:
+                self.log_path.parent.mkdir(parents=True, exist_ok=True)
+                with self.log_path.open("a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(event.to_json(), separators=(",", ":"), default=str) + "\n")
+            except OSError as exc:  # a locked/full log must not kill the stream
+                log.warning("could not write stream log: %s", exc)
         if self.on_event is not None:
             try:
                 self.on_event(event)
@@ -190,7 +256,9 @@ class MarketStream:
                 log.exception("on_event handler failed")
 
     def stop(self) -> None:
-        self._stop.set()
+        self._stop_requested = True
+        if self._stop_obj is not None:
+            self._stop_obj.set()
 
     def request_resync(self, market_id: str, reason: str) -> None:
         """Queue one REST resync per market; reasons accumulate while it is pending."""
@@ -201,10 +269,14 @@ class MarketStream:
         else:
             reasons.add(reason)
 
+    def _requeue(self, market_id: str) -> None:
+        if not self._stop_requested and market_id in self._pending:
+            self._queue.put_nowait(("resync", market_id))
+
     # ------------------------------------------------------------ connection
 
     async def _mint_token(self) -> Dict[str, Any]:
-        token = await self._call(self.client.mint_realtime_token)
+        token = await self._call(self.client.mint_realtime_token, _budget=False)
         self._token = token
         expires = parse_time(token.get("expiresAt"))
         self._token_expires = expires or (datetime.now(timezone.utc) + timedelta(hours=3))
@@ -213,13 +285,22 @@ class MarketStream:
     async def _connect(self) -> None:
         token = self._token or await self._mint_token()
         rt = self.realtime_factory(token["supabaseUrl"], token["anonKey"])
-        await rt.connect()
-        # Authorize before subscribing: tournament channels need the minted token.
-        await rt.set_auth(token["token"])
-        self._rt = rt
-        self._down_since = None
-        for market_id in self.market_ids:
-            await self._subscribe(rt, market_id)
+        try:
+            await rt.connect()
+            # Authorize before subscribing: tournament channels need the minted token.
+            await rt.set_auth(token["token"])
+            self._rt = rt
+            self._down_since = None
+            self._channel_error = False
+            for market_id in self.market_ids:
+                await self._subscribe(rt, market_id)
+        except BaseException:
+            self._rt = None
+            try:
+                await rt.close()
+            except Exception:  # pragma: no cover - best effort
+                log.debug("closing a half-built realtime client failed", exc_info=True)
+            raise
 
     async def _subscribe(self, rt: Any, market_id: str) -> None:
         topic = topic_for(self.context, market_id)
@@ -238,11 +319,27 @@ class MarketStream:
                 # Fires on the first join and again on every rejoin (reconnect/socket error).
                 first = market_id not in self._subscribed_once
                 self._subscribed_once.add(market_id)
+                self._reconnect_failures = 0
                 self.request_resync(market_id, "subscribed" if first else "resubscribed")
             else:
                 log.warning("channel %s: %s %s", topic, name, error or "")
+                if name == "CHANNEL_ERROR":
+                    # A refused join is never retried by the library: rebuild the connection
+                    # (with a fresh token) after the reconnect back-off.
+                    self._channel_error = True
+                    self._reconnect_failures += 1
 
         await channel.subscribe(on_state)
+
+    def _update_join_tokens(self, token: str) -> None:
+        """Make library rejoins carry the current token (realtime-py keeps the join payload)."""
+        channels = getattr(self._rt, "channels", None)
+        if not isinstance(channels, Mapping):
+            return
+        for channel in list(channels.values()):
+            push = getattr(channel, "join_push", None)
+            if push is not None and hasattr(push, "update_payload"):
+                push.update_payload({"access_token": token})
 
     async def _close_realtime(self) -> None:
         rt, self._rt = self._rt, None
@@ -255,10 +352,13 @@ class MarketStream:
 
     def _socket_alive(self) -> bool:
         rt = self._rt
-        if rt is None or not getattr(rt, "is_connected", False):
+        if rt is None or self._channel_error or not getattr(rt, "is_connected", False):
             return False
         task = getattr(rt, "_listen_task", None)  # realtime-py exposes no public liveness flag
         return not (task is not None and task.done())
+
+    def _reconnect_delay(self) -> float:
+        return min(300.0, self.reconnect_after * (2 ** min(self._reconnect_failures, 6)))
 
     # ------------------------------------------------------------ REST resync
 
@@ -268,9 +368,18 @@ class MarketStream:
             resp = await self._call(
                 self.client.get_market_orderbook, market_id, tournament_id=self.context.tournament_id, depth=self.depth
             )
+        except RequestCancelled:
+            return
         except SuperMarketError as exc:
             log.warning("resync of market %s failed: %s", market_id, exc)
+            # Keep the reasons (a gap still needs its backfill) and retry with back-off.
+            self._pending.setdefault(market_id, set()).update(reasons)
+            delay = min(120.0, max(2.0, self._retry_delay.get(market_id, 1.0) * 2))
+            self._retry_delay[market_id] = delay
+            asyncio.get_running_loop().call_later(delay, self._requeue, market_id)
             return
+        self._retry_delay.pop(market_id, None)
+        self.last_rest[market_id] = asyncio.get_running_loop().time()
         self.resyncs += 1
         books, _ = books_from_market_orderbook(resp, self.context.tournament_id, market_id=market_id)
         self.market_exchanges[market_id] = [b.exchange_id for b in books]
@@ -285,20 +394,36 @@ class MarketStream:
             await self._backfill(market_id)
 
     async def _backfill(self, market_id: str) -> None:
-        """Emit trades from the REST tape since the stream started that we have not seen."""
+        """Emit trades from the REST tape that the stream has not seen.
+
+        Pages newest-first from just before the last trade we saw (or the stream start),
+        stopping once a page holds only known trades, with a page cap per exchange.
+        """
+        floor = self.started_at.timestamp()
         for exchange_id in self.market_exchanges.get(market_id, []):
+            last = self.last_trade_ts.get(exchange_id)
+            since = max(floor, last - 60.0) if last is not None else floor
+            collected: List[Mapping[str, Any]] = []
+            cursor: Optional[str] = None
             try:
-                page = await self._call(
-                    self.client.get_trades,
-                    exchange_id,
-                    tournament_id=self.context.tournament_id,
-                    start=iso(self.started_at),
-                    limit=200,
-                )
+                for _ in range(max(1, self.max_backfill_pages)):
+                    kwargs: Dict[str, Any] = {"tournament_id": self.context.tournament_id, "start": iso(datetime.fromtimestamp(since, timezone.utc)), "limit": 200}
+                    if cursor:
+                        kwargs["cursor"] = cursor
+                    page = await self._call(self.client.get_trades, exchange_id, **kwargs)
+                    data = [t for t in page.get("data") or [] if isinstance(t, Mapping)]
+                    collected.extend(data)
+                    pagination = page.get("pagination") or {}
+                    cursor = pagination.get("nextCursor")
+                    if not pagination.get("hasMore") or not cursor:
+                        break
+                    if data and all(str(t.get("id")) in self.seen_trades for t in data):
+                        break
+            except RequestCancelled:
+                return
             except SuperMarketError as exc:
                 log.warning("trade backfill for exchange %s failed: %s", exchange_id, exc)
-                continue
-            for trade in reversed(page.get("data") or []):  # tape is newest first
+            for trade in reversed(collected):  # the tape is newest first
                 self._emit_trade(
                     market_id,
                     {
@@ -323,6 +448,11 @@ class MarketStream:
             if len(self.seen_trades) > MAX_SEEN_TRADES:
                 for old in list(self.seen_trades)[: MAX_SEEN_TRADES // 5]:
                     del self.seen_trades[old]
+        executed = parse_time(trade.get("executedAt"))
+        exchange_id = trade.get("exchangeId")
+        if executed is not None and exchange_id is not None:
+            key = str(exchange_id)
+            self.last_trade_ts[key] = max(self.last_trade_ts.get(key, 0.0), executed.timestamp())
         self._emit(StreamEvent("trade", market_id, dict(trade)))
 
     def _emit_book_if_changed(self, market_id: str, before: Optional[Book], after: Book, source: str) -> bool:
@@ -397,7 +527,25 @@ class MarketStream:
         for reason in reasons:
             self.request_resync(market_id, reason)
 
-    # ------------------------------------------------------------ timers
+    # ------------------------------------------------------------ workers & timers
+
+    async def _rest_worker(self) -> None:
+        """Process queued resyncs one at a time, off the broadcast path."""
+        loop = asyncio.get_running_loop()
+        while not self._stop.is_set():
+            market_id = await self._rest_queue.get()
+            reasons = self._pending.get(market_id)
+            if not reasons:
+                continue  # already handled by an earlier entry
+            if reasons == {"book_dirty"}:
+                wait = self.min_dirty_interval - (loop.time() - self.last_rest.get(market_id, float("-inf")))
+                if wait > 0:  # coalesce bursts of dirty hints into one refetch
+                    loop.call_later(wait, self._requeue, market_id)
+                    continue
+            try:
+                await self._resync(market_id)
+            except Exception:
+                log.exception("resync of market %s crashed", market_id)
 
     async def _timers(self) -> None:
         loop = asyncio.get_running_loop()
@@ -414,7 +562,7 @@ class MarketStream:
                     self.next_periodic[market_id] = now + self.resync_interval
                     self.request_resync(market_id, "periodic")
             wall = datetime.now(timezone.utc)
-            for exchange_id in self.books.expired(wall):
+            for exchange_id in self.books.expired(wall, grace=1.0):
                 book = self.books.get(exchange_id)
                 if book is not None:
                     book.next_expiry_at = None  # one refetch per expiry
@@ -424,53 +572,87 @@ class MarketStream:
             if self._token_expires is not None and wall >= self._token_expires - timedelta(seconds=self.token_refresh_margin):
                 self._token_expires = None  # set again by the refresh
                 self._queue.put_nowait(("refresh_token", None))
-            if self._rt is not None:
+            if self._want_connected and not self._reconnect_pending:
                 if self._socket_alive():
                     self._down_since = None
                 elif self._down_since is None:
                     self._down_since = now
-                elif now - self._down_since >= self.reconnect_after:
-                    self._down_since = now
+                elif now - self._down_since >= self._reconnect_delay():
+                    self._reconnect_pending = True
                     self._queue.put_nowait(("reconnect", None))
 
     async def _refresh_token(self) -> None:
         try:
             token = await self._mint_token()
+        except RequestCancelled:
+            return
+        except ApiError as exc:
+            if 400 <= exc.status < 500 and exc.status != 429:
+                # Revoked key, missing scope…: retrying every minute only burns writes.
+                log.error("realtime token refresh refused: %s", exc)
+                self._fatal = exc
+                self._emit(StreamEvent("status", None, {"status": "fatal", "error": str(exc)}))
+                self.stop()
+                return
+            self._schedule_token_retry(exc)
+            return
         except SuperMarketError as exc:
-            log.error("realtime token refresh failed: %s; retrying in 60s", exc)
-            retry_at = datetime.now(timezone.utc) + timedelta(seconds=60)
-            self._token_expires = retry_at + timedelta(seconds=self.token_refresh_margin)
+            self._schedule_token_retry(exc)
             return
         if self._rt is not None:
             await self._rt.set_auth(token["token"])
+            self._update_join_tokens(token["token"])
         self._emit(StreamEvent("status", None, {"status": "token_refreshed", "expiresAt": token.get("expiresAt")}))
         for market_id in self.market_ids:
             self.request_resync(market_id, "token_refresh")
 
+    def _schedule_token_retry(self, exc: BaseException) -> None:
+        log.error("realtime token refresh failed: %s; retrying in 60s", exc)
+        retry_at = datetime.now(timezone.utc) + timedelta(seconds=60)
+        self._token_expires = retry_at + timedelta(seconds=self.token_refresh_margin)
+
     async def _reconnect(self) -> None:
-        log.warning("realtime socket is down; reconnecting")
-        self._emit(StreamEvent("status", None, {"status": "reconnecting"}))
-        await self._close_realtime()
+        loop = asyncio.get_running_loop()
         try:
-            await self._connect()
-        except Exception as exc:
-            log.error("reconnect failed: %s", exc)
-            return
-        for market_id in self.market_ids:
-            self.request_resync(market_id, "reconnect")
+            if self._socket_alive():
+                self._down_since = None  # recovered while the request was queued
+                return
+            log.warning("realtime socket is down; reconnecting")
+            self._emit(StreamEvent("status", None, {"status": "reconnecting"}))
+            await self._close_realtime()
+            try:
+                await self._connect()
+            except Exception as exc:
+                self._reconnect_failures += 1
+                self._down_since = loop.time()  # try again after a longer back-off
+                log.error("reconnect failed: %s (next attempt in %.0fs)", exc, self._reconnect_delay())
+                self._emit(StreamEvent("status", None, {"status": "reconnect_failed", "error": str(exc)}))
+                return
+            for market_id in self.market_ids:
+                self.request_resync(market_id, "reconnect")
+        finally:
+            self._reconnect_pending = False
 
     # ------------------------------------------------------------ main loop
 
     async def run(self, duration: Optional[float] = None) -> None:
-        """Run until :meth:`stop` is called, ``duration`` seconds pass, or the task is cancelled."""
+        """Run until :meth:`stop` is called, ``duration`` seconds pass, or the task is cancelled.
+
+        Raises the fatal :class:`ApiError` (e.g. a revoked key) that stopped the stream, if any.
+        """
         loop = asyncio.get_running_loop()
         self.started_at = datetime.now(timezone.utc)
         deadline = None if duration is None else loop.time() + duration
-        await self._connect()
-        timers = asyncio.create_task(self._timers())
-        stopper = asyncio.create_task(self._stop.wait())
+        stop_event = self._stop
+        tasks: List["asyncio.Task[Any]"] = []
+        client_was_cancelled = self.client.cancelled
         try:
-            while not self._stop.is_set():
+            await self._connect()
+            self._want_connected = True
+            tasks = [asyncio.create_task(self._timers()), asyncio.create_task(self._rest_worker())]
+            stopper = asyncio.create_task(stop_event.wait())
+            tasks.append(stopper)
+            while not stop_event.is_set():
                 timeout = None if deadline is None else deadline - loop.time()
                 if timeout is not None and timeout <= 0:
                     break
@@ -480,23 +662,35 @@ class MarketStream:
                     getter.cancel()
                     await asyncio.gather(getter, return_exceptions=True)
                     continue
-                kind, item = getter.result()
                 try:
+                    kind, item = getter.result()
                     await self._dispatch(kind, item)
                 except Exception:
-                    log.exception("failed to process %s", kind)
+                    log.exception("failed to process a stream event")
         finally:
-            timers.cancel()
-            stopper.cancel()
-            await asyncio.gather(timers, stopper, return_exceptions=True)
+            self._shutdown.set()  # wake the REST budget waits
+            if self.cancel_client_on_exit and not client_was_cancelled:
+                self.client.cancel()  # wake 429/503 retry waits inside the client
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
             await self._close_realtime()
+            executor, self._executor = self._executor, None
+            if executor is not None:
+                await loop.run_in_executor(None, executor.shutdown, True)
+            if self.cancel_client_on_exit and not client_was_cancelled:
+                self.client.reset_cancel()
+            self._shutdown.clear()
+            self._want_connected = False
+        if self._fatal is not None:
+            raise self._fatal
 
     async def _dispatch(self, kind: str, item: Any) -> None:
         if kind == "broadcast":
             market_id, message = item
             await self.handle_broadcast(market_id, message)
         elif kind == "resync":
-            await self._resync(item)
+            self._rest_queue.put_nowait(item)
         elif kind == "status":
             market_id, state, error = item
             self._emit(StreamEvent("status", market_id, {"status": state, "error": error}))
