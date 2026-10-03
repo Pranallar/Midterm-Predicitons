@@ -239,7 +239,6 @@ def test_levels_skip_malformed_and_sort() -> None:
     assert all(isinstance(lv.price, float) and isinstance(lv.quantity, float) for lv in book.bids + book.asks)
 
 
-@pytest.mark.xfail(strict=True, reason="BUG: _levels rejects bool prices but accepts a bool quantity as 1.0")
 def test_levels_skip_bool_quantity() -> None:
     book = Book.from_payload({"exchangeId": "36", "bids": [{"price": 0.4, "quantity": True}], "asks": []})
     assert book.bids == []
@@ -530,11 +529,19 @@ def test_resolve_context_explicit_slug(fake, client) -> None:
     assert "/tournaments/my%20cup" in str(fake.calls[0].request.url)  # slug is path-quoted
 
 
-def test_resolve_context_public_makes_no_request(fake, client) -> None:
+def test_resolve_context_public_probes_one_market(fake, client) -> None:
+    fake.add("GET", "/markets", {"data": [{"id": "5", "contexts": [{"type": "public", "tournament": None}]}], "pagination": {"hasMore": False, "nextCursor": None}})
     ctx = resolve_context(client, public=True)
     assert ctx == Context.public()
     assert ctx.is_public and ctx.label == "public" and ctx.tournament_id is None
-    assert fake.calls == []
+    assert [(c.path, c.params) for c in fake.calls] == [("/markets", {"limit": "1"})]
+
+
+def test_resolve_context_public_rejects_org_bound_key(fake, client) -> None:
+    org_market = {"id": "5", "contexts": [{"type": "tournament", "tournament": {"id": TOURNAMENT_ID, "slug": TOURNAMENT_SLUG}}]}
+    fake.add("GET", "/markets", {"data": [org_market], "pagination": {"hasMore": False, "nextCursor": None}})
+    with pytest.raises(ContextError, match="bound to an organization"):
+        resolve_context(client, public=True)
 
 
 def test_resolve_context_single_active(fake, client) -> None:
@@ -800,8 +807,9 @@ def test_diff_bid_or_ask_only_changes() -> None:
 def test_diff_new_rows_only_after_first_snapshot() -> None:
     changes = diff_rows({"36": row("36")}, [row("36"), row("99", latest=0.7)])
     assert [(c["exchange_id"], c["change"], c["delta"]) for c in changes] == [("99", "new", None)]
-    # rows that disappeared are not reported
-    assert diff_rows({"36": row("36"), "37": row("37")}, [row("36")]) == []
+    # rows that disappeared (closed/settled markets) are reported as removed
+    removed = diff_rows({"36": row("36"), "37": row("37")}, [row("36")])
+    assert [(c["exchange_id"], c["change"]) for c in removed] == [("37", "removed")]
 
 
 def test_diff_min_move_filter() -> None:
@@ -814,7 +822,6 @@ def test_diff_min_move_filter() -> None:
     assert appeared[0]["change"] == "latest_price" and appeared[0]["delta"] is None
 
 
-@pytest.mark.xfail(strict=True, reason="BUG: diff_rows compares raw float differences, so an exact min_move-sized move (e.g. 0.40->0.41 with 0.01) is dropped")
 @pytest.mark.parametrize("old, new, min_move", [(0.40, 0.41, 0.01), (0.41, 0.40, 0.01), (0.405, 0.41, 0.005)])
 def test_diff_move_equal_to_min_move_is_reported(old: float, new: float, min_move: float) -> None:
     # --min-move is documented as "ignore price moves smaller than this"; a move of
@@ -980,8 +987,9 @@ def test_watch_failed_snapshot_logged_and_loop_continues(fake, client, clock, ca
     assert "1 change(s)" in out.getvalue()
 
 
-def test_watch_failed_market_listing_is_retried_next_iteration(fake, client, clock, caplog) -> None:
-    fake.add("GET", MARKETS_PATH, (403, error_body("FORBIDDEN", "not a member")), market_page([two_markets()[0]]))
+def test_watch_failed_market_listing_is_retried_next_iteration(fake, make_client, clock, caplog) -> None:
+    client = make_client(max_retries=0)
+    fake.add("GET", MARKETS_PATH, (500, error_body("INTERNAL_ERROR", "boom")), market_page([two_markets()[0]]))
     fake.add("GET", "/exchanges/prices", prices_reply(0.41))
     bot, _, _ = make_bot(client, clock)
     seen = []

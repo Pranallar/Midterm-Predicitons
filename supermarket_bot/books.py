@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 _FRACTION = re.compile(r"\.(\d+)")
@@ -65,6 +65,10 @@ def is_newer(candidate: Optional[BookVersion], held: Optional[BookVersion]) -> b
     return candidate.key() > held.key()
 
 
+def _is_num(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
 @dataclass(frozen=True)
 class Level:
     price: float
@@ -77,7 +81,7 @@ def _levels(raw: Any, descending: bool) -> List[Level]:
         if not isinstance(item, Mapping):
             continue
         price, qty = item.get("price"), item.get("quantity")
-        if isinstance(price, (int, float)) and isinstance(qty, (int, float)) and not isinstance(price, bool):
+        if _is_num(price) and _is_num(qty):
             levels.append(Level(float(price), float(qty)))
     levels.sort(key=lambda lv: lv.price, reverse=descending)
     return levels
@@ -164,11 +168,15 @@ class BookStore:
         if held is not None:
             book.option = book.option or held.option
             book.market_id = book.market_id or held.market_id
+            # REST books carry no nextExpiryAt; keep the pushed one so the expiry refetch still happens.
+            if book.next_expiry_at is None and held.next_expiry_at is not None:
+                book.next_expiry_at = held.next_expiry_at
         self.books[book.exchange_id] = book
 
-    def expired(self, now: datetime) -> List[str]:
+    def expired(self, now: datetime, grace: float = 0.0) -> List[str]:
         """Exchanges whose soonest resting-order expiry has passed (refetch them)."""
-        return [eid for eid, b in self.books.items() if b.next_expiry_at is not None and b.next_expiry_at <= now]
+        cutoff = now - timedelta(seconds=grace)
+        return [eid for eid, b in self.books.items() if b.next_expiry_at is not None and b.next_expiry_at <= cutoff]
 
 
 def select_context(response: Mapping[str, Any], tournament_id: Optional[str]) -> Mapping[str, Any]:

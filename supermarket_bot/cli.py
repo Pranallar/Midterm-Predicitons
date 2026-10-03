@@ -47,7 +47,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("markets", help="list markets in the tournament")
     _market_filters(s)
-    s.add_argument("--limit", type=int, help="stop after this many markets")
+    s.add_argument("--limit", type=positive_int, help="stop after this many markets")
 
     s = sub.add_parser("market", help="one market: outcomes, prices and resolution tree")
     s.add_argument("market_id")
@@ -59,7 +59,7 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("watch", help="poll prices on an interval and print what moved")
     _market_filters(s)
     s.add_argument("--interval", type=float, default=30.0, help="seconds between snapshots (default 30)")
-    s.add_argument("--iterations", type=int, help="stop after N snapshots (default: run until Ctrl-C)")
+    s.add_argument("--iterations", type=positive_int, help="stop after N snapshots (default: run until Ctrl-C)")
     s.add_argument("--min-move", type=float, default=0.0, help="ignore price moves smaller than this")
     s.add_argument("--refresh-markets", type=float, default=300.0, help="seconds between market-list refreshes")
     s.add_argument("--no-save", action="store_true", help="do not write snapshots to the data directory")
@@ -67,38 +67,61 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("book", help="order book for a market (all outcomes) or one exchange")
     s.add_argument("market_id", nargs="?")
     s.add_argument("--exchange", help="show one exchange's book instead of a whole market")
-    s.add_argument("--depth", type=int, default=10, help="price levels per side (1-200, default 10)")
+    s.add_argument("--depth", type=bounded_int(1, 200), default=10, help="price levels per side (1-200, default 10)")
 
     s = sub.add_parser("trades", help="recent trades for an exchange (newest first)")
     s.add_argument("exchange_id")
-    s.add_argument("--limit", type=int, default=50, help="number of trades (default 50)")
+    s.add_argument("--limit", type=positive_int, default=50, help="number of trades (default 50)")
     s.add_argument("--since", help="ISO-8601 start time (inclusive)")
 
     s = sub.add_parser("history", help="OHLCV price candles for an exchange")
     s.add_argument("exchange_id")
     s.add_argument("--resolution", default="1h", choices=["1m", "5m", "1h", "1d", "1w"])
-    s.add_argument("--limit", type=int, default=48, help="number of candles (1-1000, default 48)")
+    s.add_argument("--limit", type=bounded_int(1, 1000), default=48, help="number of candles (1-1000, default 48)")
     s.add_argument("--since", help="ISO-8601 start time; without it the newest candles are returned")
     s.add_argument("--csv", help="also write the candles to this CSV file")
 
     s = sub.add_parser("leaderboard", help="tournament standings")
     s.add_argument("--period", default="all", choices=["1d", "7d", "30d", "quarter", "all"])
     s.add_argument("--sort", choices=["pnl", "roi", "winRate", "volume", "trades"])
-    s.add_argument("--limit", type=int, default=20)
+    s.add_argument("--limit", type=positive_int, default=20, help="rows to show (paged 100 at a time)")
 
     s = sub.add_parser("scan", help="engine-reported mispricings: ALL violations and overround")
-    s.add_argument("--max-markets", type=int, default=25, help="multi-outcome market books to read (1 read each)")
+    s.add_argument("--max-markets", type=positive_int, default=25, help="multi-outcome market books to read (1 read each)")
 
     s = sub.add_parser("portfolio", help="your positions and P&L in the tournament")
-    s.add_argument("--period", default="all", choices=["day", "week", "month", "quarter", "year", "all"])
+    s.add_argument(
+        "--period",
+        default="quarter",
+        choices=["day", "week", "month", "quarter", "year", "all"],
+        help="P&L lookback (default quarter; the API reports no period P&L for 'all')",
+    )
 
     s = sub.add_parser("stream", help="live trades and books over WebSocket (needs `pip install realtime`)")
     s.add_argument("market_ids", nargs="*", help="markets to follow (default: every open market)")
     s.add_argument("--duration", type=float, help="stop after this many seconds")
     s.add_argument("--resync-interval", type=float, default=90.0, help="seconds between REST book resyncs per market")
-    s.add_argument("--max-markets", type=int, default=50, help="cap on markets when following all of them")
+    s.add_argument("--max-markets", type=positive_int, default=50, help="cap on markets when following all of them")
     s.add_argument("--no-log", action="store_true", help="do not write data/<tournament>/stream-<date>.jsonl")
     return p
+
+
+def positive_int(text: str) -> int:
+    return bounded_int(1, None)(text)
+
+
+def bounded_int(low: int, high: Optional[int]) -> Any:
+    def parse(text: str) -> int:
+        try:
+            value = int(text)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"expected an integer, got {text!r}")
+        if value < low or (high is not None and value > high):
+            span = f"{low}-{high}" if high is not None else f">= {low}"
+            raise argparse.ArgumentTypeError(f"must be {span}, got {value}")
+        return value
+
+    return parse
 
 
 def _market_filters(s: argparse.ArgumentParser) -> None:
@@ -251,9 +274,15 @@ class App:
             where = "" if self.args.no_save else f", saving to {self.settings.data_dir / self.context.label}/"
             self.print(f"Polling every {self.args.interval:g}s{where}. Ctrl-C to stop.")
 
+        first = [True]
+
         def emit_json(snap: Any, changes: List[Dict[str, Any]]) -> None:
             if self.args.json:
-                self.print(json.dumps({"takenAt": snap.taken_at.isoformat(), "changes": changes}, default=str))
+                record: Dict[str, Any] = {"takenAt": snap.taken_at.isoformat(), "changes": changes}
+                if first[0]:
+                    record["rows"] = snap.rows  # full baseline once, then only what moved
+                    first[0] = False
+                self.print(json.dumps(record, default=str))
 
         if self.args.json:
             bot.out = None
@@ -362,14 +391,28 @@ class App:
 
     def cmd_leaderboard(self) -> None:
         ctx = self.context
-        if ctx.slug:
-            period = self.args.period
-            if period == "quarter":
-                resp = self.client.get_leaderboard(tournament_slug=ctx.slug, period=period, sort=self.args.sort, limit=self.args.limit)
-            else:
-                resp = self.client.get_tournament_leaderboard(ctx.slug, period=period, sort=self.args.sort, limit=self.args.limit)
-        else:
-            resp = self.client.get_leaderboard(period=self.args.period, limit=self.args.limit)
+        wanted = self.args.limit
+        period = self.args.period
+
+        def fetch(offset: int, limit: int) -> Dict[str, Any]:
+            # Both leaderboard endpoints cap limit at 100, so page with offset.
+            if ctx.slug and period != "quarter":  # the tournament endpoint has no "quarter"
+                return self.client.get_tournament_leaderboard(ctx.slug, period=period, sort=self.args.sort, limit=limit, offset=offset)
+            if ctx.slug:
+                return self.client.get_leaderboard(tournament_slug=ctx.slug, period=period, sort=self.args.sort, limit=limit, offset=offset)
+            return self.client.get_leaderboard(period=period, limit=limit, offset=offset)  # global: no sort
+
+        want = min(100, wanted)
+        resp = fetch(0, want)
+        entries = list(resp.get("leaderboard") or [])
+        total = resp.get("total")
+        full_page = len(entries) >= want
+        while full_page and len(entries) < wanted and isinstance(total, int) and len(entries) < total:
+            want = min(100, wanted - len(entries))
+            page = fetch(len(entries), want).get("leaderboard") or []
+            entries.extend(page)
+            full_page = len(page) >= want  # a short page is the last one
+        resp = {**resp, "leaderboard": entries[:wanted]}
         if self.args.json:
             return self.dump(resp)
         self.header()
@@ -494,7 +537,19 @@ def configure_logging(verbosity: int) -> None:
             logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
+def _safe_console() -> None:
+    """Never crash on characters like "Δ" or "→" when output goes to a cp1252 pipe/file on Windows."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(errors="replace")
+            except (ValueError, OSError):  # pragma: no cover - exotic streams
+                pass
+
+
 def main(argv: Optional[Sequence[str]] = None, out: Optional[TextIO] = None, transport: Any = None) -> int:
+    _safe_console()
     parser = build_parser()
     args = parser.parse_args(argv)
     configure_logging(args.verbose)
@@ -520,6 +575,9 @@ def main(argv: Optional[Sequence[str]] = None, out: Optional[TextIO] = None, tra
             print(f"details: {json.dumps(exc.details, default=str)}", file=sys.stderr)
         return 1
     except SuperMarketError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    except OSError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     finally:

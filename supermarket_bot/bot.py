@@ -15,6 +15,8 @@ from __future__ import annotations
 import csv
 import json
 import logging
+import os
+import tempfile
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -24,7 +26,7 @@ from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Seque
 from .books import books_from_market_orderbook
 from .client import SuperMarketClient
 from .display import fmt_delta, fmt_price, table, truncate
-from .errors import SuperMarketError
+from .errors import AUTH_CODES, ApiError, RequestCancelled, SuperMarketError
 
 log = logging.getLogger("supermarket_bot")
 
@@ -47,6 +49,13 @@ ROW_FIELDS = [
 
 class ContextError(SuperMarketError):
     """The trading context could not be determined automatically."""
+
+
+def is_fatal(exc: BaseException) -> bool:
+    """Errors no retry can fix: bad/expired key, missing scope, unconfirmed email, terms…"""
+    if isinstance(exc, RequestCancelled):
+        return True
+    return isinstance(exc, ApiError) and (exc.code in AUTH_CODES or exc.status == 401 or (exc.code == "FORBIDDEN" and exc.status == 403))
 
 
 @dataclass(frozen=True)
@@ -92,6 +101,13 @@ def resolve_context(client: SuperMarketClient, slug: Optional[str] = None, publi
       With no tournaments at all, fall back to the public context.
     """
     if public:
+        page = client.list_markets(limit=1) or {}
+        for market in page.get("data") or []:
+            if any((ctx or {}).get("type") == "tournament" for ctx in market.get("contexts") or []):
+                raise ContextError(
+                    "This key is bound to an organization (such as the Predictions Cup), so it has no "
+                    "public context. Drop --public and pick a tournament with --tournament <slug>."
+                )
         return Context.public()
     if slug:
         return Context.from_tournament(client.get_tournament(slug))
@@ -180,12 +196,22 @@ def build_rows(
     return rows
 
 
+_EPS = 1e-9  # prices are on a 0.005 tick; absorb float error such as 0.41 - 0.40 = 0.00999…
+
+
 def diff_rows(
     previous: Mapping[str, Mapping[str, Any]], current: Sequence[Mapping[str, Any]], min_move: float = 0.0
 ) -> List[Dict[str, Any]]:
-    """Rows whose last price, best bid or best ask changed since the previous snapshot."""
+    """Rows whose last price, best bid or best ask moved by at least ``min_move``.
+
+    ``previous`` is the reference each exchange is compared against (see
+    :func:`advance_reference`). Exchanges missing from ``current`` (closed or
+    settled markets dropping out of the list) are reported as ``removed``.
+    """
     changes: List[Dict[str, Any]] = []
+    seen = set()
     for row in current:
+        seen.add(row["exchange_id"])
         before = previous.get(row["exchange_id"])
         if before is None:
             if previous:
@@ -196,14 +222,39 @@ def diff_rows(
             old, new = before.get(key), row.get(key)
             if old == new:
                 continue
-            if isinstance(old, (int, float)) and isinstance(new, (int, float)) and abs(new - old) < min_move:
+            if isinstance(old, (int, float)) and isinstance(new, (int, float)) and abs(new - old) + _EPS < min_move:
                 continue
             moved.append(key)
         if moved:
             old, new = before.get("latest_price"), row.get("latest_price")
             delta = round(new - old, 6) if isinstance(old, (int, float)) and isinstance(new, (int, float)) else None
             changes.append({**row, "change": ",".join(moved), "delta": delta})
+    for exchange_id, before in previous.items():
+        if exchange_id not in seen:
+            changes.append({**before, "change": "removed", "delta": None})
     return changes
+
+
+def advance_reference(
+    reference: Mapping[str, Mapping[str, Any]],
+    current: Sequence[Mapping[str, Any]],
+    changes: Sequence[Mapping[str, Any]],
+    min_move: float = 0.0,
+) -> Dict[str, Dict[str, Any]]:
+    """Next comparison baseline for :func:`diff_rows`.
+
+    With ``min_move`` the baseline only moves when a change is reported, so a run of
+    small steps still triggers once their total reaches the threshold.
+    """
+    rows = {row["exchange_id"]: dict(row) for row in current}
+    if min_move <= 0:
+        return rows
+    reported = {c["exchange_id"] for c in changes}
+    nxt: Dict[str, Dict[str, Any]] = {}
+    for exchange_id, row in rows.items():
+        held = reference.get(exchange_id)
+        nxt[exchange_id] = row if held is None or exchange_id in reported else dict(held)
+    return nxt
 
 
 class SnapshotWriter:
@@ -220,15 +271,31 @@ class SnapshotWriter:
             for row in snap.rows:
                 fh.write(json.dumps(row, separators=(",", ":"), ensure_ascii=False) + "\n")
         latest = self.dir / "latest.csv"
-        tmp = latest.with_suffix(".csv.tmp")
-        with tmp.open("w", newline="", encoding="utf-8") as fh:
+
+        def write_csv(fh: TextIO) -> None:
             writer = csv.DictWriter(fh, fieldnames=ROW_FIELDS, extrasaction="ignore")
             writer.writeheader()
             writer.writerows(snap.rows)
-        tmp.replace(latest)
+
+        atomic_write(latest, write_csv, newline="")
         markets = self.dir / "markets.json"
-        markets.write_text(json.dumps(snap.markets, indent=1, ensure_ascii=False), encoding="utf-8")
+        atomic_write(markets, lambda fh: fh.write(json.dumps(snap.markets, indent=1, ensure_ascii=False)))
         return {"jsonl": jsonl, "csv": latest, "markets": markets}
+
+
+def atomic_write(path: Path, fill: Callable[[TextIO], Any], newline: Optional[str] = None) -> None:
+    """Write via a unique temp file + ``os.replace`` so readers never see a torn file."""
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline=newline) as fh:
+            fill(fh)
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 PRICE_COLUMNS = [
@@ -305,7 +372,10 @@ class MarketDataBot:
             log.warning("%d exchange(s) missing from the price snapshot: %s", len(prices["missingIds"]), ", ".join(prices["missingIds"][:10]))
         snap = Snapshot(taken_at, self.context, [dict(m) for m in markets], rows, list(prices["missingIds"]))
         if self.writer is not None:
-            self.writer.write(snap)
+            try:
+                self.writer.write(snap)
+            except OSError as exc:  # e.g. latest.csv locked by Excel on Windows; retry next time
+                log.warning("could not save snapshot: %s", exc)
         return snap
 
     def watch(
@@ -322,6 +392,7 @@ class MarketDataBot:
         markets: Optional[List[Dict[str, Any]]] = None
         markets_at = float("-inf")
         previous: Dict[str, Dict[str, Any]] = {}
+        failures = 0
         count = 0
         while iterations is None or count < iterations:
             started = self._clock()
@@ -330,7 +401,13 @@ class MarketDataBot:
                     markets = self.list_markets(status=status, search=search)
                     markets_at = started
                 snap = self.snapshot(markets)
+                failures = 0
             except SuperMarketError as exc:
+                if is_fatal(exc):
+                    raise
+                failures += 1
+                if isinstance(exc, ApiError) and 400 <= exc.status < 500 and exc.status != 429 and failures >= 3:
+                    raise  # the same client error three times in a row will not fix itself
                 log.error("snapshot failed: %s", exc)
                 snap = None
             if snap is not None:
@@ -346,7 +423,7 @@ class MarketDataBot:
                     self._print(f"[{stamp}] no changes")
                 if on_snapshot is not None:
                     on_snapshot(snap, changes)
-                previous = snap.by_exchange()
+                previous = advance_reference(previous, snap.rows, changes, min_move)
             count += 1
             if iterations is not None and count >= iterations:
                 break

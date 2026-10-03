@@ -42,6 +42,10 @@ class NetworkError(SuperMarketError):
     """The request never got an HTTP response (DNS, TLS, timeout, connection reset)."""
 
 
+class RequestCancelled(SuperMarketError):
+    """The client was cancelled (shutdown) while a request was waiting or retrying."""
+
+
 class ApiError(SuperMarketError):
     """The API answered with a non-2xx status."""
 

@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Dict, Mapping, Optional
 
 DEFAULT_BASE_URL = "https://www.thesuper.market/api/v1"
+PLACEHOLDER_KEY = "ace_your_key_here"
 
 # Standard accounts get 100 reads and 30 writes per minute, shared by every key on
 # the account. Stay a little under so other tools (or the website) keep working.
@@ -37,8 +38,10 @@ def parse_env_file(text: str) -> Dict[str, str]:
             continue
         key = key.strip()
         value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
-            value = value[1:-1]
+        if value[:1] in ("'", '"'):
+            end = value.find(value[0], 1)
+            if end != -1:
+                value = value[1:end]  # anything after the closing quote is a comment
         elif " #" in value:
             value = value.split(" #", 1)[0].rstrip()
         if key:
@@ -102,9 +105,18 @@ class Settings:
 
         api_key = overrides.get("api_key") or get("SUPERMARKET_API_KEY")
         if not api_key:
+            hint = ""
+            example = (env_file.parent if env_file is not None else Path(".")) / ".env.example"
+            leaked = load_env_file(example).get("SUPERMARKET_API_KEY", "")
+            if leaked and leaked != PLACEHOLDER_KEY:
+                hint = (
+                    " Your key is in .env.example, which is committed to git and is not read by the bot."
+                    " Put it in a file named .env instead, and if .env.example was pushed to GitHub,"
+                    " revoke that key and create a new one."
+                )
             raise ConfigError(
                 "No API key found. Set SUPERMARKET_API_KEY in your environment or in a "
-                ".env file (see .env.example)."
+                ".env file (see .env.example)." + hint
             )
         base_url = str(overrides.get("base_url") or get("SUPERMARKET_BASE_URL") or DEFAULT_BASE_URL)
         tournament = overrides.get("tournament") or get("SUPERMARKET_TOURNAMENT")

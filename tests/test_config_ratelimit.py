@@ -103,10 +103,6 @@ class TestParseEnvFile:
     def test_crlf_line_endings(self):
         assert parse_env_file("A=1\r\nB='2'\r\n") == {"A": "1", "B": "2"}
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="BUG: a quoted value followed by an inline ' #' comment keeps its quotes",
-    )
     def test_quoted_value_followed_by_inline_comment(self):
         # Both bash and python-dotenv read this as  ace_secret_123  (no quotes).
         text = 'SUPERMARKET_API_KEY="ace_secret_123"  # my key\nB=\'x\' # note'
@@ -746,7 +742,6 @@ class TestFormatters:
         assert out == expected
         assert len(out) <= width
 
-    @pytest.mark.xfail(strict=True, reason="BUG: truncate(text, 1) returns 2 characters ('h…'), exceeding the width")
     def test_truncate_width_one_respects_width(self):
         assert len(truncate("hello", 1)) <= 1
 

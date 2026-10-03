@@ -29,7 +29,11 @@ def fmt_delta(value: Any) -> str:
 
 def truncate(text: Any, width: int) -> str:
     s = "" if text is None else str(text)
-    return s if len(s) <= width else s[: max(1, width - 1)] + "…"
+    if len(s) <= width:
+        return s
+    if width <= 0:
+        return ""
+    return s[: width - 1] + "…"
 
 
 def table(rows: Iterable[Mapping[str, Any]], columns: Sequence[Column], max_width: Optional[Mapping[str, int]] = None) -> str:

@@ -202,7 +202,6 @@ def test_slug_with_slash_does_not_reach_a_different_route(fake, client):
     assert fake.calls[0].request.url.raw_path == b"/api/v1/tournaments/a%2Fmarkets"
 
 
-@pytest.mark.xfail(strict=True, reason="BUG: _seg leaves '.'/'..' unencoded, so httpx dot-segment removal escapes the path")
 @pytest.mark.parametrize("segment", ["..", "."])
 def test_dot_segments_cannot_escape_the_path(fake, client, segment):
     # get_tournament_market("..", 26) must not silently turn into the public GET /markets/26
@@ -521,11 +520,15 @@ def test_429_without_retry_after_waits_at_least_one_second(fake, client, sleeper
     assert sleeper.calls == [1.0, 1.0]
 
 
-def test_429_wait_is_capped_by_max_retry_wait(fake, make_client, sleeper):
+def test_429_longer_than_max_retry_wait_raises_and_pauses(fake, make_client, sleeper, clock):
     c = make_client(max_retry_wait=30)
     fake.add("GET", "/account", (429, error_body("RATE_LIMITED"), {"Retry-After": "600"}), {"id": "u1"})
-    c.get_account()
-    assert sleeper.calls == [30.0]
+    with pytest.raises(ApiError) as exc:  # never retry before the server allows it
+        c.get_account()
+    assert exc.value.retry_after == 600.0 and len(fake.calls) == 1
+    start = clock.now
+    assert c.get_account() == {"id": "u1"}  # the next call waits out the server's Retry-After
+    assert clock.now - start == pytest.approx(600.0)
 
 
 def test_429_on_write_pauses_write_limiter(fake, client, sleeper, clock):
@@ -544,7 +547,6 @@ def test_429_retried_for_plain_post_too(fake, client, sleeper):
     assert sleeper.calls == [2.0]
 
 
-@pytest.mark.xfail(strict=True, reason="BUG: a 429 that is raised (retries exhausted) never pauses the limiter, so the next call ignores Retry-After")
 def test_429_given_up_still_honours_retry_after_for_next_call(fake, make_client, sleeper, clock):
     c = make_client(max_retries=0)
     handler = _recorder(clock)
@@ -606,11 +608,13 @@ def test_503_standings_updating_falls_back_to_details_retry_after_seconds(fake, 
     assert sleeper.calls == [12.0]
 
 
-def test_503_wait_is_capped_by_max_retry_wait(fake, make_client, sleeper):
+def test_503_longer_than_max_retry_wait_raises_and_pauses(fake, make_client, sleeper, clock):
     c = make_client(max_retry_wait=5)
     fake.add("GET", "/account", (503, error_body("SERVICE_UNAVAILABLE"), {"Retry-After": "90"}), {})
-    c.get_account()
-    assert sleeper.calls == [5.0]
+    with pytest.raises(ApiError):
+        c.get_account()
+    assert sleeper.calls == [] and len(fake.calls) == 1
+    assert c.read_limiter._wait_time(clock.now) == pytest.approx(90.0)
 
 
 def test_503_retried_for_plain_post(fake, client, sleeper):
@@ -814,7 +818,6 @@ def test_iter_cursor_max_items_stops_without_extra_request(fake, client):
     assert len(fake.calls) == 1  # page boundary: no fetch of a page we will not use
 
 
-@pytest.mark.xfail(strict=True, reason="BUG: max_items=0 yields one item (limit checked only after yielding)")
 def test_iter_cursor_max_items_zero_yields_nothing(fake, client):
     fake.add("GET", "/markets", _cursor_page([1, 2], "c1"))
     assert list(client.iter_cursor("/markets", max_items=0)) == []
@@ -915,7 +918,6 @@ def test_iter_offset_max_items(fake, client):
     assert len(fake.calls) == 2
 
 
-@pytest.mark.xfail(strict=True, reason="BUG: max_items=0 yields one item (limit checked only after yielding)")
 def test_iter_offset_max_items_zero_yields_nothing(fake, client):
     fake.add("GET", "/x", {"data": [1, 2, 3], "total": 3})
     assert list(client.iter_offset("/x", max_items=0)) == []

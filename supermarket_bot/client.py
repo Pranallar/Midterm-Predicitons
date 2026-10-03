@@ -22,6 +22,7 @@ from __future__ import annotations
 import email.utils
 import logging
 import random
+import threading
 import time
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Union
 from urllib.parse import quote
@@ -30,7 +31,7 @@ import httpx
 
 from . import __version__
 from .config import DEFAULT_BASE_URL, DEFAULT_READS_PER_MIN, DEFAULT_WRITES_PER_MIN, Settings
-from .errors import ApiError, NetworkError
+from .errors import ApiError, NetworkError, RequestCancelled
 from .ratelimit import SlidingWindowLimiter
 
 log = logging.getLogger("supermarket_bot")
@@ -48,6 +49,9 @@ def _seg(value: Id) -> str:
     text = str(value).strip()
     if not text:
         raise ValueError("path parameter must not be empty")
+    if text in (".", ".."):
+        # httpx would normalise these away and silently hit a different endpoint
+        raise ValueError(f"invalid path parameter {text!r}")
     return quote(text, safe="")
 
 
@@ -104,7 +108,7 @@ class SuperMarketClient:
         reads_per_min: int = DEFAULT_READS_PER_MIN,
         writes_per_min: int = DEFAULT_WRITES_PER_MIN,
         transport: Optional[httpx.BaseTransport] = None,
-        sleep: Callable[[float], None] = time.sleep,
+        sleep: Optional[Callable[[float], None]] = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if not api_key:
@@ -114,7 +118,9 @@ class SuperMarketClient:
         self.max_retry_wait = max_retry_wait
         self.backoff_base = backoff_base
         self.backoff_cap = backoff_cap
-        self._sleep = sleep
+        self._cancel = threading.Event()
+        self._sleep = sleep if sleep is not None else self._interruptible_sleep
+        sleep = self._sleep
         self.read_limiter = SlidingWindowLimiter(reads_per_min, clock=clock, sleep=sleep)
         self.write_limiter = SlidingWindowLimiter(writes_per_min, clock=clock, sleep=sleep)
         self.requests_sent = 0
@@ -144,6 +150,25 @@ class SuperMarketClient:
     def close(self) -> None:
         self._http.close()
 
+    def cancel(self) -> None:
+        """Abort every pending and future request (rate-limit and retry waits end at once).
+
+        Used on shutdown so a background thread stuck in a ``Retry-After`` wait does not
+        keep the process alive. Call :meth:`reset_cancel` to use the client again.
+        """
+        self._cancel.set()
+
+    def reset_cancel(self) -> None:
+        self._cancel.clear()
+
+    @property
+    def cancelled(self) -> bool:
+        return self._cancel.is_set()
+
+    def _interruptible_sleep(self, seconds: float) -> None:
+        if self._cancel.wait(max(0.0, seconds)):
+            raise RequestCancelled("request cancelled")
+
     def __enter__(self) -> "SuperMarketClient":
         return self
 
@@ -154,25 +179,38 @@ class SuperMarketClient:
         ceiling = min(self.backoff_cap, self.backoff_base * (2**attempt))
         return random.uniform(ceiling / 2, ceiling)
 
+    @staticmethod
+    def _server_hint(err: ApiError) -> Optional[float]:
+        """The server's requested wait: ``Retry-After`` or ``details.retryAfterSeconds``."""
+        if err.retry_after is not None:
+            return err.retry_after
+        seconds = err.details.get("retryAfterSeconds") if err.details else None
+        if isinstance(seconds, (int, float)) and not isinstance(seconds, bool):
+            return max(0.0, float(seconds))
+        return None
+
     def _retry_delay(self, err: ApiError, attempt: int, idempotent: bool) -> Optional[float]:
-        """Seconds to wait before retrying ``err``, or ``None`` to raise it."""
+        """Seconds to wait before retrying ``err``, or ``None`` to raise it.
+
+        A server-requested wait is never shortened: if it exceeds ``max_retry_wait`` the
+        error is raised (after pausing the limiter) instead of retrying too early.
+        """
         if attempt >= self.max_retries:
             return None
+        hint = self._server_hint(err)
         if err.status == 429:
-            delay = err.retry_after if err.retry_after is not None else max(1.0, self._backoff(attempt))
+            delay = hint if hint is not None else max(1.0, self._backoff(attempt))
         elif err.code == "REQUEST_IN_FLIGHT":
-            delay = err.retry_after if err.retry_after is not None else 90.0
+            delay = hint if hint is not None else 90.0
         elif err.status == 503:
-            hinted = err.retry_after
-            if hinted is None:
-                seconds = err.details.get("retryAfterSeconds") if err.details else None
-                hinted = float(seconds) if isinstance(seconds, (int, float)) else None
-            delay = max(hinted or 0.0, self._backoff(attempt))
+            delay = max(hint or 0.0, self._backoff(attempt))
         elif idempotent and err.status in (500, 502, 504):
             delay = self._backoff(attempt)
         else:
             return None
-        return min(delay, self.max_retry_wait)
+        if delay > self.max_retry_wait:
+            return None
+        return delay
 
     @staticmethod
     def _to_error(resp: httpx.Response, method: str, path: str) -> ApiError:
@@ -226,11 +264,13 @@ class SuperMarketClient:
         query = _clean_params(params)
         attempt = 0
         while True:
+            if self._cancel.is_set():
+                raise RequestCancelled(f"{method} {path}: request cancelled")
             limiter.acquire()
             self.requests_sent += 1
             try:
                 resp = self._http.request(method, path, params=query, json=json)
-            except httpx.TransportError as exc:
+            except httpx.RequestError as exc:  # transport errors and undecodable bodies
                 if idempotent and attempt < self.max_retries:
                     delay = self._backoff(attempt)
                     attempt += 1
@@ -248,6 +288,11 @@ class SuperMarketClient:
                     raise ApiError(resp.status_code, "INVALID_RESPONSE", "Response was not JSON", method=method, path=path) from exc
 
             err = self._to_error(resp, method, path)
+            hint = self._server_hint(err)
+            if err.status == 429 or (err.status == 503 and hint is not None):
+                # The budget is per account: make every caller honour the server's wait,
+                # even when this request gives up and raises.
+                limiter.pause(hint if hint is not None else 1.0)
             delay = self._retry_delay(err, attempt, idempotent)
             if delay is None:
                 raise err
@@ -271,6 +316,8 @@ class SuperMarketClient:
         max_pages: Optional[int] = None,
     ) -> Iterator[JSON]:
         """Yield items across cursor-paginated pages (``pagination.nextCursor``)."""
+        if max_items is not None and max_items <= 0:
+            return
         query = dict(params or {})
         seen = set()
         pages = 0
@@ -302,6 +349,8 @@ class SuperMarketClient:
         max_items: Optional[int] = None,
     ) -> Iterator[JSON]:
         """Yield items across offset-paginated pages (tournaments, leaderboards)."""
+        if max_items is not None and max_items <= 0:
+            return
         query = dict(params or {})
         offset = int(query.pop("offset", 0) or 0)
         query["limit"] = page_size

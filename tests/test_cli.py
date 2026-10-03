@@ -257,9 +257,10 @@ def test_public_flag_skips_tournament_lookups(run, fake, monkeypatch):
     fake.add("GET", "/markets", market_page([market("5", "Global market", [("9", None, 0.3)])]))
     code, out = run("--public", "markets")
     assert code == 0
-    assert [c.path for c in fake.calls] == ["/markets"]
-    assert "tournamentId" not in fake.calls[0].params
-    assert fake.calls[0].params["status"] == "open"
+    assert [c.path for c in fake.calls] == ["/markets", "/markets"]  # public-context probe, then the listing
+    assert fake.calls[0].params == {"limit": "1"}
+    assert "tournamentId" not in fake.calls[1].params
+    assert fake.calls[1].params["status"] == "open"
     assert out.splitlines()[0] == "Public global markets [public]"
 
 
@@ -750,11 +751,11 @@ def test_watch_json_emits_one_record_per_snapshot(run, cup, fake):
     assert code == 0
     records = [json.loads(line) for line in out.splitlines()]  # no header / tables mixed in
     assert len(records) == 2
-    assert all(set(r) == {"takenAt", "changes"} for r in records)
+    assert set(records[0]) == {"takenAt", "changes", "rows"}  # baseline once
+    assert set(records[1]) == {"takenAt", "changes"}
     assert [(c["exchange_id"], c["delta"]) for c in records[1]["changes"]] == [("37", -0.1)]
 
 
-@pytest.mark.xfail(strict=True, reason="BUG: watch --json never emits the first snapshot's prices (first record is changes=[])")
 def test_watch_json_first_record_carries_initial_prices(run, cup, fake):
     _snapshot_fakes(fake)
     code, out = run("-t", TOURNAMENT_SLUG, "--json", "watch", "--iterations", "1", "--interval", "0", "--no-save")
@@ -825,10 +826,13 @@ def test_book_reads_the_tournament_context_not_legacy_top_level(run, cup, fake):
 def test_book_depth_is_clamped_and_limits_rows(run, cup, fake):
     deep = market_orderbook([book_exchange("36", [(0.4, 1), (0.39, 2), (0.38, 3)], [(0.41, 1), (0.42, 2)], option="A")])
     fake.add("GET", "/markets/26/orderbook", deep)
-    code, out = run("-t", TOURNAMENT_SLUG, "book", "26", "--depth", "500")
+    with pytest.raises(SystemExit) as exc:  # out-of-range depth is rejected by argparse
+        run("-t", TOURNAMENT_SLUG, "book", "26", "--depth", "500")
+    assert exc.value.code == 2
+    code, out = run("-t", TOURNAMENT_SLUG, "book", "26", "--depth", "200")
     assert code == 0
     assert fake.calls_to("/markets/26/orderbook")[-1].params["depth"] == "200"
-    code, out = run("-t", TOURNAMENT_SLUG, "book", "26", "--depth", "0")
+    code, out = run("-t", TOURNAMENT_SLUG, "book", "26", "--depth", "1")
     assert code == 0
     assert fake.calls_to("/markets/26/orderbook")[-1].params["depth"] == "1"
     assert "0.390" not in out and "0.420" not in out  # only the top rung printed
@@ -907,7 +911,7 @@ def test_trades_json_default_limit(run, cup, fake):
 def test_history_params_table_and_sparkline(run, cup, fake):
     path = "/exchanges/36/price-history"
     fake.add("GET", path, _candles())
-    code, out = run("-t", TOURNAMENT_SLUG, "history", "36", "--resolution", "5m", "--since", "2026-10-01T00:00:00Z", "--limit", "5000")
+    code, out = run("-t", TOURNAMENT_SLUG, "history", "36", "--resolution", "5m", "--since", "2026-10-01T00:00:00Z", "--limit", "1000")
     assert code == 0
     assert fake.calls_to(path)[0].params == {"tournamentId": TOURNAMENT_ID, "resolution": "5m", "from": "2026-10-01T00:00:00Z", "limit": "1000"}
     lines = _lines(out)
@@ -922,7 +926,9 @@ def test_history_params_table_and_sparkline(run, cup, fake):
 def test_history_defaults_without_since(run, cup, fake):
     path = "/exchanges/36/price-history"
     fake.add("GET", path, {**_candles(), "candles": []})
-    code, out = run("-t", TOURNAMENT_SLUG, "history", "36", "--limit", "0")
+    with pytest.raises(SystemExit):
+        run("-t", TOURNAMENT_SLUG, "history", "36", "--limit", "0")
+    code, out = run("-t", TOURNAMENT_SLUG, "history", "36", "--limit", "1")
     assert code == 0
     assert fake.calls_to(path)[0].params == {"tournamentId": TOURNAMENT_ID, "resolution": "1h", "limit": "1"}
     assert "· 1h candles · 0 bucket(s) with trades" in out
@@ -988,10 +994,11 @@ def test_leaderboard_quarter_uses_leaderboards_with_tournament_slug(run, cup, fa
 
 def test_leaderboard_public_is_global_without_sort(run, fake):
     fake.add("GET", "/leaderboards", _leaderboard(period="all", my_rank=None))
+    fake.add("GET", "/markets", {"data": [{"id": "5", "contexts": [{"type": "public", "tournament": None}]}], "pagination": {"hasMore": False, "nextCursor": None}})
     code, out = run("--public", "leaderboard", "--sort", "roi")
     assert code == 0
-    assert [c.path for c in fake.calls] == ["/leaderboards"]  # no tournament lookups
-    params = fake.calls[0].params
+    assert [c.path for c in fake.calls] == ["/markets", "/leaderboards"]  # probe only, no tournament lookups
+    params = fake.calls[1].params
     assert "sort" not in params and "tournamentSlug" not in params  # sort is a 400 on the global board
     assert params["period"] == "all"
     assert out.splitlines()[0] == "Public global markets [public]"
@@ -1007,7 +1014,6 @@ def test_leaderboard_archived_entries_show_final_total_value(run, cup, fake):
     assert _lines(out)[4].split()[:3] == ["1", "zed", "2,500.50"]
 
 
-@pytest.mark.xfail(strict=True, reason="BUG: leaderboard --limit is sent unclamped; the API documents limit 1..100")
 def test_leaderboard_limit_stays_within_documented_range(run, cup, fake):
     path = f"/tournaments/{TOURNAMENT_SLUG}/leaderboard"
     fake.add("GET", path, _leaderboard())
@@ -1155,10 +1161,11 @@ def test_portfolio_tournament_positions_and_pnl(run, cup, fake):
 def test_portfolio_public_uses_default_context_endpoints(run, fake):
     fake.add("GET", "/portfolio/positions", {"positions": [], "summary": {}})
     fake.add("GET", "/portfolio/pnl", {**PNL, "period": "all", "periodPnl": None})
-    code, out = run("--public", "portfolio")
+    fake.add("GET", "/markets", {"data": [{"id": "5", "contexts": [{"type": "public", "tournament": None}]}], "pagination": {"hasMore": False, "nextCursor": None}})
+    code, out = run("--public", "portfolio", "--period", "all")
     assert code == 0
-    assert [c.path for c in fake.calls] == ["/portfolio/positions", "/portfolio/pnl"]
-    assert fake.calls[1].params == {"period": "all"}
+    assert [c.path for c in fake.calls] == ["/markets", "/portfolio/positions", "/portfolio/pnl"]
+    assert fake.calls[2].params == {"period": "all"}
     assert "period P&L —" in out
     assert _lines(out)[-1] == "No open positions."
 
