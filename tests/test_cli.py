@@ -1190,3 +1190,39 @@ def test_cli_commands_only_ever_issue_get_requests(run, cup, fake):
         code, _ = run(*argv)
         assert code == 0
     assert fake.calls and {c.method for c in fake.calls} == {"GET"}
+
+
+# --------------------------------------------------------------------------- round-1 QA regressions
+
+
+def test_live_api_12_tournament_flag_works_after_the_command(run, fake, monkeypatch, capsys):
+    fake.add("GET", T_PATH, tournament())
+    fake.add("GET", T_MARKETS, market_page([]))
+    code, out = run("markets", "--tournament", TOURNAMENT_SLUG)
+    assert code == 0 and [c.path for c in fake.calls] == [T_PATH, T_MARKETS]
+    assert out.splitlines()[0] == HEADER
+
+    parse = cli.build_parser().parse_args
+    args = parse(["dashboard", "--tournament", "predictions-cup-2026", "--demo"])
+    assert args.tournament == "predictions-cup-2026" and args.demo and args.command == "dashboard"
+    assert parse(["-t", "a", "dashboard"]).tournament == "a"  # before the command still works
+    assert parse(["-t", "a", "dashboard", "-t", "b"]).tournament == "b"  # the later value wins
+    plain = parse(["dashboard"])
+    assert (plain.tournament, plain.public, plain.json, plain.env_file, plain.data_dir) == (None, False, False, ".env", None)
+    assert parse(["markets", "--public", "--json"]).public is True
+
+    # the error message's advice is the form that works
+    seen = {}
+
+    def fake_dashboard(settings, args, out=None):
+        seen["tournament"] = args.tournament
+        return 0
+
+    import supermarket_bot.web as web_mod
+
+    monkeypatch.setattr(web_mod, "run_dashboard", fake_dashboard)
+    assert cli.main(["dashboard", "--tournament", "predictions-cup-2026"], out=io.StringIO()) == 0
+    assert seen == {"tournament": "predictions-cup-2026"}
+    fake.add("GET", "/tournaments", tournament_page([tournament(slug="cup-a", tid="a"), tournament(slug="cup-b", tid="b")]))
+    code, _ = run("markets")
+    assert code == 1 and "dashboard --tournament <slug>" in capsys.readouterr().err

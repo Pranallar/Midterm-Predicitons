@@ -371,7 +371,9 @@ def violation(amount: float = 0.05) -> Dict[str, Any]:
 class TestArbitrage:
     def test_constraint_violation(self) -> None:
         [o] = arbitrage_opportunities({"data": [violation()], "violationsCount": 1}, [], BAL)
-        assert (o.kind, o.exchange_id, o.market_id, o.side) == ("arbitrage", "11", "5", "yes")
+        # a two-leg set: no single exchange/option describes it (the legs do)
+        assert (o.kind, o.exchange_id, o.option, o.market_id, o.side, o.unit) == ("arbitrage", None, None, "5", "yes", "sets")
+        assert [(leg["exchange_id"], leg["side"], leg["price"]) for leg in o.legs] == [("11", "yes", 0.50), ("12", "no", 0.45)]
         assert o.entry_price == 0.95  # buy YES 0.50 + buy NO (sell YES at 0.55) 0.45
         assert o.edge == 0.05 and o.expected_return == pytest.approx(0.05 / 0.95, abs=1e-6)  # rounded to 6 dp
         assert o.suggested_shares == math.floor(8000 / 0.95)
@@ -631,3 +633,120 @@ def test_report_from_real_analytics() -> None:
 
 def _unused(*_: Callable[..., Any]) -> None:  # keep imported names referenced for linters
     _ = (Opportunity, SURGE_WINDOWS)
+
+
+# --------------------------------------------------------------------------- round-1 QA regressions
+
+
+def senate_violation(amount: float = 0.03, r_price: float = 0.71, d_price: float = 0.32) -> Dict[str, Any]:
+    """The demo's complementary Senate-control violation: sell YES on both outcomes (= buy NO on both)."""
+    title = "Which party will control the Senate after the midterms?"
+    legs = [("9016", "Republicans", r_price), ("9017", "Democrats", d_price)]
+    return {
+        "relationshipId": "rel-senate", "type": "complementary", "violationAmount": amount,
+        "reason": f"{title} outcomes sum to {r_price + d_price:.3f}, {amount:.3f} outside the bound.",
+        "suggestedCorrectiveTrades": [
+            {"exchangeId": eid, "outcomeSide": "YES", "action": "sell", "rationale": "a full set settles at exactly 1",
+             "marketId": "316", "marketTitle": title, "outcome": option, "currentPrice": price}
+            for eid, option, price in legs
+        ],
+        "observedPrices": [{"exchangeId": eid, "price": price, "marketId": "316", "marketTitle": title, "outcome": option,
+                            "currentPrice": price} for eid, option, price in legs],
+        "direction": {"kind": "symmetric", "fromExchangeIds": ["9016", "9017"], "toExchangeIds": ["9016", "9017"],
+                      "description": "Every outcome constrains every other."},
+        "evaluationStatus": "violated", "constraint": {"priceRule": "sum(P(outcome)) = 1"},
+    }
+
+
+def senate_infos(settle: Optional[float] = NOW + 30 * 86400) -> Dict[str, ExchangeInfo]:
+    title = "Which party will control the Senate after the midterms?"
+    return {eid: ExchangeInfo(exchange_id=eid, market_id="316", option=opt, market_title=title,
+                              settlement_date=iso(settle) if settle is not None else None)
+            for eid, opt in (("9016", "Republicans"), ("9017", "Democrats"))}
+
+
+class TestRound1Regressions:
+    def test_functional_4_constraint_set_lists_every_leg_at_its_own_price(self) -> None:
+        latest = {"9016": quote(0.705, 0.715), "9017": quote(0.325, 0.335)}
+        [o] = arbitrage_opportunities({"data": [senate_violation()]}, [], BAL, latest=latest, infos=senate_infos(),
+                                      cup_end=CUP_END)
+        assert (o.exchange_id, o.option, o.side, o.unit) == (None, None, "no", "sets")
+        assert o.title == "Which party will control the Senate after the midterms?"
+        assert [(leg["exchange_id"], leg["option"], leg["side"], leg["price"]) for leg in o.legs] == [
+            ("9016", "Republicans", "no", 0.295), ("9017", "Democrats", "no", 0.675)]
+        assert o.entry_price == 0.97 and o.target_price == 1.0  # one set pays exactly 1.00
+        assert o.edge == pytest.approx(0.03) and o.suggested_shares == math.floor(8000 / 0.97)
+        text = " | ".join(o.rationale)
+        assert "NO Republicans @ 0.295 + NO Democrats @ 0.675" in text and "pays 1.00 at settlement" in text
+        assert "sets at the 8%-of-balance cap" in text
+        assert any("live asks" in r for r in o.risks)
+
+    def test_functional_4_edge_is_the_set_payoff_minus_its_cost(self) -> None:
+        # engine prices sum to 1.03 (violation 0.03) but the legs cost 0.96 now: the set gains 0.04
+        [o] = arbitrage_opportunities({"data": [senate_violation(0.03, 0.72, 0.32)]}, [], BAL)
+        assert [leg["price"] for leg in o.legs] == [0.28, 0.68]
+        assert o.entry_price == 0.96 and o.edge == pytest.approx(0.04)
+        assert "+0.04 per set" in " | ".join(o.rationale)
+        # spread ate the gap: kept as information, but nothing to size or rank
+        latest = {"9016": quote(0.69, 0.73), "9017": quote(0.30, 0.34)}
+        [gone] = arbitrage_opportunities({"data": [senate_violation()]}, [], BAL, latest=latest)
+        assert gone.entry_price == 1.01 and gone.suggested_shares == 0 and gone.score == 0.0
+        assert "the gap is gone" in " | ".join(gone.rationale)
+
+    def test_functional_4_single_leg_constraint_is_a_plain_order(self) -> None:
+        v = violation()
+        v["suggestedCorrectiveTrades"] = v["suggestedCorrectiveTrades"][1:]
+        [o] = arbitrage_opportunities({"data": [v]}, [], BAL)
+        assert (o.exchange_id, o.side, o.entry_price, o.unit, o.legs) == ("12", "no", 0.45, "shares", [])
+
+    def test_functional_4_headline_describes_the_set(self) -> None:
+        r = build_report(**scenario(surges=[], bands=[], overround_rows=(), constraints={"data": [senate_violation()]},
+                                    infos=senate_infos()))
+        assert "2-leg set" in r.headline and "NO Republicans" in r.headline and "per set" in r.headline
+
+    def test_functional_5_arbitrage_knows_when_every_leg_settles(self) -> None:
+        [o] = arbitrage_opportunities({"data": [senate_violation()]}, [], BAL, infos=senate_infos(), cup_end=CUP_END)
+        assert o.settles_before_cup_end is True
+        assert any("before the Cup ends" in r for r in o.risks)
+        assert not any("if that is after the Cup ends" in r for r in o.risks)
+        [late] = arbitrage_opportunities({"data": [senate_violation()]}, [], BAL,
+                                         infos=senate_infos(CUP_END + 86400), cup_end=CUP_END)
+        assert late.settles_before_cup_end is False
+        [unknown] = arbitrage_opportunities({"data": [senate_violation()]}, [], BAL, infos=senate_infos(None),
+                                            cup_end=CUP_END)
+        assert unknown.settles_before_cup_end is None
+        # the multi-outcome book flag reads the settlement date of the market's outcomes
+        rows = [{"market_id": "316", "market_title": "Senate control", "outcomes": 2, "overround": 0.97, "arbitrage": True}]
+        latest = {"9016": quote(0.62, 0.64), "9017": quote(0.32, 0.33)}
+        [book] = arbitrage_opportunities(None, rows, BAL, infos=senate_infos(), cup_end=CUP_END, latest=latest)
+        assert book.settles_before_cup_end is True and book.unit == "sets"
+        assert [(leg["option"], leg["price"]) for leg in book.legs] == [("Republicans", 0.64), ("Democrats", 0.33)]
+        # the report passes the infos and the Cup end through
+        r = build_report(**scenario(surges=[], bands=[], constraints={"data": [senate_violation()]}, infos=senate_infos(),
+                                    overround_rows=()))
+        assert [o.settles_before_cup_end for o in r.opportunities] == [True]
+
+    def test_live_api_10_unknown_rank_leader_and_balance_are_stated(self) -> None:
+        r = build_report(**scenario(balance=None, initial_balance=None, leader_value=None, my_rank=None))
+        assert r.risk_mode == "balanced"
+        assert "Balance unknown: sized on the 100,000 starting balance" in r.assumptions
+        assert "Leaderboard unavailable: risk mode assumes balanced" in r.assumptions
+        assert "neither defending" not in r.principles[-1] and "balanced by default" in r.principles[-1]
+        assert "unknown" in r.principles[-1]
+        fade = next(o for o in r.opportunities if o.kind == "fade")
+        assert any("assumes the 100,000 starting balance" in line for line in fade.rationale)
+        watch = next(o for o in r.opportunities if o.kind == "watch")
+        assert not any("starting balance" in line for line in watch.rationale)  # nothing sized
+        # everything known: no assumptions, the usual wording
+        known = build_report(**scenario())
+        assert known.assumptions == [] and "neither defending" in known.principles[-1]
+        late = build_report(**scenario(leader_value=None, my_rank=None, now=CUP_END - 5 * 86400))
+        assert late.risk_mode == "aggressive" and "treated as outside the top 10" in late.assumptions[0]
+        assert json.loads(json.dumps(r.to_dict()))["assumptions"] == r.assumptions
+
+    def test_live_api_7_closed_surges_give_no_ideas(self) -> None:
+        from supermarket_bot.models import SURGE_CLOSED
+
+        closed = [mk_surge(eid="e1", status=SURGE_CLOSED), mk_surge(eid="e3", verdict="unclear", status=SURGE_CLOSED)]
+        r = build_report(**scenario(surges=closed, bands=[], constraints=None, overround_rows=()))
+        assert r.opportunities == []

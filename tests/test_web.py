@@ -35,7 +35,9 @@ from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Tuple
 import httpx
 import pytest
 
+from conftest import error_body, market_page
 from conftest import market as api_market
+from conftest import price as api_price
 
 import supermarket_bot.attribution as attribution_mod
 import supermarket_bot.demo as demo_mod
@@ -48,7 +50,8 @@ from supermarket_bot.cli import build_parser
 from supermarket_bot.client import SuperMarketClient
 from supermarket_bot.config import Settings
 from supermarket_bot.errors import ApiError
-from supermarket_bot.models import PricePoint, StrategyReport, Surge
+from supermarket_bot.models import Attribution, PricePoint, StrategyReport, Surge
+from supermarket_bot.ratelimit import SlidingWindowLimiter
 from supermarket_bot.store import TrackerStore
 
 T0 = 1_791_129_600.0  # 2026-10-04T16:00:00Z: demo start of the deterministic pipeline
@@ -63,7 +66,7 @@ ROW_KEYS = {
 }
 STATUS_KEYS = {
     "ok", "demo", "read_only", "now", "started_at", "interval", "tournament", "tracker", "view_error",
-    "account", "cup_end", "days_left", "features", "counts",
+    "account", "cup_end", "days_left", "features", "counts", "problems", "detection", "view_updated_at",
 }
 COUNT_KEYS = {"outcomes", "markets", "surges", "surges_last_hour", "open_participant_surges", "high_band", "violations"}
 ACCOUNT_KEYS = {"balance", "initial_balance", "my_rank", "leader_value", "leaders", "updated_at"}
@@ -73,7 +76,10 @@ BAND_KEYS = {
     "settlement_date", "settlement_ts", "settles_before_cup_end", "entry_price", "entry_is_estimate",
     "payout_per_share", "return_pct",
 }
-EXCHANGE_KEYS = {"now", "exchange", "series", "series_window_s", "surges", "trades", "book", "book_error", "book_fetched_at", "high_band"}
+EXCHANGE_KEYS = {
+    "now", "exchange", "series", "series_window_s", "surges", "trades", "book", "book_error", "book_fetched_at", "high_band",
+    "book_pending", "book_stale", "market_open",
+}
 STRATEGY_KEYS = {f.name for f in fields(StrategyReport)} | {"now", "backtest_status", "backtest_error", "available"}
 GET_ENDPOINTS = (
     "/api/health", "/api/status", "/api/markets", "/api/markets?q=arizona", "/api/surges", "/api/highband",
@@ -121,6 +127,13 @@ def warm_up(tracker: Any) -> None:
             break
     tracker.run_once()
     tracker.analyze_pending(20)
+
+
+def exchange_with_book(app: web.DashboardApp, eid: str) -> Optional[Dict[str, Any]]:
+    """The exchange detail once its background order-book fetch has finished."""
+    app.exchange(eid)  # starts the fetch (the detail itself never waits for the book)
+    assert app.wait_books(10)
+    return app.exchange(eid)
 
 
 def dumps(value: Any) -> bytes:
@@ -614,7 +627,7 @@ def test_highband(pipe: SimpleNamespace) -> None:
 
 
 def test_exchange_detail(pipe: SimpleNamespace, surges_by_eid: Dict[str, Dict[str, Any]]) -> None:
-    data = pipe.app.exchange(PARTICIPANT_EID)
+    data = exchange_with_book(pipe.app, PARTICIPANT_EID)
     assert data is not None and EXCHANGE_KEYS <= set(data)
     now = pipe.clock.now
     assert data["now"] == now and data["series_window_s"] == 7 * 86400
@@ -639,6 +652,7 @@ def test_exchange_detail(pipe: SimpleNamespace, surges_by_eid: Dict[str, Dict[st
 
     book = data["book"]
     assert data["book_error"] is None and data["book_fetched_at"] <= now
+    assert data["book_pending"] is False and data["book_stale"] is False and data["market_open"] is True
     assert set(book) >= {"bids", "asks", "best_bid", "best_ask", "spread", "mid", "sequence"}
     bids, asks = [lv["price"] for lv in book["bids"]], [lv["price"] for lv in book["asks"]]
     assert bids == sorted(bids, reverse=True) and asks == sorted(asks)
@@ -658,7 +672,7 @@ def test_exchange_detail_of_a_high_band_outcome(pipe: SimpleNamespace) -> None:
 
 
 def test_exchange_book_is_cached(pipe: SimpleNamespace) -> None:
-    first = pipe.app.exchange("9004")
+    first = exchange_with_book(pipe.app, "9004")
     sent = pipe.client.requests_sent
     second = pipe.app.exchange("9004")
     assert pipe.client.requests_sent == sent  # served from the 15 s cache
@@ -881,7 +895,7 @@ def test_nulls_and_junk_are_normalised(make_app: Callable[..., web.DashboardApp]
     status = app.status()
     assert status["tracker"]["errors"] == 2 and status["tracker"]["last_error"] == "second"
     assert status["tracker"]["cycles"] == 0
-    assert status["tracker"]["backfill"] == {"done": 3.0, "total": 5.0, "complete": False}
+    assert status["tracker"]["backfill"] == {"done": 3.0, "total": 5.0, "failed": None, "pending": 2.0, "complete": False}
     assert status["account"]["balance"] is None
     for payload in (status, app.markets(), app.surges(), app.highband(), app.strategy()):
         assert_json_safe(payload)
@@ -1000,8 +1014,8 @@ def test_book_errors_are_short_and_scrubbed(make_app: Callable[..., web.Dashboar
             raise RuntimeError(f"connect failed for Bearer {FAKE_KEY} " + "x" * 500)
 
     app = make_app(client=BrokenClient(), secrets=[FAKE_KEY])
-    data = app.exchange("e1")
-    assert data["book"] is None and data["book_fetched_at"] == NOW
+    data = exchange_with_book(app, "e1")
+    assert data["book"] is None and data["book_fetched_at"] == NOW and data["book_pending"] is False
     assert FAKE_KEY not in data["book_error"] and "***" in data["book_error"]
     assert len(data["book_error"]) <= 300
 
@@ -1012,7 +1026,7 @@ def test_truncated_errors_do_not_leak_part_of_a_secret(make_app: Callable[..., w
             raise RuntimeError("x" * 280 + FAKE_KEY)
 
     app = make_app(client=BrokenClient(), secrets=[FAKE_KEY])
-    text = web.encode_json(app.exchange("e1"), [FAKE_KEY]).decode("utf-8")
+    text = web.encode_json(exchange_with_book(app, "e1"), [FAKE_KEY]).decode("utf-8")
     assert FAKE_KEY[:12] not in text
 
 
@@ -1113,6 +1127,7 @@ def test_http_payloads_match_the_app(client: HTTP, pipe: SimpleNamespace) -> Non
     assert client.get("/api/markets").json() == assert_json_safe(pipe.app.markets())
     assert client.get("/api/surges").json() == assert_json_safe(pipe.app.surges())
     assert client.get("/api/highband").json() == assert_json_safe(pipe.app.highband())
+    exchange_with_book(pipe.app, "9003")  # the order book is cached, so both reads see the same one
     assert client.get("/api/exchange/9003").json() == assert_json_safe(pipe.app.exchange("9003"))
     status = client.get("/api/status").json()
     assert status["demo"] is True and status["counts"] == pipe.app.status()["counts"]
@@ -1489,6 +1504,7 @@ def test_no_secrets_in_any_response(make_app: Callable[..., web.DashboardApp], s
 
     tracker = FakeTracker(_leaky_view(), queued=RuntimeError(f"queue rejected {FAKE_KEY}"))
     app = make_app(tracker, client=LeakyClient(), secrets=[FAKE_KEY])
+    assert "***" in exchange_with_book(app, "e1")["book_error"]  # the cached (masked) book error is served below
     with serve(app) as srv:
         http_client = HTTP(srv.port)
         responses = [http_client.get(p) for p in ("/api/health", "/api/status", "/api/markets", f"/api/markets?q={FAKE_KEY}",
@@ -1746,3 +1762,391 @@ def test_run_dashboard_rejects_bad_arguments(tmp_path: Path, overrides: Dict[str
     err = io.StringIO()
     assert web.run_dashboard(None, args, out=io.StringIO(), err=err) == 2
     assert message in err.getvalue()
+
+
+# --------------------------------------------------------------------------- QA round 1 regressions (server)
+
+
+class GatedBookClient:
+    """An order-book read that blocks until released: a slow upstream (Retry-After, timeouts, a busy budget)."""
+
+    def __init__(self) -> None:
+        self.gate = threading.Event()
+        self.calls = 0
+        self._lock = threading.Lock()
+
+    def get_exchange_orderbook(self, exchange_id: str, depth: int = 20, tournament_id: Any = None) -> Dict[str, Any]:
+        with self._lock:
+            self.calls += 1
+        assert self.gate.wait(30), "the test never released the order book"
+        return {"exchangeId": exchange_id, "bids": [{"price": 0.43, "quantity": 120}], "asks": [{"price": 0.45, "quantity": 80}]}
+
+
+def test_robustness_3_exchange_detail_never_waits_for_a_slow_order_book(
+    make_app: Callable[..., web.DashboardApp], store: TrackerStore
+) -> None:
+    assert 0 < web.BOOK_WAIT_S <= 1.0  # the most a detail request ever waits for the book
+    clock = DemoClock(NOW)
+    slow = GatedBookClient()
+    store.record_surge(make_surge("e1", "m1"))
+    app = make_app(client=slow, clock=clock, book_wait=0.05)
+    try:
+        started = time.monotonic()
+        data = app.exchange("e1")
+        assert time.monotonic() - started < 3.0
+        assert data["book"] is None and data["book_pending"] is True and data["book_fetched_at"] is None
+        assert data["book_error"] == "Loading the order book…"
+        assert [p[2] for p in data["series"]] == ["tick"] * 5  # the local data comes straight away
+        assert len(data["surges"]) == 1
+        for _ in range(3):  # polls while the read is still running share the one fetch
+            assert app.exchange("e1")["book_pending"] is True
+        with serve(app) as srv:
+            started = time.monotonic()
+            resp = HTTP(srv.port).get("/api/exchange/e1")
+            assert resp.status == 200 and time.monotonic() - started < 3.0  # well inside the UI's 15 s timeout
+            assert resp.json()["book_pending"] is True and resp.json()["series"]
+        assert slow.calls == 1
+        slow.gate.set()
+        assert app.wait_books(10)
+        data = app.exchange("e1")
+        assert data["book_pending"] is False and data["book_error"] is None and data["book_fetched_at"] == NOW
+        assert data["book"]["best_bid"] == 0.43 and data["book"]["best_ask"] == 0.45
+        clock.advance(web.BOOK_TTL_S - 1)
+        assert app.exchange("e1")["book"] == data["book"] and slow.calls == 1  # cached for 15 s
+        clock.advance(2)
+        slow.gate.clear()
+        stale = app.exchange("e1")  # expired: refreshed in the background; the previous book meanwhile
+        assert stale["book_pending"] is True and stale["book_stale"] is True
+        assert stale["book"] == data["book"] and stale["book_fetched_at"] == NOW
+    finally:
+        slow.gate.set()
+        assert app.wait_books(10)
+    assert slow.calls == 2
+    fresh = app.exchange("e1")
+    assert fresh["book_pending"] is False and fresh["book_stale"] is False
+    assert fresh["book_fetched_at"] == NOW + web.BOOK_TTL_S + 1
+
+
+def test_robustness_5_a_wildcard_bind_accepts_requests_from_other_devices(
+    make_app: Callable[..., web.DashboardApp], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(web, "machine_addresses", lambda ipv6=False: ["192.0.2.2"])
+    monkeypatch.setattr(web.socket, "gethostname", lambda: "VM")
+    with serve(make_app(), host="0.0.0.0") as srv:
+        port = srv.port
+        assert srv.local_only is False and srv.allow_any_host is True
+        assert srv.url == f"http://127.0.0.1:{port}"
+        assert srv.network_urls == [f"http://192.0.2.2:{port}"]
+        assert {f"192.0.2.2:{port}", f"vm:{port}"} <= srv.allowed_hosts
+        http = HTTP(port)
+        for host in (f"127.0.0.1:{port}", f"192.0.2.2:{port}", f"VM:{port}", f"my-laptop.local:{port}", f"[2001:db8::5]:{port}"):
+            resp = http.get("/api/health", headers={"Host": host})
+            assert resp.status == 200, (host, resp.body)
+            resp = http.post("/api/surges/999/analyze", Host=host, Origin=f"http://{host.lower()}")
+            assert resp.status == 404, (host, resp.body)  # past the host and origin checks; the surge just does not exist
+        assert_json_error(http.post("/api/surges/999/analyze", Host=f"192.0.2.2:{port}", Origin="http://evil.example"), 403)
+        for bad in ("", f"127.0.0.1:{port}@evil.example", "a b", "x" * 300):
+            assert_json_error(http.get("/api/health", headers={"Host": bad}), 421)
+    with serve(make_app()) as srv:  # the default loopback bind still turns other names away (DNS rebinding)
+        assert srv.local_only is True and srv.allow_any_host is False and srv.network_urls == []
+        assert_json_error(HTTP(srv.port).get("/api/health", headers={"Host": f"192.0.2.2:{srv.port}"}), 421)
+    strict = web.make_server(make_app(), "0.0.0.0", 0, allow_any_host=False)  # a wildcard bind locked to this machine
+    try:
+        assert strict.host_allowed(f"192.0.2.2:{strict.port}") and strict.host_allowed(f"vm:{strict.port}")
+        assert not strict.host_allowed(f"evil.example:{strict.port}")
+    finally:
+        strict.server_close()
+    assert web.is_loopback_host("127.0.0.2") and web.is_loopback_host("[::1]") and web.is_loopback_host("localhost")
+    assert not web.is_loopback_host("0.0.0.0") and not web.is_loopback_host("192.168.1.5") and not web.is_loopback_host("")
+
+
+def test_robustness_5_run_dashboard_prints_the_lan_url_and_an_accurate_warning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(web, "machine_addresses", lambda ipv6=False: ["192.0.2.2"])
+    servers: List[web.DashboardServer] = []
+    real_make_server = web.make_server
+
+    def capture(app: web.DashboardApp, host: str = "127.0.0.1", port: int = 8765) -> web.DashboardServer:
+        srv = real_make_server(app, host, port)
+        servers.append(srv)
+        return srv
+
+    monkeypatch.setattr(web, "make_server", capture)
+    out, err = io.StringIO(), io.StringIO()
+    result: Dict[str, Any] = {}
+    args = _dashboard_args(tmp_path, "--demo", "--no-browser", "--port", "0", "--host", "0.0.0.0")
+
+    def run() -> None:
+        result["code"] = web.run_dashboard(None, args, out=out, err=err)
+
+    thread = threading.Thread(target=run, name="test-run-dashboard-lan", daemon=True)
+    thread.start()
+    try:
+        assert _wait_for(lambda: "From other devices" in out.getvalue(), timeout=10.0), (out.getvalue(), err.getvalue())
+        port = servers[0].port
+        assert f"Dashboard running at http://127.0.0.1:{port}" in out.getvalue()
+        assert f"From other devices on your network: http://192.0.2.2:{port}" in out.getvalue()
+        warning = err.getvalue()
+        assert "listening on 0.0.0.0" in warning and "DNS-rebinding" in warning and "read-only" in warning
+        assert HTTP(port).get("/api/health", headers={"Host": f"192.0.2.2:{port}"}).status == 200
+    finally:
+        if servers:
+            servers[0].shutdown()
+        thread.join(15)
+    assert result.get("code") == 0
+    assert _wait_for(lambda: not _tracker_threads(), timeout=5.0)
+
+
+class StatusTracker(FakeTracker):
+    """A FakeTracker that also answers ``status()`` (which keeps working when ``view()`` fails)."""
+
+    def __init__(self, view: Any, status: Mapping[str, Any]) -> None:
+        super().__init__(view)
+        self._status = dict(status)
+
+    def status(self) -> Dict[str, Any]:
+        return copy.deepcopy(self._status)
+
+
+def test_robustness_9_a_failing_view_keeps_the_last_good_data(
+    make_app: Callable[..., web.DashboardApp], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("SUPERMARKET_CUP_END", raising=False)
+    live = {"running": True, "cycles": 7, "last_snapshot_at": NOW - 5, "markets_updated_at": NOW - 60}
+    view = {
+        "exchanges": [
+            {"exchange_id": "e1", "market_id": "m1", "title": "Will Democrats win the Maine Senate race?", "bid": 0.43, "ask": 0.45},
+            {"exchange_id": "e2a", "market_id": "m2", "title": "Who will win the Springfield mayoral race?", "bid": 0.59, "ask": 0.61},
+        ],
+        "context": {
+            "balance": 80_000.0, "initial_balance": 100_000.0,
+            "leaderboard": {"top": [{"rank": 1, "username": "alice", "value": 130_000.0}], "my_rank": 40, "leader_value": 130_000.0},
+        },
+        "status": dict(live, cycles=6),
+    }
+    tracker = StatusTracker(view, live)
+    app = make_app(tracker)
+    good = app.status()
+    assert good["view_error"] is None and good["counts"]["outcomes"] == 2 and good["view_updated_at"] == NOW
+    tracker.fail = RuntimeError("view exploded")
+    status = app.status()
+    assert status["view_error"] == "view exploded"
+    assert status["counts"] == good["counts"]  # the last good rows, not "0 outcomes in 0 markets"
+    assert status["account"] == good["account"]  # balance, rank and leader stay
+    assert status["view_updated_at"] == NOW
+    assert status["tracker"]["running"] is True and status["tracker"]["cycles"] == 7  # tracker.status() is still read
+    assert status["tracker"]["last_snapshot_at"] == NOW - 5  # not "Starting… / not yet"
+    assert [r["exchange_id"] for r in app.markets()["rows"]] == ["e1", "e2a"]
+    report = app.strategy()
+    assert report["available"] is True and report["balance"] == 80_000.0 and report["my_rank"] == 40
+    expected = strategy_mod.risk_mode(80_000.0, 100_000.0, 130_000.0, 40, report["days_left"])
+    assert report["risk_mode"] == expected == "aggressive"  # not a flip to balanced
+
+
+def test_live_api_2_current_problems_and_detection_are_exposed(make_app: Callable[..., web.DashboardApp]) -> None:
+    problems = [
+        {"source": "prices", "message": f"HTTP 503 SERVICE_UNAVAILABLE: busy (GET /exchanges/prices) {FAKE_KEY}",
+         "since": NOW - 300, "last": NOW - 5, "count": 31, "severity": "warning"},
+        {"source": "leaderboard", "message": "HTTP 403 FORBIDDEN: not visible", "since": NOW - 900, "last": NOW - 600,
+         "count": 2, "severity": "error"},
+        {"source": "balance", "message": "x" * 1000, "since": "2026-10-01T00:00:00Z", "last": None, "count": "junk", "severity": "LOUD"},
+        "junk",
+        None,
+        {"no": "source or message"},
+    ]
+    detection = {"enabled": True, "waiting_for_history": 12, "reason": "Waiting for price history on 12 outcomes"}
+    app = make_app(FakeTracker({"status": {"problems": problems, "detection": detection, "errors": 34}}), secrets=[FAKE_KEY])
+    status = app.status()
+    got = status["problems"]
+    assert [p["source"] for p in got] == ["leaderboard", "prices", "balance"]  # errors first, then the newest
+    assert status["tracker"]["problems"] == got
+    assert {k: got[1][k] for k in ("since", "last", "count", "severity")} == {
+        "since": NOW - 300, "last": NOW - 5, "count": 31, "severity": "warning"
+    }
+    assert got[2]["since"] == iso_epoch("2026-10-01T00:00:00Z") and got[2]["last"] is None
+    assert got[2]["count"] == 1 and got[2]["severity"] == "warning" and len(got[2]["message"]) <= 300
+    assert status["detection"] == detection and status["tracker"]["detection"] == detection
+    text = web.encode_json(status, [FAKE_KEY]).decode("utf-8")
+    assert FAKE_KEY not in text and "busy (GET /exchanges/prices) ***" in text
+    older = make_app(FakeTracker({"status": {"errors": 3}})).status()  # a tracker that predates the fields
+    assert older["problems"] == [] and older["detection"] is None
+
+
+def test_live_api_2_a_rate_limit_pause_is_reported(make_app: Callable[..., web.DashboardApp]) -> None:
+    limiter = SlidingWindowLimiter(90)
+    limiter.acquire()
+    app = make_app(FakeTracker({"status": {}}), client=SimpleNamespace(read_limiter=limiter))
+    calm = app.status()
+    assert calm["tracker"]["read_budget"]["paused_for"] == 0 and calm["problems"] == []
+    limiter.pause(20)
+    status = app.status()
+    budget = status["tracker"]["read_budget"]
+    assert budget["used"] == 1 and budget["limit"] == 90 and 15 <= budget["paused_for"] <= 20
+    [problem] = status["problems"]
+    assert problem["source"] == "rate limit" and problem["severity"] == "warning"
+    assert "Rate limited" in problem["message"] and "20 s" in problem["message"]
+
+
+def test_live_api_3_a_failing_market_list_is_not_reported_as_a_fresh_snapshot(
+    make_app: Callable[..., web.DashboardApp], make_client: Callable[..., SuperMarketClient], fake: Any, store: TrackerStore
+) -> None:
+    fake.add("GET", "/tournaments/cup/markets", (503, error_body("SERVICE_UNAVAILABLE", "The market list is down")))
+    client = make_client(max_retries=0)
+    tracker = tracker_mod.Tracker(client, Context("t-1", "cup", "Cup"), store, backfill=False, clock=lambda: NOW)
+    tracker.run_once()
+    raw = tracker.status()
+    assert raw["last_snapshot_at"] is None and raw["last_cycle_at"] == NOW and raw["fatal_error"] is None
+    status = make_app(tracker, client=client).status()
+    assert status["tracker"]["last_snapshot_at"] is None  # not the cycle time: nothing was snapshotted
+    assert status["tracker"]["cycles"] == 1 and status["tracker"]["errors"] >= 1
+    assert status["counts"]["outcomes"] == 0
+    if raw.get("problems") is not None:  # the tracker reports its current failures (contract item 3)
+        assert any("SERVICE_UNAVAILABLE" in p["message"] for p in status["problems"])
+    summary = web.tracker_summary({"last_snapshot_at": None, "last_cycle_at": NOW, "cycles": 3})
+    assert summary["last_snapshot_at"] is None and summary["last_cycle_at"] == NOW
+
+
+@pytest.mark.parametrize(
+    "backfill, complete",
+    [
+        ({"total": 80, "done": 78, "failed": 2, "pending": 0}, True),  # the QA case: 2 series gave up
+        ({"total": 740, "done": 0, "failed": 740, "pending": 0}, True),  # price history down for good
+        ({"total": 6, "done": 4, "failed": 1, "pending": 1}, False),
+        ({"total": 6, "done": 6, "failed": 0, "pending": 0}, True),
+        ({"done": 3, "pending": 2}, False),
+        ({"total": 6, "done": 4, "failed": 2, "pending": 0, "complete": False}, False),  # an explicit flag wins
+    ],
+)
+def test_live_api_5_backfill_counts_failed_series_as_finished(backfill: Dict[str, Any], complete: bool) -> None:
+    summary = web.tracker_summary({"backfill": backfill})["backfill"]
+    assert summary["complete"] is complete
+    assert summary["failed"] == (float(backfill["failed"]) if "failed" in backfill else None)
+    assert summary["pending"] == float(backfill["pending"])
+
+
+def test_live_api_5_a_real_backfill_that_gave_up_is_complete(
+    make_app: Callable[..., web.DashboardApp], make_client: Callable[..., SuperMarketClient], fake: Any, store: TrackerStore
+) -> None:
+    title = "Will Republicans win the Arizona Senate race?"
+    fake.add("GET", "/tournaments/cup/markets", market_page([api_market("m9", title, [("e9", "YES", 0.5)])]))
+    fake.add("GET", "/exchanges/prices", {"data": [api_price("e9", "m9", 0.5, 0.49, 0.51)], "missingIds": []})
+    fake.add("GET", "/exchanges/e9/price-history", (404, error_body("NOT_FOUND", "no history for this exchange")))
+    client = make_client(max_retries=0)
+    tracker = tracker_mod.Tracker(client, Context("t-1", "cup", "Cup"), store, clock=lambda: NOW, backfill_reads_per_min=1000)
+    tracker.run_once()
+    while tracker.backfill_step(10):
+        pass
+    raw = tracker.status()["backfill"]
+    assert (raw["total"], raw["done"], raw["failed"], raw["pending"]) == (2, 0, 2, 0)
+    summary = make_app(tracker, client=client).status()["tracker"]["backfill"]
+    assert summary == {"done": 0.0, "total": 2.0, "failed": 2.0, "pending": 0.0, "complete": True}
+
+
+def _crowd_surge(eid: str, mid: str, **kw: Any) -> Surge:
+    surge = make_surge(eid, mid, **kw)
+    surge.attribution = Attribution(
+        verdict="participants", confidence=0.8, reversion_odds=0.75, summary="Two large trades and no news", analyzed_at=NOW - 30
+    )
+    return surge
+
+
+def test_live_api_7_surges_on_closed_markets_are_closed_and_yield_no_ideas(
+    make_app: Callable[..., web.DashboardApp], store: TrackerStore
+) -> None:
+    # m1 (e1) closed after its surge; m2 (e2a, e2b) is still open. Both surges are "open" in the store.
+    closed = store.record_surge(_crowd_surge("e1", "m1"))
+    still_open = store.record_surge(_crowd_surge("e2a", "m2", start_price=0.45, end_price=0.60, peak_price=0.61, change=0.15))
+    rows = [
+        {"exchange_id": "e2a", "market_id": "m2", "title": "Who will win the Springfield mayoral race?", "option": "Alice Smith",
+         "bid": 0.59, "ask": 0.61},
+        {"exchange_id": "e2b", "market_id": "m2", "title": "Who will win the Springfield mayoral race?", "option": "Bob Jones"},
+    ]
+    surges = [s.to_dict() for s in (closed, still_open)]
+    app = make_app(FakeTracker({"exchanges": rows, "surges": surges, "status": {"markets_updated_at": NOW - 60}}))
+    by_eid = {s["exchange_id"]: s for s in app.surges()["surges"]}
+    assert by_eid["e1"]["status"] == web.SURGE_CLOSED == "closed" and by_eid["e1"]["market_open"] is False
+    assert by_eid["e2a"]["status"] == "open" and by_eid["e2a"]["market_open"] is True
+    assert app.status()["counts"]["open_participant_surges"] == 1  # only the open market's surge
+    detail = app.exchange("e1")
+    assert detail is not None and detail["market_open"] is False
+    assert [s["status"] for s in detail["surges"]] == ["closed"]
+    assert app.exchange("e2a")["market_open"] is True
+    opps = app.strategy()["opportunities"]
+    assert all(o.get("exchange_id") != "e1" for o in opps)  # nothing priced off the closed market's last tick
+    assert [(o["kind"], o["exchange_id"], o["surge_id"]) for o in opps if o["kind"] in ("fade", "watch")] == [
+        ("fade", "e2a", still_open.id)
+    ]
+    # Before the open-market list ever loaded nothing is relabelled: the dashboard cannot tell yet.
+    early = make_app(FakeTracker({"exchanges": [], "surges": surges, "status": {}}))
+    assert {s["status"] for s in early.surges()["surges"]} == {"open"}
+    assert {s["market_open"] for s in early.surges()["surges"]} == {None}
+    # A view that cannot be read at all (and no earlier one) says nothing about which markets are open.
+    broken = StatusTracker({}, {"markets_updated_at": NOW - 60})
+    broken.fail = RuntimeError("view exploded")
+    assert {s["status"] for s in make_app(broken).exchange("e1")["surges"]} == {"open"}
+    # A surge the tracker already marked closed passes through as it is.
+    marked = dict(surges[0], status="closed")
+    passed = make_app(FakeTracker({"exchanges": rows, "surges": [marked], "status": {}})).surges()["surges"]
+    assert [s["status"] for s in passed] == ["closed"]
+
+
+def test_functional_4_multi_leg_arbitrage_keeps_its_legs(
+    make_app: Callable[..., web.DashboardApp], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    senate = "Which party will control the Senate after the midterms?"
+    base = {
+        "target_price": None, "stop_price": None, "prob_win": 1.0, "edge": 0.03, "expected_return": 0.031, "horizon_hours": None,
+        "suggested_shares": 100, "suggested_cost": 97.0, "score": 0.5, "confidence": 0.9, "rationale": [], "risks": [],
+    }
+    report = {
+        "generated_at": NOW, "risk_mode": "balanced", "headline": "Balanced mode.",
+        "assumptions": ["Balance unknown: sized on the 100,000 starting balance", None, ""],
+        "opportunities": [
+            dict(base, kind="arbitrage", exchange_id=None, market_id=313, title=senate, option=None, side="no", entry_price=0.97, legs=[
+                {"exchange_id": 9016, "market_id": 313, "title": senate, "option": "Republicans", "side": "NO", "price": 0.295},
+                {"exchange_id": 9017, "market_id": 313, "title": senate, "option": "Democrats", "side": "no", "price": float("nan")},
+                "junk",
+            ]),
+            dict(base, kind="carry", exchange_id=9007, market_id="301", title="California Governor", option="YES", side="yes",
+                 entry_price=0.97, legs=None),
+        ],
+    }
+    monkeypatch.setattr(strategy_mod, "build_report", lambda **kwargs: copy.deepcopy(report))
+    data = assert_json_safe(make_app(FakeTracker({})).strategy())
+    arb, carry = data["opportunities"]
+    assert arb["exchange_id"] is None and arb["market_id"] == "313"
+    assert [(leg["exchange_id"], leg["market_id"], leg["option"], leg["side"], leg["price"]) for leg in arb["legs"]] == [
+        ("9016", "313", "Republicans", "no", 0.295),
+        ("9017", "313", "Democrats", "no", None),
+    ]
+    assert carry["exchange_id"] == "9007" and carry["legs"] is None
+    assert data["assumptions"] == ["Balance unknown: sized on the 100,000 starting balance"]
+
+
+def test_functional_4_demo_constraint_arbitrage_is_served_as_legs(client: HTTP, pipe: SimpleNamespace) -> None:
+    pipe.app.wait_backtest(10)
+    report = client.get("/api/strategy").json()
+    senate = [o for o in report["opportunities"] if o["kind"] == "arbitrage" and o["market_id"] == "313"]
+    assert senate, [o["market_id"] for o in report["opportunities"]]
+    legs = senate[0]["legs"]
+    assert len(legs) >= 2  # buy NO on Republicans AND on Democrats, each at its own price
+    for leg in legs:
+        assert isinstance(leg["exchange_id"], str) and leg["market_id"] == "313"
+        assert leg["side"] in ("yes", "no") and finite_or_none(leg["price"]) and leg["price"] is not None
+    assert {leg["exchange_id"] for leg in legs} >= {"9016", "9017"}
+    assert all(isinstance(a, str) for a in report.get("assumptions") or [])
+
+
+def test_visual_9_chart_series_spreads_over_time_not_tick_count() -> None:
+    from supermarket_bot.models import PricePoint as PP
+
+    now = 1_800_000_000.0
+    # 7 days of hourly candles, then 6 hours of 5-second live ticks (4,320 points)
+    pts = [PP(now - 7 * 86400 + i * 3600, 0.40, source="candle") for i in range(7 * 24 - 6)]
+    pts += [PP(now - 6 * 3600 + i * 5, 0.45, source="tick") for i in range(6 * 720)]
+    out = web.tiered_series(pts, now)
+    assert len(out) <= web.MAX_SERIES_POINTS
+    span_24h = [p for p in out if p.ts >= now - 86400]
+    hours_covered = {int((p.ts - (now - 86400)) // 3600) for p in span_24h}
+    assert len(hours_covered) >= 20  # the whole day is represented, not just the tick-dense last hours

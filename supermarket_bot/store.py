@@ -257,32 +257,54 @@ def _surge_values(surge: Surge) -> List[Any]:
 
 
 REFRAME_SHARE = 0.5  # same rule analytics uses to pick the shortest window holding most of a move
+EXTEND_MIN = 0.03  # a longer window takes over only when the move went this far past the old peak
 
 
 def _merge_surges(old: Surge, new: Surge) -> Surge:
     """Merge a fresh detection into the stored open surge for the same exchange and direction.
 
-    Keeps the earliest start and the latest end; the larger ``|change|`` decides the window,
-    its length and z-score. The peak is the extreme of both. ``detected_at`` (the first
-    detection) and the attribution are kept.
+    One *frame* describes the move: ``start_ts``, ``start_price``, ``window``, ``window_s`` and
+    ``zscore`` always come from the same detection, and ``change`` is always
+    ``end_price - start_price``, so the numbers a card prints add up.
+
+    * The end (``end_ts`` / ``end_price``) follows the latest detection.
+    * The stored frame is kept, re-measured to the new end (z scaled with the change), unless
+      the new detection describes the move better: a *shorter* window starting later that
+      still holds at least half of the move (the first sighting used partial history), or a
+      *longer* window because the move kept going well past the old peak. A longer window
+      that merely re-detects a move which already happened (a 1h spike still visible through
+      the 24h window a day later) never drags the start back by a day.
+    * The peak is the extreme of both; ``detected_at`` (the first detection) and the
+      attribution are kept.
     """
     merged = dataclasses.replace(old)
-    # A later detection over a shorter window that still holds most of the move describes it
-    # better (e.g. the first sighting used partial history): adopt its start and window.
-    reframe = (
-        new.window_s < old.window_s
-        and new.start_ts > old.start_ts
-        and abs(new.change) + 1e-9 >= REFRAME_SHARE * abs(old.change)
-    )
-    if reframe:
-        merged.start_ts, merged.start_price = new.start_ts, new.start_price
-        merged.change, merged.window, merged.window_s, merged.zscore = new.change, new.window, new.window_s, new.zscore
-    elif new.start_ts < old.start_ts:
-        merged.start_ts, merged.start_price = new.start_ts, new.start_price
-    if new.end_ts >= old.end_ts:
+    up = old.direction != "down"
+    later = new.end_ts >= old.end_ts
+    if later:
         merged.end_ts, merged.end_price = new.end_ts, new.end_price
-    if not reframe and abs(new.change) > abs(old.change):
-        merged.change, merged.window, merged.window_s, merged.zscore = new.change, new.window, new.window_s, new.zscore
+    old_move = round(merged.end_price - old.start_price, 6)  # the stored frame, measured to the latest end
+    adopt = False
+    if later:
+        shorter = (
+            new.window_s < old.window_s
+            and new.start_ts > old.start_ts
+            and abs(new.change) + 1e-9 >= REFRAME_SHARE * abs(old_move)
+        )
+        beyond = (new.peak_price - old.peak_price) if up else (old.peak_price - new.peak_price)
+        extends = (
+            new.window_s > old.window_s
+            and beyond + 1e-9 >= EXTEND_MIN
+            and abs(new.change) > abs(old_move) + 1e-9
+        )
+        adopt = shorter or extends
+    if adopt:
+        merged.start_ts, merged.start_price = new.start_ts, new.start_price
+        merged.window, merged.window_s, merged.zscore = new.window, new.window_s, new.zscore
+    else:
+        if old.zscore is not None and abs(old.change) > 1e-9:
+            # Same frame, same volatility: z scales with the move.
+            merged.zscore = round(old.zscore * old_move / old.change, 4)
+    merged.change = round(merged.end_price - merged.start_price, 6)
     if old.direction == "down":
         merged.peak_price = min(old.peak_price, new.peak_price)
     else:
@@ -664,7 +686,8 @@ class TrackerStore:
     # surges -----------------------------------------------------------------
     def record_surge(self, surge: Surge, merge_window_s: float = 6 * 3600) -> Surge:
         """Insert, or merge into the open surge for the same exchange+direction detected within
-        ``merge_window_s`` (keep earliest start, latest end, larger |change|). Returns the stored surge with id.
+        ``merge_window_s`` (see :func:`_merge_surges`: one consistent frame, the latest end,
+        ``change == end_price - start_price``). Returns the stored surge with id.
 
         "Detected within" counts from the stored surge's first detection or its latest end,
         whichever is newer, so a move that keeps being re-detected stays one surge. The stored

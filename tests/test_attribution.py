@@ -851,3 +851,112 @@ def test_integration_with_tracker_store_and_analytics(fake: Any, client: Any) ->
     back = store.get_surge(stored.id)
     assert back is not None and back.attribution is not None and back.attribution.verdict == "participants"
     store.close()
+
+
+# --------------------------------------------------------------------------- round-1 QA regressions
+
+
+class _DownProvider:
+    """A news provider whose every search fails (the providers never raise; they set last_error)."""
+
+    min_interval_s = 0.0
+
+    def __init__(self, name: str, reason: str) -> None:
+        self.name = name
+        self.reason = reason
+        self.last_error: Optional[str] = None
+
+    def search(self, query: str, since: Optional[float], until: Optional[float], limit: int = 20) -> List[Article]:
+        self.last_error = self.reason
+        return []
+
+    def close(self) -> None:
+        pass
+
+
+class _EmptyProvider(_DownProvider):
+    def search(self, query: str, since: Optional[float], until: Optional[float], limit: int = 20) -> List[Article]:
+        self.last_error = None
+        return []
+
+
+def test_live_api_8_news_outage_is_not_evidence_of_no_news(fake: Any, client: Any) -> None:
+    from supermarket_bot.news import NewsSearcher
+
+    def run(providers: List[Any]) -> Attribution:
+        route_spike(fake)
+        searcher = NewsSearcher(providers, clock=lambda: NOW, sleep=lambda s: None)
+        return Attributor(client, CTX, FakeStore(INFO), searcher, clock=lambda: NOW, flow_fn=simple_flow).analyze(make_surge())
+
+    quiet = run([_EmptyProvider("google-news", ""), _EmptyProvider("gdelt", "")])
+    down = run([_DownProvider("google-news", "ConnectError: [Errno -3] name resolution failed"),
+                _DownProvider("gdelt", "HTTP 503: Service Unavailable")])
+    assert quiet.news_status == "ok" and down.news_status == "unavailable"
+    assert quiet.verdict == "participants" and quiet.confidence == pytest.approx(0.9)
+    assert "No news articles matched this market around the move" in quiet.reasons
+    text = "\n".join(down.reasons)
+    assert "No news articles matched" not in text
+    assert "News search failed (google-news: ConnectError" in text and "gdelt: HTTP 503" in text
+    # five crowd signals still carry a participants verdict, but capped and with lower odds
+    assert down.verdict == "participants"
+    assert down.confidence == pytest.approx(attr_mod.OUTAGE_MAX_CONFIDENCE)
+    assert down.reversion_odds == pytest.approx(attr_mod.OUTAGE_MAX_REVERSION) and down.reversion_odds < quiet.reversion_odds
+    assert "news search failed" in down.summary
+    stored = Attribution(**{**down.to_dict(), "articles": [], "flow": None})
+    assert stored.news_status == "unavailable"
+
+
+def test_live_api_8_outage_needs_crowd_evidence_that_stands_alone() -> None:
+    flow = make_flow(n_trades=4)  # one crowd signal (few trades)
+    surge = make_surge(change=0.05, end_price=0.55)
+    ok = attribute(surge, flow, [], 300.0, "t", None, NOW, news_status="ok")  # + thin book = 2 signals
+    assert ok.verdict == "participants"
+    down = attribute(surge, flow, [], 300.0, "t", None, NOW, news_status="unavailable", news_errors=["gdelt: HTTP 503"])
+    assert down.verdict == "unclear" and down.news_status == "unavailable"
+    assert "News search failed (gdelt: HTTP 503)" in down.reasons[1]
+    assert "3 are needed without news" in "\n".join(down.reasons)
+    disabled = attribute(surge, flow, [], 300.0, "t", None, NOW, news_status="disabled")
+    assert disabled.verdict == "participants" and disabled.news_status == "disabled"
+
+
+def test_live_api_8_status_for_disabled_raising_and_legacy_searchers(fake: Any, client: Any) -> None:
+    route_spike(fake)
+    none = Attributor(client, CTX, FakeStore(INFO), None, clock=lambda: NOW, flow_fn=simple_flow).analyze(make_surge())
+    assert none.news_status == "disabled"
+    route_spike(fake)
+    legacy = Attributor(client, CTX, FakeStore(INFO), FakeNews(), clock=lambda: NOW, flow_fn=simple_flow).analyze(make_surge())
+    assert legacy.news_status == "ok"  # a searcher without search_market(): its empty answer is trusted
+    route_spike(fake)
+    broken = Attributor(client, CTX, FakeStore(INFO), FakeNews(error=RuntimeError("x")), clock=lambda: NOW,
+                        flow_fn=simple_flow).analyze(make_surge())
+    assert broken.news_status == "unavailable"
+
+
+def test_live_api_8_llm_merge_keeps_the_outage_cap(fake: Any, client: Any) -> None:
+    from supermarket_bot.news import NewsSearcher
+
+    route_spike(fake)
+    judge = FakeJudge({"verdict": "participants", "confidence": 1.0, "reversion_odds": 1.0, "explanation": "few traders",
+                       "key_article_indexes": []})
+    searcher = NewsSearcher([_DownProvider("gdelt", "HTTP 503")], clock=lambda: NOW, sleep=lambda s: None)
+    result = Attributor(client, CTX, FakeStore(INFO), searcher, judge=judge, clock=lambda: NOW, flow_fn=simple_flow).analyze(make_surge())
+    assert result.method == "heuristic+llm" and result.verdict == "participants"
+    assert result.confidence <= attr_mod.OUTAGE_MAX_CONFIDENCE and result.reversion_odds <= attr_mod.OUTAGE_MAX_REVERSION
+
+
+def test_functional_1_flow_reads_only_the_trades_that_made_the_move(fake: Any, client: Any) -> None:
+    """A 1h surge that stayed open for hours still reads the tape around its own window."""
+    late = T0 + 5 * 3600
+    tape = [trade(f"late{i}", T0 + 3600 * i, 300, side="YES" if i % 2 else "NO") for i in range(1, 6)] + SPIKE_TRADES
+    route_spike(fake, trades=trades_page(tape))
+    seen: List[List[TradeRecord]] = []
+
+    def flow_fn(records: Sequence[TradeRecord]) -> TradeFlow:
+        seen.append(list(records))
+        return simple_flow(records)
+
+    surge = make_surge(end_ts=late, detected_at=T0)
+    assert attr_mod.flow_until(surge) == pytest.approx(START + 1.25 * 3600 + attr_mod.FLOW_SLACK_S)
+    Attributor(client, CTX, FakeStore(INFO), FakeNews(), clock=lambda: late, flow_fn=flow_fn).analyze(surge)
+    assert [r.trade_id for r in seen[0]] == ["t2", "t3"]
+    assert attr_mod.flow_until(make_surge()) == pytest.approx(T0 + attr_mod.FLOW_SLACK_S)  # a fresh surge: up to its end

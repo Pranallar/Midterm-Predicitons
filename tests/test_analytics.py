@@ -640,3 +640,75 @@ class TestHoursUntil:
         assert parse_iso_ts(1_790_000_000) == 1_790_000_000.0
         assert parse_iso_ts("1790000000") == 1_790_000_000.0
         assert parse_iso_ts(True) is None
+
+
+# --------------------------------------------------------------------------- round-1 QA regressions
+
+
+def _sparse_candles_then_ticks() -> List[PricePoint]:
+    """Demo-like data: 5m candles only in buckets that had trades, then 16 min of live ticks."""
+    pts = [P(NOW - 26 * H + i * 1800, 0.38, "candle") for i in range(48)]  # quiet day, a trade every 30 min
+    pts = [p for p in pts if p.ts <= NOW - 95 * M]
+    pts += [P(NOW - 95 * M, 0.385, "candle"), P(NOW - 40 * M, 0.50, "candle"), P(NOW - 25 * M, 0.53, "candle")]
+    pts += build(lambda t: 0.535, NOW - 16 * M, NOW, 5)
+    return pts
+
+
+class TestRound1Regressions:
+    def test_functional_3_change_1h_holds_the_candle_close_through_tradeless_buckets(self) -> None:
+        pts = _sparse_candles_then_ticks()
+        # the last candle before now - 1h closed 95 min ago and nobody traded until 40 min ago
+        assert change_over(pts, NOW, 3600.0) == pytest.approx(0.535 - 0.385)
+        assert value_at(pts, NOW - H, 15 * M).price == 0.385  # type: ignore[union-attr]
+        # five minutes into tracking, the 5m change already has a reference (the last candle)
+        early = [p for p in pts if p.ts <= NOW - 16 * M + 120]
+        assert change_over(early, NOW - 16 * M + 120, 300.0) == pytest.approx(0.535 - 0.53)
+
+    def test_functional_3_tick_gaps_and_a_trailing_candle_stay_missing(self) -> None:
+        ticks = build(lambda t: 0.40, NOW - 30 * H, NOW - 3 * H, 60) + build(lambda t: 0.55, NOW - 10 * M, NOW, 60)
+        assert change_over(ticks, NOW, 3600.0) is None  # an outage between ticks is not filled
+        candles = build(lambda t: 0.40, NOW - 48 * H, NOW - 50 * M, H, source="candle")
+        assert change_over(candles, NOW, 300.0) is None  # nothing after the candle: the current mark is stale
+
+    def test_functional_3_detection_keeps_the_1h_window_on_sparse_candles(self) -> None:
+        pts = _sparse_candles_then_ticks()
+        s = detect_surges(pts, NOW, "9002", "302")[0]
+        assert s.window == "1h" and s.change == pytest.approx(0.15)
+        # the held reference starts the window at now - 1h, not 95 min back
+        assert s.start_ts == NOW - H and s.start_price == 0.385
+
+    def test_live_api_4_partial_windows_report_a_jump_seen_live(self) -> None:
+        start = NOW - 60
+        pts = build(lambda t: 0.37 if t < start + 20 else 0.53, start, NOW, 5)
+        assert detect_surges(pts, NOW, "5003", "m") == []  # no reference 5 min back
+        [s] = detect_surges(pts, NOW, "5003", "m", partial=True)
+        assert (s.window, s.direction, s.start_ts, s.start_price, s.end_price) == ("5m", "up", start, 0.37, 0.53)
+        assert s.zscore is None  # no volatility history yet
+        # with full history the partial rule changes nothing
+        full = calm_then(step_at(NOW - 2 * M, 0.06))
+        assert [x.to_dict() for x in detect_surges(full, NOW, "e", "m", partial=True)] == \
+            [x.to_dict() for x in detect_surges(full, NOW, "e", "m")]
+
+    def test_visual_9_downsample_by_time_keeps_the_whole_day(self) -> None:
+        candles = build(lambda t: 0.40 + 0.01 * ((t // 3600) % 3), NOW - 24 * H, NOW - H, 1800, source="candle")
+        ticks = build(lambda t: 0.45, NOW - H + 5, NOW, 5)  # 720 live ticks in the last hour
+        pts = candles + ticks
+        out = A.downsample_by_time(pts, 96, NOW - 24 * H, NOW)
+        assert 2 <= len(out) <= 96 and out[0] is pts[0] and out[-1] is pts[-1]
+        assert [p.ts for p in out] == sorted(p.ts for p in out)
+        last_hour = sum(1 for p in out if p.ts > NOW - H)
+        assert last_hour <= 6  # about 4 of 95 slots, not most of the points
+        gaps = [b.ts - a.ts for a, b in zip(out, out[1:])]
+        assert max(gaps) <= 2 * (24 * H / 95) + 1e-6
+        # the index-based downsample piles most points into the dense last hour
+        assert sum(1 for p in downsample(pts, 96) if p.ts > NOW - H) > 48
+
+    def test_visual_9_downsample_by_time_edge_cases(self) -> None:
+        pts = build(lambda t: 0.5, T0, T0 + 10 * M, 60)
+        assert A.downsample_by_time(pts, 96) == pts
+        assert A.downsample_by_time(pts, 1) == [pts[-1]]
+        assert A.downsample_by_time(pts, 0) == [] and A.downsample_by_time([], 5) == []
+        out = A.downsample_by_time(list(reversed(pts)), 4)
+        assert len(out) <= 4 and out[0] == pts[0] and out[-1] == pts[-1]
+        same = [P(T0, 0.5), P(T0, 0.6), P(T0, 0.7)]
+        assert len(A.downsample_by_time(same, 2)) == 2

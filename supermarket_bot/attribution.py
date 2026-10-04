@@ -29,6 +29,9 @@ from .books import Book, parse_time
 from .bot import is_fatal
 from .errors import ApiError
 from .models import (
+    NEWS_DISABLED,
+    NEWS_OK,
+    NEWS_UNAVAILABLE,
     VERDICT_NEWS,
     VERDICT_PARTICIPANTS,
     VERDICT_UNCLEAR,
@@ -56,6 +59,11 @@ NEWS_LAG_S = 30 * 60.0  # up to 30 min after the move ended still counts as the 
 NEWS_VERDICT_MIN = 0.55
 NO_NEWS_MAX = 0.3
 MIN_CROWD_FOR_PARTICIPANTS = 2
+# When every news provider failed, "no headlines" is not evidence: a participants verdict then
+# needs one more crowd signal (the crowd evidence must stand on its own) and is capped.
+OUTAGE_EXTRA_CROWD = 1
+OUTAGE_MAX_CONFIDENCE = 0.55
+OUTAGE_MAX_REVERSION = 0.6
 
 FEW_TRADES = 5
 CONCENTRATED_TOP_SHARE = 0.5
@@ -69,6 +77,7 @@ BOOK_BAND = 0.05  # depth is measured within +/- 5 cents of the mid
 TRADES_LOOKBACK_S = 3600.0  # tape is fetched from start_ts - 1 h
 TRADES_MAX = 200
 FLOW_SLACK_S = 60.0  # trades up to a minute after the last point still belong to the move
+FLOW_WINDOW_SHARE = 1.25  # the move itself spans at most its window plus the start-point tolerance
 NEWS_SINCE_S = 24 * 3600.0
 MAX_ARTICLES = 10
 
@@ -208,6 +217,11 @@ def _move_text(surge: Surge) -> str:
     )
 
 
+def _news_failure_text(errors: Sequence[str]) -> str:
+    detail = "; ".join(_clip(e, 120) for e in errors if e) or "every news provider failed"
+    return f"News search failed ({_clip(detail, 300)})"
+
+
 def attribute(
     surge: Surge,
     flow: Optional[TradeFlow],
@@ -216,16 +230,28 @@ def attribute(
     market_title: str,
     option: Optional[str],
     now: float,
+    *,
+    news_status: Optional[str] = None,
+    news_errors: Sequence[str] = (),
 ) -> Attribution:
-    """The heuristic verdict for one surge (see DESIGN.md for every threshold)."""
+    """The heuristic verdict for one surge (see DESIGN.md for every threshold).
+
+    ``news_status`` is ``"ok"``, ``"unavailable"`` (every news provider failed) or
+    ``"disabled"``. When the search was unavailable, missing headlines are not evidence of
+    "no news": a participants verdict needs ``MIN_CROWD_FOR_PARTICIPANTS + 1`` crowd signals
+    and its confidence and reversion odds are capped.
+    """
     ranked = sorted(articles, key=lambda a: _contribution(a, surge), reverse=True)
     best = ranked[0] if ranked else None
     news = news_score(articles, surge)
     signals = crowd_signals(surge, flow, book_depth)
     crowd = len(signals)
+    news_failed = news_status == NEWS_UNAVAILABLE and best is None
 
     reasons: List[str] = [_move_text(surge)]
-    if best is None:
+    if best is None and news_failed:
+        reasons.append(f"{_news_failure_text(news_errors)}: missing headlines are not evidence that there was no news")
+    elif best is None:
         reasons.append("No news articles matched this market around the move")
     else:
         rel = _clamp(best.relevance) if _num(best.relevance) else 0.0
@@ -263,15 +289,27 @@ def attribute(
             f"news moves tend to hold ({reversion:.0%} reversion odds)."
         )
         reasons.append("A matching headline landed right around the move, so the price likely reflects new information")
-    elif news < NO_NEWS_MAX and crowd >= MIN_CROWD_FOR_PARTICIPANTS:
+    elif news < NO_NEWS_MAX and crowd >= MIN_CROWD_FOR_PARTICIPANTS + (OUTAGE_EXTRA_CROWD if news_failed else 0):
         verdict = VERDICT_PARTICIPANTS
         confidence = min(0.9, 0.4 + 0.12 * crowd)
         reversion = min(0.8, 0.5 + 0.08 * crowd)
         trades = f"{flow.n_trades} trade(s)" if flow is not None else "unknown flow"
-        summary = (
-            f"Participant-driven: {move} on {trades} with {crowd} crowd signal(s) and no matching news; "
-            f"{reversion:.0%} odds it gives back half."
-        )
+        if news_failed:
+            confidence = min(confidence, OUTAGE_MAX_CONFIDENCE)
+            reversion = min(reversion, OUTAGE_MAX_REVERSION)
+            summary = (
+                f"Participant-driven: {move} on {trades} with {crowd} crowd signal(s); the news search failed, so "
+                f"news cannot be ruled out (confidence capped); {reversion:.0%} odds it gives back half."
+            )
+            reasons.append(
+                f"The crowd evidence stands on its own ({crowd} signals), but without a working news search the "
+                f"confidence is capped at {OUTAGE_MAX_CONFIDENCE:.0%}"
+            )
+        else:
+            summary = (
+                f"Participant-driven: {move} on {trades} with {crowd} crowd signal(s) and no matching news; "
+                f"{reversion:.0%} odds it gives back half."
+            )
         reasons.append(
             "The trade tape has no trader identity: ‘participants’ means the evidence points to a few "
             "Cup traders moving the price, not to new information"
@@ -280,8 +318,16 @@ def attribute(
         verdict = VERDICT_UNCLEAR
         confidence = 0.35
         reversion = 0.4
-        summary = f"Unclear: news score {news:.2f} and {crowd} crowd signal(s); wait for confirmation."
-        reasons.append(f"Mixed evidence (news score {news:.2f}, {crowd} crowd signal(s)): wait for confirmation")
+        if news_failed:
+            summary = (f"Unclear: the news search failed and {crowd} crowd signal(s) are not enough on their own; "
+                       "wait for confirmation.")
+            reasons.append(
+                f"Mixed evidence (news search failed, {crowd} crowd signal(s); "
+                f"{MIN_CROWD_FOR_PARTICIPANTS + OUTAGE_EXTRA_CROWD} are needed without news): wait for confirmation"
+            )
+        else:
+            summary = f"Unclear: news score {news:.2f} and {crowd} crowd signal(s); wait for confirmation."
+            reasons.append(f"Mixed evidence (news score {news:.2f}, {crowd} crowd signal(s)): wait for confirmation")
 
     kept = [replace(a) for a in ranked if _contribution(a, surge) > 0][:MAX_ARTICLES]
     return Attribution(
@@ -295,6 +341,7 @@ def attribute(
         book_depth=book_depth,
         method="heuristic",
         analyzed_at=now,
+        news_status=news_status,
     )
 
 
@@ -564,6 +611,20 @@ def _trade_records(exchange_id: str, trades: Sequence[Any]) -> List[TradeRecord]
     return out
 
 
+def flow_until(surge: Surge) -> float:
+    """End of the trade window for a surge's flow analysis.
+
+    A surge stays open (its ``end_ts`` moving forward) for as long as the move is re-detected,
+    but the trades that *made* the move happened within its detection window of the start.
+    Hours of later trading would only dilute the crowd signals.
+    """
+    window = surge.window_s if _num(surge.window_s) and surge.window_s > 0 else 0.0
+    end = surge.end_ts
+    if window:
+        end = min(end, surge.start_ts + FLOW_WINDOW_SHARE * window)
+    return end + FLOW_SLACK_S
+
+
 def _short_error(exc: BaseException) -> str:
     text = str(exc).split(" — ")[0]  # drop the long hint suffix ApiError adds
     if not isinstance(exc, ApiError):
@@ -644,9 +705,8 @@ class Attributor:
                 self.store.add_trades(surge.exchange_id, trades)
             except Exception as exc:
                 log.warning("could not store trades for exchange %s: %s", surge.exchange_id, exc)
-        records = [
-            t for t in _trade_records(surge.exchange_id, trades) if surge.start_ts <= t.ts <= surge.end_ts + FLOW_SLACK_S
-        ]
+        until = flow_until(surge)
+        records = [t for t in _trade_records(surge.exchange_id, trades) if surge.start_ts <= t.ts <= until]
         if len(trades) >= TRADES_MAX:
             notes.append(f"Tape capped at the newest {TRADES_MAX} trades since an hour before the move")
         try:
@@ -670,16 +730,25 @@ class Attributor:
         depth, _mid = _book_depth(payload, reference)
         return depth
 
-    def _articles(self, surge: Surge, title: str, option: Optional[str], now: float, notes: List[str]) -> List[Article]:
+    def _articles(self, surge: Surge, title: str, option: Optional[str], now: float,
+                  notes: List[str]) -> Tuple[List[Article], str, List[str]]:
+        """(articles, news status, provider errors) for the surge's market."""
         if self.news is None:
             notes.append("News search is disabled: the verdict rests on the tape and the book only")
-            return []
+            return [], NEWS_DISABLED, []
+        since = surge.start_ts - NEWS_SINCE_S
         try:
-            return list(self.news.search_for_market(title, option, surge.start_ts - NEWS_SINCE_S, now, limit=20))
+            search = getattr(self.news, "search_market", None)
+            if callable(search):
+                result = search(title, option, since, now, limit=20)
+                articles = [a for a in getattr(result, "articles", None) or [] if isinstance(a, Article)]
+                if getattr(result, "ok", True):
+                    return articles, NEWS_OK, []
+                return articles, NEWS_UNAVAILABLE, [str(e) for e in getattr(result, "errors", None) or []]
+            return list(self.news.search_for_market(title, option, since, now, limit=20)), NEWS_OK, []
         except Exception as exc:
             log.warning("news search failed for %r: %s", title, exc)
-            notes.append(f"News search failed ({type(exc).__name__})")
-            return []
+            return [], NEWS_UNAVAILABLE, [type(exc).__name__]
 
     def analyze(self, surge: Surge) -> Attribution:
         """Attribute one surge. API errors degrade (flow/depth None); fatal auth errors raise."""
@@ -688,8 +757,9 @@ class Attributor:
         title, option = self._market_info(surge)
         flow = self._flow(surge, notes)
         depth = self._depth(surge, notes)
-        articles = self._articles(surge, title, option, now, notes)
-        result = attribute(surge, flow, articles, depth, title, option, now)
+        articles, news_status, news_errors = self._articles(surge, title, option, now, notes)
+        result = attribute(surge, flow, articles, depth, title, option, now, news_status=news_status,
+                           news_errors=news_errors)
         if notes:
             result.reasons.extend(notes)
         if self.judge is not None:
@@ -705,4 +775,8 @@ class Attributor:
                     log.warning("LLM judge raised %s: %s; keeping the heuristic verdict", type(exc).__name__, exc)
                     verdict = None
                 result = merge(result, verdict, result.articles)
+                if result.news_status == NEWS_UNAVAILABLE and result.verdict == VERDICT_PARTICIPANTS and not result.articles:
+                    # Claude saw the same "news search failed" evidence; the outage cap still applies.
+                    result.confidence = round(min(result.confidence, OUTAGE_MAX_CONFIDENCE), 4)
+                    result.reversion_odds = round(min(result.reversion_odds, OUTAGE_MAX_REVERSION), 4)
         return result

@@ -86,7 +86,7 @@ def parse_iso_ts(value: object) -> Optional[float]:
 class _Series:
     """Time-ordered points with a usable price, plus parallel ``ts``/``prices`` lists for bisecting."""
 
-    __slots__ = ("points", "ts", "prices", "_q")
+    __slots__ = ("points", "ts", "prices", "held", "_q")
 
     def __init__(self, points: Optional[Sequence[PricePoint]]) -> None:
         usable = [p for p in (points or ()) if p is not None and _num(p.ts) is not None and _num(p.price) is not None]
@@ -94,6 +94,8 @@ class _Series:
         self.points: List[PricePoint] = usable
         self.ts: List[float] = [float(p.ts) for p in usable]
         self.prices: List[float] = [float(p.price) for p in usable]  # type: ignore[arg-type]
+        # Candles exist only for buckets with trades: a candle close holds until the next point.
+        self.held: List[bool] = [getattr(p, "source", "tick") == "candle" for p in usable]
         self._q: Optional[List[int]] = None
 
     def __len__(self) -> int:
@@ -111,11 +113,35 @@ class _Series:
         return i if i >= 0 else None
 
     def value_idx(self, t: float, tolerance_s: float) -> Optional[int]:
-        """Like :meth:`idx_at`, but None when that point is older than ``t - tolerance_s``."""
+        """Like :meth:`idx_at`, but None when that point is older than ``t - tolerance_s``.
+
+        A *candle* point is the exception when a later point exists: the price-history API only
+        has candles for buckets with trades, so a gap after a candle means nobody traded and its
+        close still held at ``t`` (forward fill). A gap between ticks is a tracking outage, and a
+        candle with nothing after it may be stale, so those keep the tolerance rule.
+        """
         i = self.idx_at(t)
-        if i is None or self.ts[i] < t - tolerance_s - _TS_EPS:
+        if i is None:
+            return None
+        if self.ts[i] < t - tolerance_s - _TS_EPS and not (self.held[i] and i + 1 < len(self.ts)):
             return None
         return i
+
+    def window_ref(self, t: float, tolerance_s: float, partial: bool = False) -> Optional[Tuple[int, float]]:
+        """``(index, start time)`` of the reference for a window starting at ``t``, or None.
+
+        The start time is the point's own time, except for a held candle (its close carried
+        forward), which starts the window at ``t`` itself. With ``partial``, a series that only
+        begins after ``t`` uses its first point: the move since tracking started, which is shorter
+        than the window, so a qualifying change is a real move within the window.
+        """
+        i = self.value_idx(t, tolerance_s)
+        if i is not None:
+            start = self.ts[i]
+            return i, (t if start < t - tolerance_s - _TS_EPS else start)
+        if partial and len(self.ts) and self.ts[0] > t + _TS_EPS:
+            return 0, self.ts[0]
+        return None
 
 
 def _sigma_from_sums(n: int, s1: int, s2: int) -> float:
@@ -176,7 +202,8 @@ def mark_price(last: Optional[float], bid: Optional[float], ask: Optional[float]
 
 
 def value_at(points: Sequence[PricePoint], t: float, tolerance_s: float) -> Optional[PricePoint]:
-    """Latest point with ``ts <= t`` and a non-None price, if not older than ``t - tolerance_s``."""
+    """Latest point with ``ts <= t`` and a non-None price, if not older than ``t - tolerance_s``
+    (a candle followed by a later point holds through the gap, see ``_Series.value_idx``)."""
     series = _Series(points)
     i = series.value_idx(t, tolerance_s)
     return series.points[i] if i is not None else None
@@ -185,7 +212,8 @@ def value_at(points: Sequence[PricePoint], t: float, tolerance_s: float) -> Opti
 def change_over(points: Sequence[PricePoint], now: float, window_s: float) -> Optional[float]:
     """``p_now - p_then`` over ``window_s`` (None when either mark is missing or stale).
 
-    ``p_now`` must be no older than 15 minutes; ``p_then`` uses the window tolerance.
+    ``p_now`` must be no older than 15 minutes; ``p_then`` uses the window tolerance, except that
+    a candle close holds until the next point (trade-less buckets have no candle).
     """
     series = _Series(points)
     i_now = series.value_idx(now, MAX_STALENESS_S)
@@ -216,6 +244,7 @@ def _detect(
     windows: Dict[str, Tuple[float, float]],
     z_threshold: float,
     sigma_fn: SigmaFn,
+    partial: bool = False,
 ) -> List[Surge]:
     """Shared decision logic for :func:`detect_surges` and the backtest's incremental scanner."""
     if not len(series):
@@ -225,10 +254,13 @@ def _detect(
         return []
     prices = series.prices
     p_now = prices[i_now]
-    candidates: List[Tuple[str, float, int, float, Optional[float]]] = []
+    candidates: List[Tuple[str, float, int, float, float, Optional[float]]] = []
     for name, (window_s, min_change) in sorted(windows.items(), key=lambda kv: kv[1][0]):
-        i_then = series.value_idx(now - window_s, window_tolerance(window_s))
-        if i_then is None:
+        ref = series.window_ref(now - window_s, window_tolerance(window_s), partial)
+        if ref is None:
+            continue
+        i_then, start_ts = ref
+        if i_then >= i_now:
             continue
         change = round(p_now - prices[i_then], 6)
         if abs(change) < _EPS or abs(change) + _EPS < min_change:
@@ -237,13 +269,15 @@ def _detect(
         z = change / (sigma * math.sqrt(window_s / VOL_STEP_S)) if sigma is not None and sigma > 0 else None
         if z is not None and abs(z) + _EPS < z_threshold:
             continue
-        candidates.append((name, window_s, i_then, change, z))
+        candidates.append((name, window_s, i_then, start_ts, change, z))
     if not candidates:
         return []
     # Describe the move by the SHORTEST window that still captures most of it: a 20-minute
     # spike is a 1h surge, not a 24h one, so attribution looks at the trades that moved it.
-    biggest = max(abs(c[3]) for c in candidates)
-    name, window_s, i_then, change, z = next(c for c in candidates if abs(c[3]) + _EPS >= SHORTEST_SHARE * biggest)
+    biggest = max(abs(c[4]) for c in candidates)
+    name, window_s, i_then, start_ts, change, z = next(
+        c for c in candidates if abs(c[4]) + _EPS >= SHORTEST_SHARE * biggest
+    )
     span = prices[i_then : i_now + 1]
     up = change > 0
     surge = Surge(
@@ -251,7 +285,7 @@ def _detect(
         market_id=market_id,
         window=name,
         window_s=window_s,
-        start_ts=series.ts[i_then],
+        start_ts=start_ts,
         end_ts=series.ts[i_now],
         start_price=prices[i_then],
         end_price=p_now,
@@ -271,6 +305,8 @@ def detect_surges(
     market_id: str,
     windows: Optional[Dict[str, Tuple[float, float]]] = None,
     z_threshold: float = Z_THRESHOLD,
+    *,
+    partial: bool = False,
 ) -> List[Surge]:
     """At most one Surge (the most significant qualifying window). Empty list when none.
 
@@ -279,13 +315,17 @@ def detect_surges(
     24 h *before* the window. Among qualifying windows the shortest one whose ``|change|`` is at
     least half of the largest qualifying ``|change|`` is reported. The current mark must be
     no older than 15 minutes. Only points with ``ts <= now`` are used (no look-ahead).
+
+    ``partial=True`` is for live-only tracking (no candle history): a window reaching back
+    before the first point measures the move since that point instead of being skipped, so a
+    jump seen live is reported without waiting a full window of ticks.
     """
     series = _Series(points)
 
     def sigma(window_s: float, end: float) -> Optional[float]:
         return _volatility(series, end, VOL_LOOKBACK_S, VOL_STEP_S)
 
-    return _detect(series, now, exchange_id, market_id, windows or SURGE_WINDOWS, z_threshold, sigma)
+    return _detect(series, now, exchange_id, market_id, windows or SURGE_WINDOWS, z_threshold, sigma, partial)
 
 
 class _SurgeScanner:
@@ -544,6 +584,50 @@ def downsample(points: Sequence[PricePoint], max_points: int) -> List[PricePoint
     m = max_points - 1
     # round-half-up of i * (n - 1) / m in integer arithmetic; distinct because n - 1 > m
     return [pts[(2 * i * (n - 1) + m) // (2 * m)] for i in range(max_points)]
+
+
+def downsample_by_time(points: Sequence[PricePoint], max_points: int, start: Optional[float] = None,
+                       end: Optional[float] = None) -> List[PricePoint]:
+    """At most ``max_points`` points spread evenly over *time* (for sparklines and charts).
+
+    ``[start, end]`` (default: the first and last point) is cut into ``max_points - 1`` equal
+    slots; each slot keeps its last point, and an empty slot after data repeats the previous
+    price at the slot's end (a price holds until it changes). The first and last points are
+    always kept. Unlike :func:`downsample`, a burst of dense live ticks cannot crowd out the
+    rest of the window. Input is sorted by time first.
+    """
+    pts = sorted((p for p in (points or ()) if p is not None and _num(p.ts) is not None), key=lambda p: p.ts)
+    if max_points <= 0 or not pts:
+        return []
+    if len(pts) <= max_points:
+        return pts
+    if max_points == 1:
+        return [pts[-1]]
+    lo = float(start) if start is not None else float(pts[0].ts)
+    hi = float(end) if end is not None else float(pts[-1].ts)
+    lo, hi = min(lo, float(pts[0].ts)), max(hi, float(pts[-1].ts))
+    slots = max_points - 1
+    width = (hi - lo) / slots
+    if width <= 0:
+        return [pts[0], pts[-1]] if len(pts) > 1 else [pts[0]]
+    last_in: List[Optional[PricePoint]] = [None] * slots
+    for p in pts[1:]:
+        k = min(slots - 1, max(0, int((float(p.ts) - lo) / width)))
+        last_in[k] = p  # sorted input: the last write is the slot's last point
+    out: List[PricePoint] = [pts[0]]
+    prev = pts[0]
+    first_slot = min(slots - 1, max(0, int((float(pts[0].ts) - lo) / width)))
+    for k in range(first_slot, slots):
+        kept = last_in[k]
+        if kept is not None:
+            out.append(kept)
+            prev = kept
+        elif k < slots - 1:
+            slot_end = lo + (k + 1) * width
+            if slot_end > float(prev.ts) and slot_end < float(pts[-1].ts):
+                out.append(PricePoint(ts=slot_end, price=prev.price, last=prev.last, bid=prev.bid, ask=prev.ask,
+                                      source=prev.source))
+    return out  # the first point plus at most one per slot; the last slot holds the last point
 
 
 def hours_until(iso_date: Optional[str], now: float) -> Optional[float]:

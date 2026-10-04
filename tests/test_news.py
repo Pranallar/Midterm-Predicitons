@@ -785,3 +785,27 @@ def test_demo_news_provider_plugs_into_searcher() -> None:
     searcher = NewsSearcher([provider], clock=lambda: NOW)
     results = searcher.search_for_market("Will Republicans win the Pennsylvania Senate race?", "YES", NOW - 86400, NOW)
     assert all(isinstance(a, Article) and 0 < a.relevance <= 1 for a in results)
+
+
+# --------------------------------------------------------------------------- round-1 QA regressions
+
+
+def test_live_api_8_search_market_reports_an_outage() -> None:
+    clock = FakeClock(NOW)
+    down = NewsSearcher([FakeProvider("google-news", [], error="ConnectError: name resolution failed"),
+                         FakeProvider("gdelt", RuntimeError("boom"))], clock=clock)
+    result = down.search_market(TITLE, OPTION, None, None)
+    assert result.ok is False and result.articles == [] and not result.cached
+    assert result.errors[0] == "google-news: ConnectError: name resolution failed"
+    assert result.errors[1] == "gdelt: RuntimeError: boom"
+    assert down.search_for_market(TITLE, OPTION, None, None) == []  # the list API is unchanged
+
+    quiet = NewsSearcher([FakeProvider("google-news", [], error="HTTP 503"), FakeProvider("gdelt", [])], clock=clock,
+                         relax=False)
+    answered = quiet.search_market(TITLE, OPTION, None, None)
+    assert answered.ok is True and answered.errors == ["google-news: HTTP 503"]  # one provider answered: "no news"
+    again = quiet.search_market(TITLE, OPTION, None, None)
+    assert again.ok is True and again.cached is True
+
+    assert NewsSearcher([], clock=clock).search_market(TITLE, OPTION, None, None).ok is False
+    assert NewsSearcher([FakeProvider("p", [])], clock=clock).search_market("", None, None, None).ok is True

@@ -1133,3 +1133,26 @@ def test_price_table_with_delta() -> None:
     assert lines[2].split()[-2:] == ["-0.030", "latest_price,best_bid"]
     new_row = diff_rows({"1": {}}, [{"exchange_id": "36", "latest_price": 0.5}])
     assert price_table(new_row, with_delta=True).splitlines()[2].split()[-1] == "new"
+
+
+# --------------------------------------------------------------------------- round-1 QA regressions
+
+
+def test_live_api_1_leaderboard_403_is_not_fatal() -> None:
+    from supermarket_bot.bot import is_fatal
+    from supermarket_bot.errors import ApiError, NetworkError, RequestCancelled
+
+    # optional reads the key may not see: report and carry on
+    assert not is_fatal(ApiError(403, "FORBIDDEN", "You are not a member of this tournament."))
+    assert not is_fatal(ApiError(403, "FORBIDDEN", "Forbidden"))
+    assert not is_fatal(ApiError(403, "ADMIN_REQUIRED", "Admin only"))
+    for status, code in ((404, "NOT_FOUND"), (409, "CONFLICT"), (429, "RATE_LIMITED"), (503, "SERVICE_UNAVAILABLE")):
+        assert not is_fatal(ApiError(status, code, "x"))
+    assert not is_fatal(NetworkError("x")) and not is_fatal(ValueError("x"))
+    # the key itself is unusable
+    for code in ("INVALID_API_KEY", "API_KEY_REVOKED", "API_KEY_EXPIRED", "INSUFFICIENT_SCOPES", "ACCOUNT_BANNED",
+                 "TERMS_NOT_ACKNOWLEDGED", "RESIDENCE_UPDATE_REQUIRED", "MISSING_API_KEY"):
+        assert is_fatal(ApiError(403 if code not in ("INVALID_API_KEY", "MISSING_API_KEY") else 401, code, "x")), code
+    assert is_fatal(ApiError(401, "UNAUTHORIZED", "x"))
+    assert is_fatal(ApiError(403, "FORBIDDEN", "Confirm the email address on this API key's account to use the API."))
+    assert is_fatal(RequestCancelled("shutdown"))

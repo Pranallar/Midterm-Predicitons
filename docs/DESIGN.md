@@ -61,6 +61,9 @@ for 20 minutes per query.
   else None.
 * **Value at time**: the mark of the latest point with `ts <= t`. It counts as missing if that
   point is older than `t - tolerance`, where the tolerance is `max(0.25 * window, 120 s)`.
+  The exception is a candle followed by a later point: candles exist only for buckets with
+  trades, so its close holds through the gap. Gaps between our own ticks (tracking outages)
+  and a trailing candle keep the tolerance rule.
 * **Volatility**: resample marks onto a 300 s grid (forward-fill) over
   `[now - 24h - window, now - window]` (the history *before* the window under test), take the
   standard deviation of step differences. Return None with fewer than 12 steps.
@@ -78,6 +81,14 @@ for 20 minutes per query.
   `reverted_fraction = (peak - current) / (peak - start)` for up-moves (mirrored for down,
   clamped to [-1, 2]). Status is `reverted` if that fraction is ≥ 0.5, else `held` once
   `now - end_ts >= 24h`, else `open`.
+* The tracker sets `closed` when the surge's market leaves the open-market list (closed or
+  settled). It reopens the surge if the market is listed again.
+* Closed, reverted and held surges never produce fade or watch ideas.
+* Merging re-detections (`store.record_surge`) keeps one frame per surge.
+  * `start_ts`, `start_price`, `window` and `zscore` always come from one detection, and
+    `change` is always `end_price - start_price`.
+  * A shorter window starting later that holds at least half of the move replaces the frame.
+  * So does a longer window, but only if the move went at least 0.03 past the old peak.
 * **High band**: `high_band(points, now, threshold=0.95, lookback_s=6h, min_fraction=0.8)`.
   The favourite side is YES if the current mark is ≥ 0.5, else NO, with
   `fav = p` or `1 - p`. `time_in_band` is the time-weighted share of the lookback where
@@ -87,8 +98,10 @@ for 20 minutes per query.
 * **Trade flow**: `trade_flow(trades)` computes the `TradeFlow` fields. HHI is
   `sum((size/total)^2)`. `price_impact` is `|last_price - first_price| / max(total/100, 1)`,
   with trades in time order.
-* **Downsampling**: `downsample(points, max_points)` keeps the first and last points and
-  picks evenly spaced points in between (for sparklines and charts).
+* **Downsampling**: `downsample_by_time(points, max_points, start, end)` cuts the window into
+  equal time slots. Each slot keeps its last point, and empty slots hold the previous price.
+  Sparklines and the drawer chart use it, so dense live ticks never crowd out older history.
+  `downsample(points, max_points)` (index-based) remains for other uses.
 
 ## Attribution (`attribution.py`)
 
@@ -113,6 +126,12 @@ The heuristic is `attribute(surge, flow, articles, book_depth, market_title, opt
     `confidence = min(0.9, 0.4 + 0.12 * crowd)`,
     `reversion_odds = min(0.8, 0.5 + 0.08 * crowd)`.
   * **unclear**: anything else. `confidence = 0.35`, `reversion_odds = 0.4`.
+* `news_status` is `ok` (a provider answered), `unavailable` (every provider failed) or
+  `disabled`.
+  * When unavailable, the missing headlines are not evidence: the reasons say "News search
+    failed".
+  * **participants** then needs 3 crowd signals, confidence is capped at 0.55 and reversion
+    odds at 0.6.
 * `reasons` are short human-readable bullets for each signal, with numbers.
 * The trade tape has no trader identity, so "participants" means the evidence points to a
   few Cup traders. Say this in the reasons.
@@ -196,9 +215,12 @@ comes from the API, falling back to `SUPERMARKET_CUP_END`, default
     only marked at the Cup's end: halve the score and add the risk "valued at market price at
     Cup end, not paid out".
   * Skip when `entry >= 0.995` (no room).
-* **Arbitrage**: one entry per engine-reported constraint violation (`violationAmount`, the
-  suggested trades as the rationale) and per multi-outcome book with
-  `hasArbitrageOpportunity`.
+* **Arbitrage**: one entry per engine-reported constraint violation and per multi-outcome
+  book with `hasArbitrageOpportunity`.
+  * A multi-leg violation is a *set*. `legs` lists each leg with its own live price,
+    `unit` is `"sets"`, `entry_price` is the cost of one set, and the edge is the set's
+    payoff minus that cost.
+  * `settles_before_cup_end` is known only when every leg's settlement date is known.
 * **Watch**: unclear surges that are still open, with zero size and a "wait for confirmation"
   note.
 * **Sizing**:
@@ -253,8 +275,21 @@ context_refresh=300, clock=time.time)`.
   attribution), `high_band` list, `context` (balance, leaderboard, constraints,
   overround rows), and `status` (last snapshot time, cycles, errors, read-budget use,
   backfill progress, queue lengths).
-* Errors: transient API errors are logged and counted; `bot.is_fatal` errors stop the
-  tracker and surface in `status.fatal_error`.
+* Errors: transient API errors are logged and counted.
+  * Only key-level failures are fatal (`bot.is_fatal`): 401s, invalid, revoked or expired
+    keys, missing scopes, a banned account, terms or residence, and an unconfirmed email.
+    They stop the tracker and surface in `status.fatal_error`.
+  * A 403 on an optional read (leaderboard, portfolio, constraints, books) is a problem, not
+    a stop.
+* `status()["problems"]` lists the current non-fatal failures:
+  `{source, message, since, last, count, severity}`. An entry clears when that source
+  succeeds again.
+* `status()["detection"]` explains when surge detection is limited (for example while history
+  is still loading). Detection waits for an outcome's history at most 10 minutes and never
+  while the backfill is failing; in that case it runs on live prices only.
+* Context refresh and backfill use single-attempt requests within their own budgets, so a
+  slow or failing optional read never stalls price snapshots.
+* The strategy report lists `assumptions` whenever the balance or leaderboard is unknown.
 
 ## Demo (`demo.py`)
 

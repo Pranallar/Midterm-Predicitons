@@ -516,8 +516,93 @@ def _leg(trade: Mapping[str, Any]) -> Tuple[str, Optional[float]]:
     return contract, (price if contract == "yes" else 1.0 - price)
 
 
+def _quote_cost(contract: str, point: Optional[PricePoint]) -> Optional[float]:
+    """What buying ``contract`` costs at the live book: the YES ask, or ``1 - YES bid`` for NO."""
+    if point is None:
+        return None
+    if contract == "yes":
+        ask = _num(point.ask)
+        return ask if ask is not None and 0.0 < ask < 1.0 else None
+    bid = _num(point.bid)
+    return round(1.0 - bid, 6) if bid is not None and 0.0 < bid < 1.0 else None
+
+
+def _members(v: Mapping[str, Any]) -> List[str]:
+    """Exchange ids the relationship constrains (direction members, else the observed prices)."""
+    ids: List[str] = []
+    direction = v.get("direction")
+    if isinstance(direction, Mapping):
+        for key in ("fromExchangeIds", "toExchangeIds"):
+            ids.extend(str(x) for x in direction.get(key) or [] if x is not None)
+    if not ids:
+        ids = [str(o.get("exchangeId")) for o in v.get("observedPrices") or []
+               if isinstance(o, Mapping) and o.get("exchangeId") is not None]
+    return list(dict.fromkeys(ids))
+
+
+def _set_payoff(kind: str, legs: Sequence[Mapping[str, Any]], members: Sequence[str]) -> Tuple[Optional[float], bool]:
+    """(guaranteed settlement payoff of one set of the legs, whether it is only a lower bound).
+
+    * NO on n members of a mutually exclusive (or complementary) group: at most one wins, so at
+      least ``n - 1`` NO shares pay (exactly ``n - 1`` when the group is complementary and covered).
+    * YES on every member of a complementary group: exactly one wins, so the set pays 1.
+    Anything else (monotonic, implication, mixed sides): unknown, ``(None, False)``.
+    """
+    ids = [str(leg.get("exchange_id")) for leg in legs]
+    if len(legs) < 2 or len(set(ids)) != len(ids):
+        return None, False
+    sides = {leg.get("side") for leg in legs}
+    kind = str(kind or "").strip().lower()
+    covered = bool(members) and set(members) <= set(ids)
+    if sides == {"no"} and kind in ("mutually_exclusive", "complementary"):
+        return float(len(legs) - 1), not (kind == "complementary" and covered)
+    if sides == {"yes"} and kind == "complementary" and covered:
+        return 1.0, False
+    return None, False
+
+
+def _legs_settle_before(exchange_ids: Sequence[Optional[str]], infos: Mapping[str, ExchangeInfo],
+                        cup_end: Optional[float]) -> Tuple[Optional[bool], Optional[float]]:
+    """True/False when every leg's settlement date is known (all before the Cup end?), else None.
+
+    Also returns the latest settlement time of the legs.
+    """
+    if cup_end is None or not exchange_ids:
+        return None, None
+    latest: Optional[float] = None
+    verdicts: List[bool] = []
+    for eid in exchange_ids:
+        info = infos.get(str(eid)) if eid is not None else None
+        before, settle = _settles_before(info.settlement_date if info is not None else None, cup_end)
+        if before is None or settle is None:
+            return None, None
+        verdicts.append(before)
+        latest = settle if latest is None else max(latest, settle)
+    return all(verdicts), latest
+
+
+def _settlement_risk(before: Optional[bool], settle: Optional[float], cup_end: Optional[float]) -> str:
+    if before is True:
+        return f"It pays at settlement ({_when(settle)}), before the Cup ends"
+    if before is False:
+        return (f"Some legs settle after the Cup ends ({_when(cup_end)}): until then they are only valued at "
+                "market price, not paid out")
+    return "It pays at settlement; if that is after the Cup ends it is only valued at market price then"
+
+
+def _legs_text(legs: Sequence[Mapping[str, Any]]) -> str:
+    parts = []
+    for leg in legs:
+        name = leg.get("option") or leg.get("title") or f"exch {leg.get('exchange_id')}"
+        parts.append(f"{str(leg.get('side') or '').upper()} {name} @ {_px(leg.get('price'))}")
+    return " + ".join(parts)
+
+
 def arbitrage_opportunities(constraints: Optional[Mapping[str, Any]], overround_rows: Sequence[Mapping[str, Any]],
-                            balance: float, *, max_position_pct: float = MAX_POSITION_PCT) -> List[Opportunity]:
+                            balance: float, *, max_position_pct: float = MAX_POSITION_PCT,
+                            latest: Optional[Mapping[str, PricePoint]] = None,
+                            infos: Optional[Mapping[str, ExchangeInfo]] = None,
+                            cup_end: Optional[float] = None) -> List[Opportunity]:
     """One idea per engine-reported constraint violation and per multi-outcome book flagged
     ``hasArbitrageOpportunity``. Sized at the per-idea cap (a true arbitrage has no Kelly limit).
 
@@ -525,8 +610,18 @@ def arbitrage_opportunities(constraints: Optional[Mapping[str, Any]], overround_
     ``MarketDataBot.scan`` result (``violations``); ``overround_rows`` use ``scan``'s
     ``markets`` row shape (``market_id``, ``market_title``, ``outcomes``, ``overround``,
     ``arbitrage``) or the API's ``hasArbitrageOpportunity``.
+
+    A violation with several corrective trades is a *set*: ``legs`` lists every contract to buy
+    with its own price (the live ask, ``1 - YES bid`` for NO, from ``latest`` when known, else the
+    engine's ``currentPrice``), ``entry_price`` is the cost of one set, sizes count sets
+    (``unit="sets"``) and ``exchange_id`` / ``option`` are None. When the set's settlement payoff
+    is known (NO on every member of a mutually exclusive group, YES on every member of a
+    complementary one) the edge is ``payoff - cost``; otherwise it is the engine's violation
+    amount. ``settles_before_cup_end`` is set when every leg's settlement date is in ``infos``.
     """
     b = _num(balance) or 0.0
+    latest = latest or {}
+    infos = infos or {}
     out: List[Opportunity] = []
     rows = []
     if constraints:
@@ -538,54 +633,105 @@ def arbitrage_opportunities(constraints: Optional[Mapping[str, Any]], overround_
         if amount <= _EPS:
             continue
         trades = [t for t in (v.get("suggestedCorrectiveTrades") or []) if isinstance(t, Mapping)]
-        legs = [_leg(t) for t in trades]
-        costs = [c for _, c in legs]
+        legs: List[Dict[str, Any]] = []
+        live = bool(trades)
+        for t in trades:
+            contract, engine_cost = _leg(t)
+            eid = str(t.get("exchangeId")) if t.get("exchangeId") is not None else None
+            quoted = _quote_cost(contract, latest.get(eid)) if eid is not None else None
+            live = live and quoted is not None
+            cost = quoted if quoted is not None else engine_cost
+            info = infos.get(eid) if eid is not None else None
+            legs.append({
+                "exchange_id": eid,
+                "market_id": str(t.get("marketId")) if t.get("marketId") is not None else (info.market_id if info else None),
+                "title": t.get("marketTitle") or (info.market_title if info else None),
+                "option": t.get("outcome") if t.get("outcome") is not None else (info.option if info else None),
+                "side": contract,
+                "price": round(cost, 4) if cost is not None else None,
+            })
+        costs = [leg["price"] for leg in legs]
         entry = round(sum(costs), 6) if legs and all(c is not None for c in costs) else None  # type: ignore[misc]
+        multi = len(legs) > 1
         first = trades[0] if trades else {}
         observed = next((o for o in (v.get("observedPrices") or []) if isinstance(o, Mapping)), {})
         market_id = str(first.get("marketId") or observed.get("marketId") or "")
         kind = v.get("type") or "relationship"
-        title = first.get("marketTitle") or observed.get("marketTitle") or str(v.get("reason") or f"{kind} relationship")
-        er = amount / entry if entry else None
-        shares = int(math.floor(max_position_pct * b / entry + 1e-9)) if entry and b > 0 else 0
+        titles = list(dict.fromkeys(str(leg["title"]) for leg in legs if leg.get("title")))
+        if multi and len(titles) > 1:
+            title = " / ".join(titles[:3])
+        else:
+            title = first.get("marketTitle") or observed.get("marketTitle") or str(v.get("reason") or f"{kind} relationship")
+        payoff, at_least = _set_payoff(str(kind), legs, _members(v)) if multi else (None, False)
+        if payoff is not None and entry is not None:
+            edge: Optional[float] = round(payoff - entry, 6)
+        else:
+            edge = round(amount, 6)
+        er = edge / entry if entry and edge is not None else None
+        tradable = entry is not None and edge is not None and edge > _EPS
+        shares = int(math.floor(max_position_pct * b / entry + 1e-9)) if tradable and b > 0 else 0  # type: ignore[operator]
+        unit = "sets" if multi else "shares"
+        before, settle = _legs_settle_before([leg["exchange_id"] for leg in legs], infos, cup_end)
         rationale = [f"Engine-reported {kind} violation of {_px(amount)}: {v.get('reason') or 'prices break the relationship'}"]
         rule = (v.get("constraint") or {}).get("priceRule") if isinstance(v.get("constraint"), Mapping) else None
         if rule:
             rationale.append(f"Rule: {rule}")
-        for t, (contract, cost) in zip(trades, legs):
+        for t, leg in zip(trades, legs):
             rationale.append(
                 f"{t.get('action') or 'Trade'} {t.get('outcomeSide') or ''} on {t.get('marketTitle') or t.get('marketId') or '?'}"
-                f"{' - ' + str(t.get('outcome')) if t.get('outcome') else ''} (exch {t.get('exchangeId')}, buy {contract.upper()} "
-                f"at {_px(cost)}): {t.get('rationale') or ''}".rstrip(": ")
+                f"{' - ' + str(t.get('outcome')) if t.get('outcome') else ''} (exch {t.get('exchangeId')}, buy {leg['side'].upper()} "
+                f"at {_px(leg['price'])}): {t.get('rationale') or ''}".rstrip(": ")
             )
-        if entry:
-            rationale.append(f"The {len(legs)} leg(s) cost {_px(entry)} per set and gain about {_px(amount)} as prices "
-                             f"correct ({er:.1%}); {shares:,} sets at the {max_position_pct:.0%}-of-balance cap")
+        if entry is not None and payoff is not None:
+            pays = f"{'at least ' if at_least else ''}{payoff:.2f}"
+            if tradable:
+                rationale.append(f"One set ({_legs_text(legs)}) costs {_px(entry)} and pays {pays} at settlement: "
+                                 f"{_signed(edge)} per set ({er:.1%}); {shares:,} sets at the {max_position_pct:.0%}-of-balance cap")  # type: ignore[arg-type]
+            else:
+                rationale.append(f"At these prices one set ({_legs_text(legs)}) costs {_px(entry)}, no less than the {pays} "
+                                 "it pays: the gap is gone after the spread, so there is nothing to size")
+        elif entry is not None:
+            what = f"The {len(legs)} legs ({_legs_text(legs)}) cost {_px(entry)} per set" if multi else \
+                f"The trade costs {_px(entry)} per share"
+            rationale.append(f"{what} and gain about {_px(amount)} as prices correct ({er:.1%}); "
+                             f"{shares:,} {unit} at the {max_position_pct:.0%}-of-balance cap")
+        prices_risk = ("Leg prices are the live asks (NO = 1 - YES bid): fills can still move them, check the depth on every leg"
+                       if live else
+                       "Prices are last/valuation prices, not executable quotes: check the asks on every leg, the spread can eat the gap")
+        risks = [prices_risk]
+        if multi:
+            risks.append("Legs fill separately: a partial fill leaves a one-sided position")
+        risks.append("The gap can persist until settlement, tying up capital")
+        risks.append(_settlement_risk(before, settle, cup_end))
+        single = legs[0] if legs and not multi else None
+        sides = {leg["side"] for leg in legs}
         out.append(Opportunity(
             kind="arbitrage",
-            exchange_id=str(first.get("exchangeId")) if first.get("exchangeId") is not None else None,
+            exchange_id=single["exchange_id"] if single else None,
             market_id=market_id,
             title=str(title),
-            option=first.get("outcome"),
-            side=legs[0][0] if legs else "yes",
+            option=single["option"] if single else None,
+            side=(sides.pop() if len(sides) == 1 else legs[0]["side"]) if legs else "yes",
             entry_price=round(entry, 4) if entry is not None else None,
-            target_price=None,
+            target_price=round(payoff, 4) if payoff is not None and not at_least else None,
             stop_price=None,
             prob_win=None,
-            edge=round(amount, 6),
+            edge=edge,
             expected_return=round(er, 6) if er is not None else None,
             horizon_hours=None,
             suggested_shares=shares,
-            suggested_cost=round(shares * entry, 2) if entry else 0.0,
-            score=round((er or 0.0) * CONSTRAINT_CONFIDENCE, 6),
+            suggested_cost=round(shares * entry, 2) if entry and shares else 0.0,
+            score=round((er or 0.0) * CONSTRAINT_CONFIDENCE, 6) if tradable else 0.0,
             confidence=CONSTRAINT_CONFIDENCE,
             rationale=rationale,
-            risks=[
-                "Prices are last/valuation prices, not executable quotes: check the asks on every leg, the spread can eat the gap",
-                "Legs fill separately: a partial fill leaves a one-sided position",
-                "The gap can persist until settlement, tying up capital",
-            ],
+            risks=risks,
+            settles_before_cup_end=before,
+            legs=legs if multi else [],
+            unit=unit,
         ))
+    by_market: Dict[str, List[ExchangeInfo]] = {}
+    for info in infos.values():
+        by_market.setdefault(str(info.market_id), []).append(info)
     for row in overround_rows or ():
         if not isinstance(row, Mapping) or not (row.get("arbitrage") or row.get("hasArbitrageOpportunity")):
             continue
@@ -597,11 +743,21 @@ def arbitrage_opportunities(constraints: Optional[Mapping[str, Any]], overround_
         edge = round(1.0 - over, 6) if over is not None and over < 1.0 - _EPS else None
         er = edge / entry if edge is not None and entry else None
         shares = int(math.floor(max_position_pct * b / entry + 1e-9)) if entry and edge is not None and b > 0 else 0
+        members = by_market.get(market_id) or []
+        before, settle = _legs_settle_before([m.exchange_id for m in members], infos, cup_end)
+        legs = []
+        if members and (not isinstance(n_out, int) or n_out == len(members)):
+            legs = [{"exchange_id": m.exchange_id, "market_id": market_id, "title": title, "option": m.option,
+                     "side": "yes", "price": _quote_cost("yes", latest.get(m.exchange_id))} for m in members]
+            if any(leg["price"] is None for leg in legs):
+                legs = []  # without every ask the per-leg list would not add up to the set price
         rationale = [f"The engine flags a potential arbitrage: the best prices across "
                      f"{str(n_out) + ' ' if n_out else 'its '}outcomes sum to {_px(over)}, below 1.00"]
         if edge is not None and entry:
             rationale.append(f"Buying one YES share of every outcome costs {_px(entry)} and pays 1.00 if exactly one wins "
                              f"({_signed(edge)} per set, {er:.1%}); {shares:,} sets at the {max_position_pct:.0%}-of-balance cap")
+        if legs:
+            rationale.append(f"Current asks: {_legs_text(legs)}")
         out.append(Opportunity(
             kind="arbitrage",
             exchange_id=None,
@@ -624,8 +780,11 @@ def arbitrage_opportunities(constraints: Optional[Mapping[str, Any]], overround_
             risks=[
                 "Only a potential arbitrage: it pays only if the listed outcomes are exhaustive and mutually exclusive",
                 "Every leg must fill at its best ask: check the depth on each outcome",
-                "It pays at settlement; if that is after the Cup ends it is only valued at market price then",
+                _settlement_risk(before, settle, cup_end),
             ],
+            settles_before_cup_end=before,
+            legs=legs,
+            unit="sets",
         ))
     return out
 
@@ -732,6 +891,45 @@ def backtest_fade(series_by_exchange: Mapping[str, Sequence[PricePoint]], horizo
 # --------------------------------------------------------------------------- report
 
 
+def _join(items: Sequence[str]) -> str:
+    items = list(items)
+    if len(items) <= 1:
+        return "".join(items)
+    return ", ".join(items[:-1]) + " and " + items[-1]
+
+
+def _unknown_inputs(balance: Optional[float], leader: Optional[float], rank: Optional[int]) -> List[str]:
+    out = []
+    if rank is None:
+        out.append("your rank")
+    if leader is None:
+        out.append("the leader's value")
+    if balance is None:
+        out.append("your balance")
+    return out
+
+
+def _assumptions(mode: str, balance: Optional[float], sizing: float, leader: Optional[float], rank: Optional[int],
+                 days_left: float) -> List[str]:
+    """What the report assumed for unknown inputs (failed or missing balance / leaderboard reads)."""
+    out: List[str] = []
+    if balance is None:
+        out.append(f"Balance unknown: sized on the {sizing:,.0f} starting balance")
+    if rank is None and leader is None:
+        text = f"Leaderboard unavailable: risk mode assumes {mode}"
+        if mode == MODE_AGGRESSIVE:
+            text += f" (rank unknown, treated as outside the top 10 with {days_left:.0f} days left)"
+        out.append(text)
+    elif rank is None:
+        out.append("Rank unknown: risk mode treats you as outside the top 3"
+                   + (" and the top 10" if mode == MODE_AGGRESSIVE and days_left <= 10 else ""))
+    elif leader is None:
+        out.append("Leader's value unknown: risk mode cannot tell how far behind the leader you are")
+    if balance is None and leader is not None:
+        out.append("Balance unknown: risk mode cannot compare your balance with the leader's")
+    return out
+
+
 def _principles(mode: str, balance: Optional[float], leader: Optional[float], rank: Optional[int],
                 days_left: float, cup_end: float) -> List[str]:
     out = [
@@ -754,19 +952,28 @@ def _principles(mode: str, balance: Optional[float], leader: Optional[float], ra
         if leader and balance is not None and balance < 0.9 * leader:
             why = f"your balance {balance:,.0f} is more than 10% behind the leader's {leader:,.0f}"
         else:
-            where = "unranked" if rank is None else f"ranked {rank}"
+            where = "unranked (or your rank is unknown)" if rank is None else f"ranked {rank}"
             why = f"only {days_left:.0f} days left and you are {where}, outside the top 10"
         out.append(f"Mode: aggressive ({why}), so favour fades and arbitrage (score x1.3) over slow carry (x0.7).")
     else:
-        out.append("Mode: balanced. You are neither defending a top-3 finish nor far behind: ideas are ranked by "
-                   "expected return x confidence.")
+        unknown = _unknown_inputs(balance, leader, rank)
+        if unknown:
+            verb = "is" if len(unknown) == 1 else "are"
+            out.append(f"Mode: balanced by default. {_join(unknown).capitalize()} {verb} unknown, so the bot cannot tell "
+                       "whether you are defending a top-3 finish or far behind: ideas are ranked by expected return x "
+                       "confidence.")
+        else:
+            out.append("Mode: balanced. You are neither defending a top-3 finish nor far behind: ideas are ranked by "
+                       "expected return x confidence.")
     return out
 
 
 def _describe(opp: Opportunity) -> str:
     label = opp.title + (f" ({opp.option})" if opp.option else "")
+    if opp.kind == "arbitrage" and opp.legs and not (opp.target_price == 1.0 and all(leg.get("side") == "yes" for leg in opp.legs)):
+        return f"buy the {len(opp.legs)}-leg set on {label} ({_legs_text(opp.legs)}) for {_px(opp.entry_price)} per set"
     if opp.kind == "arbitrage" and opp.exchange_id is None:
-        return f"buy every outcome of {label} for {_px(opp.entry_price)}"
+        return f"buy every outcome of {label} for {_px(opp.entry_price)} per set"
     at = f" at {_px(opp.entry_price)}" if opp.entry_price is not None else ""
     return f"{opp.kind} - buy {opp.side.upper()} on {label}{at}"
 
@@ -797,7 +1004,11 @@ def build_report(*, now: float, surges: Sequence[Surge], bands: Sequence[HighBan
     Uses the newest open surge per exchange (participants -> fade, unclear -> watch), every
     stable band (carry) and every arbitrage flag. Scores are ``expected_return x confidence``
     times the risk-mode multiplier; the top ``top_n`` are kept, best first. Sizing uses
-    ``balance``, else ``initial_balance``, else 100,000.
+    ``balance``, else ``initial_balance``, else 100,000. ``assumptions`` lists what was assumed
+    for unknown inputs (balance, rank, leader value), and sized ideas say so too.
+
+    Surges whose status is not ``open`` (reverted, held, or ``closed`` because their market
+    left the open list) never produce fade or watch ideas.
     """
     latest = latest or {}
     infos = infos or {}
@@ -835,7 +1046,12 @@ def build_report(*, now: float, surges: Sequence[Surge], bands: Sequence[HighBan
                                 kelly_mult=kelly_mult, max_position_pct=max_position_pct)
         if opp is not None:
             opps.append(opp)
-    opps.extend(arbitrage_opportunities(constraints, overround_rows, sizing, max_position_pct=max_position_pct))
+    opps.extend(arbitrage_opportunities(constraints, overround_rows, sizing, max_position_pct=max_position_pct,
+                                        latest=latest, infos=infos, cup_end=cup_end))
+    if bal is None:
+        for opp in opps:
+            if opp.suggested_shares > 0:
+                opp.rationale.append(f"Balance unknown: this size assumes the {sizing:,.0f} starting balance")
 
     multipliers = MODE_MULTIPLIERS.get(mode, {})
     for opp in opps:
@@ -856,4 +1072,5 @@ def build_report(*, now: float, surges: Sequence[Surge], bands: Sequence[HighBan
         principles=_principles(mode, bal, leader, rank, days_left, cup_end),
         opportunities=opps,
         backtest=backtest,
+        assumptions=_assumptions(mode, bal, sizing, leader, rank, days_left),
     )

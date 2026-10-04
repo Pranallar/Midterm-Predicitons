@@ -24,6 +24,11 @@ VERDICTS = (VERDICT_NEWS, VERDICT_PARTICIPANTS, VERDICT_UNCLEAR)
 SURGE_OPEN = "open"  # still near its peak
 SURGE_REVERTED = "reverted"  # gave back at least half of the move
 SURGE_HELD = "held"  # older than 24h and did not revert
+SURGE_CLOSED = "closed"  # its market left the open-market list (closed or settled): no trade ideas
+
+NEWS_OK = "ok"  # at least one news provider answered
+NEWS_UNAVAILABLE = "unavailable"  # every news provider failed: missing headlines are not evidence
+NEWS_DISABLED = "disabled"  # no news searcher configured
 
 
 def iso_ts(ts: Optional[float]) -> Optional[str]:
@@ -143,6 +148,7 @@ class Attribution(_Serializable):
     method: str = "heuristic"  # "heuristic" | "llm" | "heuristic+llm"
     llm: Optional[Dict[str, Any]] = None
     analyzed_at: Optional[float] = None
+    news_status: Optional[str] = None  # NEWS_OK | NEWS_UNAVAILABLE | NEWS_DISABLED (None: analysed before this existed)
 
 
 @dataclass
@@ -208,6 +214,11 @@ class Opportunity(_Serializable):
     risks: List[str] = field(default_factory=list)
     settles_before_cup_end: Optional[bool] = None
     surge_id: Optional[int] = None
+    # Multi-leg ideas (constraint arbitrage, full sets): one entry per contract to buy, each with
+    # its own price: {"exchange_id", "market_id", "title", "option", "side", "price"}. Empty for
+    # single-outcome ideas, whose exchange_id / option / side / entry_price describe the order.
+    legs: List[Dict[str, Any]] = field(default_factory=list)
+    unit: str = "shares"  # what suggested_shares counts: "shares", or "sets" for multi-leg ideas
 
 
 @dataclass
@@ -236,6 +247,9 @@ class StrategyReport(_Serializable):
     principles: List[str] = field(default_factory=list)
     opportunities: List[Opportunity] = field(default_factory=list)
     backtest: Optional[BacktestResult] = None
+    # What the report had to assume because an input was unknown, e.g. "Balance unknown: sized on
+    # the 100,000 starting balance" or "Leaderboard unavailable: risk mode assumes balanced".
+    assumptions: List[str] = field(default_factory=list)
     disclaimer: str = (
         "Read-only analysis. Nothing is traded automatically; estimates are heuristics, "
         "not guarantees."

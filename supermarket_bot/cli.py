@@ -31,13 +31,13 @@ def build_parser() -> argparse.ArgumentParser:
         description="Read-only market-data bot for the Super Market / Susquehanna Predictions Cup API.",
     )
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
-    p.add_argument("-t", "--tournament", help="tournament slug (default: SUPERMARKET_TOURNAMENT or the only active one)")
-    p.add_argument("--public", action="store_true", help="use the public global context instead of a tournament")
-    p.add_argument("--json", action="store_true", help="print raw JSON instead of tables")
-    p.add_argument("--env-file", default=".env", help="file to read settings from (default: .env)")
-    p.add_argument("--data-dir", help="where snapshots and stream logs are written (default: data/)")
+    _context_options(p, None)
     p.add_argument("-v", "--verbose", action="count", default=0, help="-v for info logs, -vv for debug")
-    sub = p.add_subparsers(dest="command", metavar="COMMAND")
+    # The context options also work after the command ("dashboard --tournament <slug>"): a copy on
+    # every subcommand whose defaults are SUPPRESS, so a value given on either side is kept.
+    common = argparse.ArgumentParser(add_help=False)
+    _context_options(common, argparse.SUPPRESS)
+    sub = p.add_subparsers(dest="command", metavar="COMMAND", parser_class=_parser_with(common))
     sub.required = True
 
     sub.add_parser("account", help="verify the key: profile, balance and accessible tournaments")
@@ -117,6 +117,32 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--llm", action="store_true", help="also ask Claude to judge surges (needs ANTHROPIC_API_KEY; costs money)")
     s.add_argument("--no-news", action="store_true", help="do not search online news for surges")
     return p
+
+
+def _context_options(p: argparse.ArgumentParser, default: Any) -> None:
+    """Options shared by the top-level parser and every subcommand (see build_parser)."""
+
+    def d(value: Any) -> Any:
+        return value if default is None else default
+
+    p.add_argument("-t", "--tournament", default=d(None),
+                   help="tournament slug (default: SUPERMARKET_TOURNAMENT or the only active one)")
+    p.add_argument("--public", action="store_true", default=d(False),
+                   help="use the public global context instead of a tournament")
+    p.add_argument("--json", action="store_true", default=d(False), help="print raw JSON instead of tables")
+    p.add_argument("--env-file", default=d(".env"), help="file to read settings from (default: .env)")
+    p.add_argument("--data-dir", default=d(None), help="where snapshots and stream logs are written (default: data/)")
+
+
+def _parser_with(common: argparse.ArgumentParser) -> Any:
+    """A subparser class that always inherits ``common``'s options."""
+
+    class _Sub(argparse.ArgumentParser):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            kwargs["parents"] = [common] + list(kwargs.get("parents") or [])
+            super().__init__(*args, **kwargs)
+
+    return _Sub
 
 
 def positive_int(text: str) -> int:

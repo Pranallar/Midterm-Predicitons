@@ -385,15 +385,61 @@ def test_record_surge_inserts_then_merges(store: TrackerStore) -> None:
 
     smaller = make_surge(start_ts=T0 + 400, end_ts=T0 + 900, start=0.50, end=0.57, detected_at=T0 + 900)
     merged = store.record_surge(smaller)
-    assert merged.change == 0.22 and merged.window == "1h"  # the larger move still defines it
+    assert merged.window == "1h"  # the 1h frame still describes the move (0.07 is less than half of it)
     assert (merged.start_ts, merged.end_ts, merged.end_price) == (T0 - 3000, T0 + 900, 0.57)
+    # change is re-measured to the new end, z scales with it (same frame, same volatility)
+    assert merged.change == 0.19 and merged.zscore == pytest.approx(5.5 * 0.19 / 0.22, abs=1e-4)
     assert merged.peak_price == 0.61
 
 
 def test_record_surge_down_moves_keep_the_lowest_peak(store: TrackerStore) -> None:
     store.record_surge(make_surge(direction="down", start=0.60, end=0.45, peak=0.44))
     merged = store.record_surge(make_surge(direction="down", start=0.60, end=0.47, peak=0.46, end_ts=T0 + 600))
-    assert merged.peak_price == 0.44 and merged.change == -0.15
+    assert merged.peak_price == 0.44 and merged.change == -0.13  # end - start, the peak is kept apart
+
+
+def test_functional_1_longer_window_redetection_keeps_the_start(store: TrackerStore) -> None:
+    """A 1h spike seen again 12 min later through the 24h window keeps its 1h start (not a day earlier)."""
+    now = T0 + 10 * DAY
+    first = store.record_surge(make_surge(start_ts=now - H, end_ts=now, start=0.38, end=0.575, peak=0.59,
+                                          window="1h", window_s=H, detected_at=now, zscore=7.7))
+    later = now + 720
+    merged = store.record_surge(make_surge(start_ts=later - 28.4 * H, end_ts=later, start=0.39, end=0.545, peak=0.59,
+                                           window="24h", window_s=DAY, detected_at=later, zscore=3.4))
+    assert merged.id == first.id
+    assert (merged.window, merged.window_s, merged.start_ts, merged.start_price) == ("1h", H, now - H, 0.38)
+    assert (merged.end_ts, merged.end_price) == (later, 0.545)
+    assert (merged.end_ts - merged.start_ts) / H == pytest.approx(1.2)
+    assert merged.change == 0.165 and merged.zscore == pytest.approx(7.7 * 0.165 / 0.195, abs=1e-4)
+    assert store.get_surge(first.id) == merged
+
+
+def test_functional_1_shorter_window_reframes_a_partial_history_detection(store: TrackerStore) -> None:
+    """A first sighting over 24h (partial history) is re-framed by a later 1h detection of the same move."""
+    now = T0 + 10 * DAY
+    store.record_surge(make_surge(start_ts=now - 20 * H, end_ts=now, start=0.40, end=0.55, window="24h",
+                                  window_s=DAY, zscore=3.1))
+    merged = store.record_surge(make_surge(start_ts=now - H + 300, end_ts=now + 300, start=0.42, end=0.56,
+                                           window="1h", window_s=H, detected_at=now + 300, zscore=6.0))
+    assert (merged.window, merged.start_ts, merged.start_price, merged.zscore) == ("1h", now - H + 300, 0.42, 6.0)
+    assert merged.change == 0.14
+
+
+def test_functional_2_change_always_equals_end_minus_start(store: TrackerStore) -> None:
+    """Whatever order the windows re-detect a move in, the card's start → end adds up to its change."""
+    now = T0 + 10 * DAY
+    detections = [
+        dict(start_ts=now - 300, end_ts=now, start=0.54, end=0.675, window="5m", window_s=300.0, zscore=5.0),
+        dict(start_ts=now - H, end_ts=now + 60, start=0.535, end=0.66, peak=0.675, window="1h", window_s=H, zscore=4.0),
+        dict(start_ts=now - 6 * H, end_ts=now + 600, start=0.50, end=0.64, peak=0.675, window="6h", window_s=6 * H),
+        dict(start_ts=now + 300, end_ts=now + 900, start=0.60, end=0.655, peak=0.675, window="5m", window_s=300.0),
+        dict(start_ts=now - 23 * H, end_ts=now + 1800, start=0.51, end=0.70, window="24h", window_s=DAY, zscore=3.5),
+    ]
+    for d in detections:
+        merged = store.record_surge(make_surge(detected_at=d["end_ts"], **d))
+        assert merged.change == pytest.approx(merged.end_price - merged.start_price, abs=1e-9)
+        assert merged.end_ts - merged.start_ts <= 1.25 * merged.window_s + (merged.end_ts - now) + 1e-6
+    assert len(store.surges()) == 1
 
 
 def test_record_surge_does_not_merge_across_direction_status_or_time(store: TrackerStore) -> None:

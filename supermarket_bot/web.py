@@ -6,9 +6,9 @@ See docs/DESIGN.md (Web section).
 * :class:`DashboardApp` turns the tracker's live view and the SQLite store into plain,
   JSON-safe dicts, one method per endpoint, so it can be tested without HTTP.
 * :class:`DashboardServer` / :class:`DashboardHandler` serve those dicts as JSON and the
-  static UI files, with local-only protections: Host-header allow-list (DNS rebinding),
-  same-origin JSON-only POSTs, a strict Content-Security-Policy and no secrets in any
-  response.
+  static UI files, with local-only protections: Host-header allow-list (DNS rebinding; only
+  on loopback binds, see :class:`DashboardServer`), same-origin JSON-only POSTs, a strict
+  Content-Security-Policy and no secrets in any response.
 * :func:`run_dashboard` wires everything together for the CLI.
 
 Nothing here places orders.
@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import dataclasses
 import errno
+import ipaddress
 import json
 import logging
 import math
@@ -34,8 +35,13 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Seque
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from . import analytics, strategy
+from . import models as _models
 from .books import Book, parse_time
-from .models import HighBand, PricePoint, Surge
+from .models import SURGE_OPEN, HighBand, PricePoint, Surge
+
+# Set by the tracker when a surge's market leaves the open-market list (closed or settled).
+# Read with a default so this module also works with a models.py that predates the status.
+SURGE_CLOSED: str = getattr(_models, "SURGE_CLOSED", "closed")
 
 log = logging.getLogger("supermarket_bot")
 
@@ -82,13 +88,20 @@ STRATEGY_TTL_S = 30.0
 STRATEGY_ERROR_TTL_S = 5.0
 BACKTEST_TTL_S = 600.0
 BACKTEST_RETRY_S = 60.0
-BOOK_TTL_S = 15.0
+BOOK_TTL_S = 15.0  # a fetched order book (or its error) is reused for this long
+BOOK_WAIT_S = 0.4  # a request waits at most this long for a background book fetch, then answers "pending"
+BOOK_STALE_S = 120.0  # while a refresh runs, an expired book younger than this is still shown (marked stale)
+MAX_BOOK_FETCHES = 4  # order-book reads in flight at once (one per exchange)
+MAX_BOOKS_CACHED = 256
+MAX_PROBLEM_TEXT = 300
 MAX_SURGES = 100
 DEFAULT_INITIAL_BALANCE = 100_000.0
 DEFAULT_CUP_END_ISO = "2026-11-04T17:00:00Z"
 
 _EXCHANGE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _SURGE_ID_RE = re.compile(r"^[0-9]{1,12}$")
+# A syntactically plausible Host header (name, IPv4 or [IPv6], optional port), lower-cased.
+_HOST_HEADER_RE = re.compile(r"^(?:[a-z0-9_](?:[a-z0-9._-]{0,252})|\[[0-9a-f:.%a-z]{2,64}\])(?::[0-9]{1,5})?$")
 _SENSITIVE_KEY_RE = re.compile(r"(?i)(api[_-]?key|apikey|token|secret|password|passwd|authorization|bearer|cookie)")
 
 
@@ -214,6 +227,16 @@ def _downsample(points: Sequence[PricePoint], max_points: int) -> List[PricePoin
         return [pts[int(round(i * step))] for i in range(max_points)]
 
 
+def _downsample_time(points: Sequence[PricePoint], max_points: int, start: float, end: float) -> List[PricePoint]:
+    """Spread over time, so a burst of live ticks cannot crowd out the rest of a tier."""
+    if len(points) <= max_points:
+        return list(points)
+    try:
+        return list(analytics.downsample_by_time(points, max_points, start, end))
+    except Exception:  # analytics unavailable or failing: fall back to index-based thinning
+        return _downsample(points, max_points)
+
+
 def tiered_series(points: Sequence[PricePoint], now: float) -> List[PricePoint]:
     """Downsample a 7-day series to at most :data:`MAX_SERIES_POINTS`, denser near ``now``."""
     pts = sorted((p for p in points if p is not None and _finite(p.price) is not None), key=lambda p: p.ts)
@@ -225,7 +248,7 @@ def tiered_series(points: Sequence[PricePoint], now: float) -> List[PricePoint]:
         hi = now - end_before
         last_tier = end_before == 0.0
         chunk = [p for p in pts if lo <= p.ts < hi or (last_tier and p.ts >= hi)]
-        out.extend(_downsample(chunk, budget))
+        out.extend(_downsample_time(chunk, budget, lo, max(hi, chunk[-1].ts) if chunk else hi))
     older = [p for p in pts if p.ts < now - SERIES_WINDOW_S]
     if older and len(out) < MAX_SERIES_POINTS:
         out.insert(0, older[-1])
@@ -334,6 +357,61 @@ def context_summary(raw: Any) -> Dict[str, Any]:
     }
 
 
+def _clip(text: str, limit: int = MAX_PROBLEM_TEXT) -> str:
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def problems_summary(raw: Any) -> List[Dict[str, Any]]:
+    """The tracker's CURRENT non-fatal failures, normalised; malformed entries are dropped.
+
+    Each entry is ``{"source", "message", "since", "last", "count", "severity"}`` (severity
+    ``"warning"`` or ``"error"``), errors first, then the most recent. Extra keys pass through.
+    """
+    out: List[Dict[str, Any]] = []
+    for item in raw if isinstance(raw, (list, tuple)) else []:
+        entry = _plain(item)
+        if not isinstance(entry, Mapping):
+            continue
+        source = _pick(entry, "source", "where")
+        message = _pick(entry, "message", "error", "last_error")
+        if not source and not message:
+            continue
+        count = _finite(entry.get("count"))
+        severity = str(entry.get("severity") or "warning").strip().lower()
+        problem = dict(entry)
+        problem.update(
+            {
+                "source": str(source or "tracker"),
+                "message": _clip(str(message or "")),
+                "since": _epoch(entry.get("since")),
+                "last": _epoch(entry.get("last")),
+                "count": max(1, int(count)) if count is not None else 1,
+                "severity": "error" if severity == "error" else "warning",
+            }
+        )
+        out.append(problem)
+    out.sort(key=lambda p: (p["severity"] != "error", -(p["last"] or p["since"] or 0.0)))
+    return out
+
+
+def detection_summary(raw: Any) -> Optional[Dict[str, Any]]:
+    """The tracker's surge-detection state ``{"enabled", "waiting_for_history", "reason"}`` (None if not reported)."""
+    data = _plain(raw)
+    if not isinstance(data, Mapping):
+        return None
+    waiting = _finite(_pick(data, "waiting_for_history", "waiting"))
+    reason = data.get("reason")
+    out = dict(data)
+    out.update(
+        {
+            "enabled": bool(data.get("enabled", True)),
+            "waiting_for_history": int(waiting) if waiting is not None and waiting > 0 else 0,
+            "reason": str(reason) if reason else None,
+        }
+    )
+    return out
+
+
 def tracker_summary(raw: Any) -> Dict[str, Any]:
     """Normalise the tracker's status dict into the fields the UI reads (raw keys are kept too)."""
     st = _plain(raw) if raw is not None else {}
@@ -357,8 +435,15 @@ def tracker_summary(raw: Any) -> Dict[str, Any]:
     if total is None:
         total = _finite(_pick(st, "backfill_total"))
     pending = _finite(_pick(backfill, "pending", "remaining", "queued"))
+    failed = _finite(_pick(backfill, "failed", "gave_up"))
     if total is None and done is not None and pending is not None:
-        total = done + pending
+        total = done + pending + (failed or 0.0)
+    explicit = _pick(backfill, "complete", "finished_all")
+    if explicit is not None:
+        complete = bool(explicit)
+    else:
+        # A series that failed for good is finished too: nothing is left to load for it.
+        complete = total is not None and done is not None and done + (failed or 0.0) >= total
     queues = _pick(st, "queues", "queue_lengths", default={})
     if not isinstance(queues, Mapping):
         queues = {}
@@ -373,20 +458,60 @@ def tracker_summary(raw: Any) -> Dict[str, Any]:
         {
             "running": bool(_pick(st, "running", "alive", default=False)),
             "cycles": int(_finite(_pick(st, "cycles", "cycle_count", "snapshots")) or 0),
-            "last_snapshot_at": _epoch(_pick(st, "last_snapshot_at", "last_snapshot", "last_snapshot_ts", "last_cycle_at")),
+            # Only a snapshot that succeeded counts: a cycle whose market list or prices failed is
+            # not "Updated just now" (so no fallback to last_cycle_at).
+            "last_snapshot_at": _epoch(_pick(st, "last_snapshot_at", "last_snapshot", "last_snapshot_ts")),
             "errors": int(_finite(errors) or 0),
             "last_error": str(last_error) if last_error else None,
             "fatal_error": str(fatal) if fatal else None,
-            "backfill": {
-                "done": done,
-                "total": total,
-                "complete": bool(_pick(backfill, "complete", "finished_all", default=total is not None and done is not None and done >= total)),
-            },
+            "backfill": {"done": done, "total": total, "failed": failed, "pending": pending, "complete": complete},
             "queues": dict(queues),
             "read_budget": dict(budget),
+            "problems": problems_summary(st.get("problems")),
+            "detection": detection_summary(st.get("detection")),
         }
     )
     return out
+
+
+def _normalise_opportunity(opp: Dict[str, Any]) -> None:
+    """Ids as strings; a multi-leg idea's ``legs`` as clean dicts (the UI lists them one by one)."""
+    for key in ("exchange_id", "market_id"):
+        if opp.get(key) is not None:
+            opp[key] = str(opp[key])
+    raw_legs = opp.get("legs")
+    if raw_legs is None:  # a single-outcome idea
+        return
+    legs = []
+    for raw in raw_legs if isinstance(raw_legs, (list, tuple)) else []:
+        leg = _plain(raw)
+        if not isinstance(leg, Mapping):
+            continue
+        item = dict(leg)
+        for key in ("exchange_id", "market_id"):
+            item[key] = str(leg[key]) if leg.get(key) is not None else None
+        item["title"] = str(leg.get("title") or "")
+        item["option"] = leg.get("option")
+        side = str(leg.get("side") or "").strip().lower()
+        item["side"] = side if side in ("yes", "no") else None
+        item["price"] = _finite(leg.get("price"))
+        legs.append(item)
+    opp["legs"] = legs
+
+
+def _limiter_pause(limiter: Any) -> float:
+    """Seconds left on a rate limiter's 429 pause (0 when not paused or not knowable)."""
+    if limiter is None:
+        return 0.0
+    until = _finite(getattr(limiter, "_paused_until", None))
+    clock = getattr(limiter, "_clock", None)
+    if until is None or not callable(clock):
+        return 0.0
+    try:
+        now = _finite(clock())
+    except Exception:
+        return 0.0
+    return max(0.0, until - now) if now is not None else 0.0
 
 
 def _match_terms(text: str, terms: Sequence[str]) -> bool:
@@ -418,6 +543,7 @@ class DashboardApp:
         analysis_enabled: bool = True,
         news_enabled: bool = True,
         llm_enabled: bool = False,
+        book_wait: float = BOOK_WAIT_S,
     ) -> None:
         self.tracker = tracker
         self.store = store
@@ -438,21 +564,52 @@ class DashboardApp:
         self._backtest_at: Optional[float] = None
         self._backtest_error: Optional[str] = None
         self._backtest_thread: Optional[threading.Thread] = None
+        # Order books: (fetched_at, book, error) per exchange, fetched in background threads.
+        self.book_wait = max(0.0, float(book_wait))
         self._books: Dict[str, Tuple[float, Optional[Dict[str, Any]], Optional[str]]] = {}
-        self._book_locks: Dict[str, threading.Lock] = {}
+        self._book_fetches: Dict[str, threading.Event] = {}  # exchange id -> set when its fetch ends
         self.view_error: Optional[str] = None
+        self._last_view: Optional[Mapping[str, Any]] = None  # the last view() that worked
+        self.view_updated_at: Optional[float] = None
 
     # ------------------------------------------------------------------ inputs
     def _view(self) -> Dict[str, Any]:
+        """The tracker's view; when ``view()`` raises, the last good one with a fresh ``status()``.
+
+        The tracker keeps running when building its view fails, so the dashboard keeps showing
+        the last rows, counts and context (``view_error`` says the data is not updating) rather
+        than an empty "starting" state, and the tracker's live status stays current.
+        """
         try:
             view = self.tracker.view()
         except Exception as exc:  # the tracker failing must not take the dashboard down
-            self.view_error = self._short(exc)
             log.debug("tracker.view() failed", exc_info=True)
-            view = None
-        else:
-            self.view_error = None
-        return view if isinstance(view, Mapping) else {}
+            self.view_error = self._short(exc)
+            with self._lock:
+                last = self._last_view
+            stale: Dict[str, Any] = dict(last) if last is not None else {}
+            status = self._tracker_status()
+            if status is not None:
+                stale["status"] = status
+            return stale
+        self.view_error = None
+        if not isinstance(view, Mapping):
+            return {}
+        with self._lock:
+            self._last_view = view
+            self.view_updated_at = self.clock()
+        return dict(view)
+
+    def _tracker_status(self) -> Optional[Mapping[str, Any]]:
+        status_fn = getattr(self.tracker, "status", None)
+        if not callable(status_fn):
+            return None
+        try:
+            status = status_fn()
+        except Exception:
+            log.debug("tracker.status() failed", exc_info=True)
+            return None
+        return status if isinstance(status, Mapping) else None
 
     def _short(self, exc: BaseException) -> str:
         # Mask secrets BEFORE truncating, or a key cut at the boundary would leak its start.
@@ -488,13 +645,37 @@ class DashboardApp:
             rows.append(out)
         return rows
 
-    def _surge_dict(self, raw: Any, rows_by_id: Mapping[str, Mapping[str, Any]]) -> Optional[Dict[str, Any]]:
+    @staticmethod
+    def _open_known(view: Mapping[str, Any], rows: Sequence[Mapping[str, Any]]) -> bool:
+        """Whether the view's rows are the open-market list (False before it ever loaded).
+
+        An empty list counts only when the view really has one and the tracker has loaded the
+        market list (every market closed); a view that could not be read at all says nothing.
+        """
+        if rows:
+            return True
+        status = view.get("status")
+        return (
+            isinstance(view.get("exchanges"), list)
+            and isinstance(status, Mapping)
+            and status.get("markets_updated_at") is not None
+        )
+
+    def _surge_dict(
+        self, raw: Any, rows_by_id: Mapping[str, Mapping[str, Any]], open_known: bool = False
+    ) -> Optional[Dict[str, Any]]:
         surge = _plain(raw)
         if not isinstance(surge, Mapping) or surge.get("exchange_id") is None:
             return None
         out = dict(surge)
         out["exchange_id"] = str(surge["exchange_id"])
         row = rows_by_id.get(out["exchange_id"])
+        # A surge on a market that left the open list (closed or settled) is never "open": its
+        # last price is frozen and nothing can be traded. The tracker marks these SURGE_CLOSED;
+        # this also covers surges stored before it did.
+        out["market_open"] = (row is not None) if open_known else None
+        if open_known and row is None and out.get("status") == SURGE_OPEN:
+            out["status"] = SURGE_CLOSED
         info = None
         if row is None or not out.get("title"):
             info = self._info(out["exchange_id"]) if row is None else None
@@ -533,7 +714,8 @@ class DashboardApp:
                 raw = self.store.surges(since=self.clock() - 2 * DAY_S, limit=MAX_SURGES)
             except Exception:
                 raw = []
-        surges = [s for s in (self._surge_dict(item, by_id) for item in raw or []) if s is not None]
+        open_known = self._open_known(view, rows)
+        surges = [s for s in (self._surge_dict(item, by_id, open_known) for item in raw or []) if s is not None]
         surges.sort(key=lambda s: (_finite(s.get("detected_at")) or 0.0, _finite(s.get("id")) or 0.0), reverse=True)
         return surges[:MAX_SURGES]
 
@@ -563,6 +745,7 @@ class DashboardApp:
         surges = self._surges(view, rows)
         ctx = context_summary(view.get("context"))
         tracker = tracker_summary(view.get("status"))
+        view_error = self.view_error
         budget = tracker["read_budget"]
         limiter = getattr(self.client, "read_limiter", None)
         if limiter is not None and _finite(budget.get("used")) is None:
@@ -571,11 +754,29 @@ class DashboardApp:
             except Exception:
                 budget = {}
             tracker["read_budget"] = budget
+        problems = list(tracker["problems"])
+        paused_for = _limiter_pause(limiter)
+        if limiter is not None:
+            budget["paused_for"] = round(paused_for, 1)
+        if paused_for > 0 and not any(p["source"] == "rate limit" for p in problems):
+            # A 429 holds every read until its Retry-After; the request is still waiting, so the
+            # tracker has nothing to report yet.
+            problems.append(
+                {
+                    "source": "rate limit",
+                    "message": f"Rate limited by the API: reads are paused for {math.ceil(paused_for)} s.",
+                    "since": now,
+                    "last": now,
+                    "count": 1,
+                    "severity": "warning",
+                }
+            )
+        tracker["problems"] = problems
         bands = view.get("high_band") or []
         open_participants = 0
         for s in surges:
             att = s.get("attribution") or {}
-            if s.get("status") == "open" and att.get("verdict") == "participants":
+            if s.get("status") == SURGE_OPEN and att.get("verdict") == "participants":
                 open_participants += 1
         last_hour = sum(1 for s in surges if (_finite(s.get("detected_at")) or 0.0) >= now - 3600.0)
         cup_end = self._cup_end(ctx)
@@ -588,7 +789,10 @@ class DashboardApp:
             "interval": self.interval,
             "tournament": self._tournament(),
             "tracker": tracker,
-            "view_error": self.view_error,
+            "view_error": view_error,
+            "view_updated_at": self.view_updated_at,
+            "problems": problems,
+            "detection": tracker["detection"],
             "account": {
                 "balance": ctx["balance"],
                 "initial_balance": ctx["initial_balance"] if ctx["initial_balance"] is not None else DEFAULT_INITIAL_BALANCE,
@@ -682,10 +886,12 @@ class DashboardApp:
         now = self.clock()
         view = self._view()
         rows = self._rows(view)
+        open_known = self._open_known(view, rows)
         row = next((r for r in rows if r["exchange_id"] == eid), None)
         info = self._info(eid)
         if row is None and info is None:
             return None
+        market_open = (row is not None) if open_known else None
         if row is None:
             row = {
                 "exchange_id": eid,
@@ -705,7 +911,7 @@ class DashboardApp:
             stored = self.store.surges(since=now - SERIES_WINDOW_S, exchange_id=eid, limit=50)
         except Exception:
             stored = []
-        surges = [s for s in (self._surge_dict(item, by_id) for item in stored) if s is not None]
+        surges = [s for s in (self._surge_dict(item, by_id, open_known) for item in stored) if s is not None]
         live = {s.get("id"): s for s in self._surges(view, rows) if s.get("exchange_id") == eid}
         surges = [live.get(s.get("id"), s) for s in surges]
         for sid, s in live.items():
@@ -720,32 +926,84 @@ class DashboardApp:
             {"id": t.trade_id, "ts": t.ts, "price": t.price, "size": t.size, "side": t.side}
             for t in reversed(records[-MAX_TRADES:])
         ]
-        fetched_at, book, book_error = self._book(eid)
         band = row.get("high_band")
-        return {
+        out = {
             "now": now,
             "exchange": row,
+            "market_open": market_open,
             "series": series,
             "series_window_s": SERIES_WINDOW_S,
             "surges": surges,
             "trades": trades,
-            "book": book,
-            "book_error": book_error,
-            "book_fetched_at": fetched_at,
             "high_band": band,
         }
+        out.update(self._book(eid))
+        return out
 
-    def _book(self, eid: str) -> Tuple[Optional[float], Optional[Dict[str, Any]], Optional[str]]:
+    def _book(self, eid: str) -> Dict[str, Any]:
+        """The order-book fields of the exchange detail; never waits on the network for long.
+
+        The series, trades and surges come from the local store, so the detail answers at once.
+        A cached book (or its error) is reused for :data:`BOOK_TTL_S`. Otherwise one background
+        fetch per exchange starts (requests for the same book share it) and this waits at most
+        ``book_wait`` seconds for it; if it is still running the answer has ``book_pending``
+        True and either ``book`` None or the previous book marked ``book_stale``, and the next
+        poll picks the new book up. A slow read (rate-limit wait, Retry-After, timeouts) can
+        therefore never hold the whole drawer back.
+        """
         if self.client is None:
-            return None, None, "No live connection to the market."
+            return {
+                "book": None,
+                "book_error": "No live connection to the market.",
+                "book_fetched_at": None,
+                "book_pending": False,
+                "book_stale": False,
+            }
         now = self.clock()
+        start = False
         with self._lock:
             cached = self._books.get(eid)
             if cached is not None and now - cached[0] < BOOK_TTL_S:
-                return cached
-            lock = self._book_locks.setdefault(eid, threading.Lock())
-        if not lock.acquire(blocking=False):  # another request is already fetching this book
-            return cached if cached is not None else (None, None, "Loading the order book…")
+                return self._book_fields(cached, pending=False)
+            done = self._book_fetches.get(eid)
+            if done is None and len(self._book_fetches) < MAX_BOOK_FETCHES:
+                done = threading.Event()
+                self._book_fetches[eid] = done
+                start = True
+        if start:
+            assert done is not None
+            thread = threading.Thread(target=self._fetch_book, args=(eid, done), name=f"dashboard-book-{eid}", daemon=True)
+            try:
+                thread.start()
+            except RuntimeError:  # cannot start a thread (interpreter shutting down, thread limit)
+                with self._lock:
+                    self._book_fetches.pop(eid, None)
+                done.set()
+        if done is not None and self.book_wait > 0 and done.wait(self.book_wait):
+            with self._lock:
+                fresh = self._books.get(eid)
+            if fresh is not None and fresh is not cached:
+                return self._book_fields(fresh, pending=False)
+        if cached is not None and cached[1] is not None and now - cached[0] < BOOK_STALE_S:
+            fields = self._book_fields(cached, pending=True)
+            fields["book_stale"] = True
+            return fields
+        return {
+            "book": None,
+            "book_error": "Loading the order book…",
+            "book_fetched_at": None,
+            "book_pending": True,
+            "book_stale": False,
+        }
+
+    @staticmethod
+    def _book_fields(entry: Tuple[float, Optional[Dict[str, Any]], Optional[str]], pending: bool) -> Dict[str, Any]:
+        fetched_at, book, error = entry
+        return {"book": book, "book_error": error, "book_fetched_at": fetched_at, "book_pending": pending, "book_stale": False}
+
+    def _fetch_book(self, eid: str, done: threading.Event) -> None:
+        """Background thread: read one order book into the cache, then wake the waiting requests."""
+        result: Optional[Tuple[float, Optional[Dict[str, Any]], Optional[str]]] = None
         try:
             tournament_id = getattr(self.context, "tournament_id", None)
             try:
@@ -754,15 +1012,28 @@ class DashboardApp:
             except Exception as exc:
                 log.info("order book for %s failed: %s", eid, exc)
                 result = (self.clock(), None, self._short(exc))
-            with self._lock:
-                self._books[eid] = result
-                if len(self._books) > 256:  # keep the cache small
-                    oldest = sorted(self._books.items(), key=lambda kv: kv[1][0])[: len(self._books) - 256]
-                    for key, _ in oldest:
-                        self._books.pop(key, None)
-            return result
         finally:
-            lock.release()
+            with self._lock:
+                if result is not None:
+                    self._books[eid] = result
+                    if len(self._books) > MAX_BOOKS_CACHED:  # keep the cache small
+                        oldest = sorted(self._books.items(), key=lambda kv: kv[1][0])[: len(self._books) - MAX_BOOKS_CACHED]
+                        for key, _ in oldest:
+                            self._books.pop(key, None)
+                self._book_fetches.pop(eid, None)
+            done.set()
+
+    def wait_books(self, timeout: float = 10.0) -> bool:
+        """Wait for the background order-book fetches in flight (tests, shutdown). True if all ended."""
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            with self._lock:
+                pending = list(self._book_fetches.values())
+            if not pending:
+                return True
+            for event in pending:
+                if not event.wait(max(0.0, deadline - time.monotonic())):
+                    return False
 
     @staticmethod
     def _book_dict(payload: Any) -> Optional[Dict[str, Any]]:
@@ -826,13 +1097,20 @@ class DashboardApp:
             "cup_end": cup_end,
         }
         try:
-            infos = {e.exchange_id: e for e in self.store.exchanges()}
+            # Only outcomes on the current open-market list: a closed or settled market keeps its
+            # last stored price and its "open" surges, and must never yield a trade idea.
+            open_ids = {r["exchange_id"] for r in self._rows(view)}
+            infos = {str(e.exchange_id): e for e in self.store.exchanges() if str(e.exchange_id) in open_ids}
             latest: Dict[str, PricePoint] = {}
             for eid in infos:
                 point = self.store.latest(eid)
                 if point is not None:
                     latest[eid] = point
-            surges = self.store.surges(since=now - 2 * DAY_S, limit=200)
+            surges = [
+                s
+                for s in self.store.surges(since=now - 2 * DAY_S, limit=200)
+                if str(s.exchange_id) in open_ids and s.status != SURGE_CLOSED
+            ]
             bands = []
             for raw in view.get("high_band") or []:
                 if isinstance(raw, HighBand):
@@ -874,8 +1152,11 @@ class DashboardApp:
         if data.get("backtest") is None and backtest is not None:
             data["backtest"] = _plain(backtest)
         for opp in data.get("opportunities") or []:
-            if isinstance(opp, dict) and opp.get("exchange_id") is not None:
-                opp["exchange_id"] = str(opp["exchange_id"])
+            if isinstance(opp, dict):
+                _normalise_opportunity(opp)
+        if "assumptions" in data:
+            raw = data.get("assumptions")
+            data["assumptions"] = [str(a) for a in raw if a] if isinstance(raw, (list, tuple)) else []
         return data, STRATEGY_TTL_S
 
     def ensure_backtest(self) -> Optional[threading.Thread]:
@@ -949,18 +1230,81 @@ class DashboardApp:
 # --------------------------------------------------------------------------- HTTP
 
 
+def is_loopback_host(host: str) -> bool:
+    """True for addresses only this machine can reach (127.0.0.0/8, ::1, localhost)."""
+    name = (host or "").strip().lower().strip("[]")
+    if name == "localhost" or name.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(name.split("%", 1)[0]).is_loopback
+    except ValueError:
+        return False
+
+
+def is_wildcard_host(host: str) -> bool:
+    return (host or "").strip().strip("[]") in ("", "0.0.0.0", "::")
+
+
+def machine_addresses(ipv6: bool = False) -> List[str]:
+    """This machine's own non-loopback IP addresses (best effort; no packets are sent)."""
+    found: List[str] = []
+
+    def add(address: Any) -> None:
+        try:
+            ip = ipaddress.ip_address(str(address).split("%", 1)[0])
+        except ValueError:
+            return
+        if ip.is_loopback or ip.is_unspecified or ip.is_link_local or (ip.version == 6 and not ipv6):
+            return
+        text = str(ip)
+        if text not in found:
+            found.append(text)
+
+    # The interface the default route uses: connecting a UDP socket only picks a source address.
+    probes: List[Tuple[int, Tuple[Any, ...]]] = [(socket.AF_INET, ("10.255.255.255", 1))]
+    if ipv6:
+        probes.append((socket.AF_INET6, ("fd00::1", 1, 0, 0)))
+    for family, target in probes:
+        try:
+            with socket.socket(family, socket.SOCK_DGRAM) as probe:
+                probe.connect(target)
+                add(probe.getsockname()[0])
+        except OSError:
+            pass
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None):
+            add(info[4][0])
+    except (OSError, UnicodeError):
+        pass
+    return found
+
+
 class DashboardServer(ThreadingHTTPServer):
+    """The dashboard's HTTP server.
+
+    On a loopback bind (the default ``127.0.0.1``) only the loopback names are accepted as
+    ``Host`` (421 otherwise), which stops DNS-rebinding pages from reading the dashboard. On a
+    non-loopback bind (``--host 0.0.0.0``, a LAN address) the user chose to let other devices
+    in, and those reach it by this machine's IP address or name, so any well-formed ``Host`` is
+    accepted (``allow_any_host``); the trade-off is printed by :func:`run_dashboard`.
+    """
+
     daemon_threads = True
     # SO_REUSEADDR lets two servers share a port on Windows; only use it elsewhere.
     allow_reuse_address = os.name != "nt"
     request_queue_size = 32
 
-    def __init__(self, app: DashboardApp, host: str = "127.0.0.1", port: int = 8765) -> None:
+    def __init__(
+        self, app: DashboardApp, host: str = "127.0.0.1", port: int = 8765, *, allow_any_host: Optional[bool] = None
+    ) -> None:
         self.app = app
         self.bind_host = host
+        self.local_only = is_loopback_host(host)
+        self.allow_any_host = (not self.local_only) if allow_any_host is None else bool(allow_any_host)
         if ":" in host:
             self.address_family = socket.AF_INET6
         super().__init__((host, port), DashboardHandler)
+        self.lan_addresses: List[str] = machine_addresses(ipv6=":" in host) if is_wildcard_host(host) else []
         self.allowed_hosts = self._allowed_hosts()
 
     @property
@@ -971,20 +1315,40 @@ class DashboardServer(ThreadingHTTPServer):
         port = self.port
         names = {f"127.0.0.1:{port}", f"localhost:{port}", f"[::1]:{port}"}
         host = self.bind_host.strip().lower()
-        if host:
+        if host and not is_wildcard_host(host):
             names.add(f"[{host}]:{port}" if ":" in host else f"{host}:{port}")
+        for address in self.lan_addresses:  # a wildcard bind: this machine's own addresses and name
+            names.add(f"[{address}]:{port}" if ":" in address else f"{address}:{port}")
+        if self.lan_addresses:
+            try:
+                name = socket.gethostname().strip().lower()
+            except OSError:
+                name = ""
+            if name:
+                names.add(f"{name}:{port}")
         if port == 80:
-            names |= {"127.0.0.1", "localhost", "[::1]"}
+            names |= {name.rsplit(":", 1)[0] for name in names}
         return frozenset(names)
+
+    def host_allowed(self, host_header: Optional[str]) -> bool:
+        host = (host_header or "").strip().lower()
+        if host in self.allowed_hosts:
+            return True
+        return self.allow_any_host and bool(_HOST_HEADER_RE.match(host))
 
     @property
     def url(self) -> str:
         host = self.bind_host
-        if host in ("", "0.0.0.0", "::"):
+        if is_wildcard_host(host):
             host = "127.0.0.1"
         if ":" in host:
             host = f"[{host}]"
         return f"http://{host}:{self.port}"
+
+    @property
+    def network_urls(self) -> List[str]:
+        """URLs other devices can use for a wildcard bind (empty for any other bind)."""
+        return [f"http://[{a}]:{self.port}" if ":" in a else f"http://{a}:{self.port}" for a in self.lan_addresses]
 
     def handle_error(self, request: Any, client_address: Any) -> None:  # quiet disconnects
         exc = sys.exc_info()[1]
@@ -1028,8 +1392,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self._json(status, {"error": message}, extra)
 
     def _host_ok(self) -> bool:
-        host = (self.headers.get("Host") or "").strip().lower()
-        return host in self.server.allowed_hosts
+        return self.server.host_allowed(self.headers.get("Host"))
 
     def _guard(self) -> bool:
         if not self._host_ok():
@@ -1200,8 +1563,10 @@ def resolve_static(url_path: str, root: Path = WEB_DIR) -> Optional[Path]:
     return real if real.is_file() else None
 
 
-def make_server(app: DashboardApp, host: str = "127.0.0.1", port: int = 8765) -> DashboardServer:
-    return DashboardServer(app, host, port)
+def make_server(
+    app: DashboardApp, host: str = "127.0.0.1", port: int = 8765, *, allow_any_host: Optional[bool] = None
+) -> DashboardServer:
+    return DashboardServer(app, host, port, allow_any_host=allow_any_host)
 
 
 # --------------------------------------------------------------------------- runtime
@@ -1386,8 +1751,14 @@ def run_dashboard(settings: Any, args: Any, out: Optional[TextIO] = None, err: O
         return 2
     if not demo and interval < 10:
         print("warning: intervals under 10 s use a lot of the 100 reads/minute budget", file=err)
-    if host not in ("127.0.0.1", "localhost", "::1"):
-        print(f"warning: listening on {host}; anyone who can reach this address can see the dashboard", file=err)
+    if not is_loopback_host(host):
+        print(
+            f"warning: listening on {host}, so any device that can reach this machine can open the dashboard "
+            "(there is no password). To let them in, the Host-header check that blocks DNS-rebinding attacks "
+            "is off, so a web page you visit could also read the dashboard's data. The dashboard is read-only "
+            "and never shows the API key; leave out --host (127.0.0.1) unless another device needs it.",
+            file=err,
+        )
 
     try:
         if demo:
@@ -1437,6 +1808,16 @@ def run_dashboard(settings: Any, args: Any, out: Optional[TextIO] = None, err: O
         if port == 0:
             print(f"Picked free port {server.port}.", file=out)
         print(f"Dashboard running at {url}  (Ctrl-C to stop)", file=out, flush=True)
+        if is_wildcard_host(host):
+            others = server.network_urls
+            if others:
+                print("From other devices on your network: " + "  ".join(others), file=out, flush=True)
+            else:
+                print(
+                    f"From other devices on your network: http://<this machine's IP address>:{server.port}",
+                    file=out,
+                    flush=True,
+                )
         if runtime.app.demo:
             print("Demo mode: simulated market data, no API key used.", file=out, flush=True)
         if not getattr(args, "no_browser", False):

@@ -799,7 +799,10 @@ def test_live_surge_on_michigan_appears_about_90s_after_start(timeline: SimpleNa
     live = [(at, sid) for at, eid, sid in timeline.detections if eid == MI]
     assert len(live) == 1
     at, sid = live[0]
-    assert 90 < at <= 300
+    # Seen in the first snapshot that shows the jump (t0 + 90 s): the last 5m candle before the
+    # tracker started holds through the trade-less buckets, so the 5m window has a reference
+    # (functional-3; before that fix it took until the 5m window was covered by live ticks).
+    assert 90 <= at <= 300
     surge = timeline.store.get_surge(sid)
     assert surge.direction == "up" and surge.change >= 0.05
     assert surge.detected_at == pytest.approx(T0 + at)

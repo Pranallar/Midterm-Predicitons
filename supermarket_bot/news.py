@@ -27,7 +27,7 @@ import threading
 import time
 import xml.etree.ElementTree as ET
 from collections import OrderedDict
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -805,6 +805,29 @@ def _bucket(ts: Optional[float]) -> str:
     return "-" if ts is None else str(int(ts // CACHE_BUCKET_S))
 
 
+@dataclass
+class MarketNews:
+    """One market's news search: the ranked articles and whether the search itself worked.
+
+    ``ok`` is False only when every provider failed (DNS errors, HTTP 5xx, rate-limit
+    cool-downs…): then an empty ``articles`` list means "unknown", not "no news". ``errors``
+    names each provider that failed, e.g. ``"gdelt: HTTP 503: …"``.
+    """
+
+    articles: List[Article]
+    ok: bool = True
+    errors: List[str] = field(default_factory=list)
+    cached: bool = False
+
+
+def _provider_error(provider: Any, reason: str, limit: int = 160) -> str:
+    name = getattr(provider, "name", None) or type(provider).__name__
+    text = " ".join(str(reason).split())
+    if len(text) > limit:
+        text = text[: limit - 1].rstrip() + "…"
+    return f"{name}: {text}"
+
+
 class NewsSearcher:
     """Query every provider for a market, dedup, score relevance, sort and cache.
 
@@ -883,10 +906,14 @@ class NewsSearcher:
         if wait > 0:
             self._sleep(wait)
 
-    def _query_all(self, query: str, since: Optional[float], until: Optional[float], limit: int) -> Tuple[List[Article], bool]:
-        """Every provider's results in provider order, and whether at least one succeeded."""
+    def _query_all(
+        self, query: str, since: Optional[float], until: Optional[float], limit: int
+    ) -> Tuple[List[Article], bool, List[str]]:
+        """Every provider's results in provider order, whether at least one succeeded, and
+        why the others failed (``"name: reason"``)."""
         found: List[Article] = []
         any_ok = False
+        errors: List[str] = []
         for provider in self.providers:
             self._wait_turn(provider)
             self.requests_sent += 1
@@ -894,18 +921,31 @@ class NewsSearcher:
                 results = provider.search(query, since, until, limit)
             except Exception as exc:  # providers should never raise, but be defensive
                 log.warning("news provider %s raised %s: %s", getattr(provider, "name", provider), type(exc).__name__, exc)
+                errors.append(_provider_error(provider, f"{type(exc).__name__}: {exc}"))
                 continue
-            if getattr(provider, "last_error", None) is None:
+            error = getattr(provider, "last_error", None)
+            if error is None:
                 any_ok = True
+            else:
+                errors.append(_provider_error(provider, error))
             found.extend(a for a in results or [] if isinstance(a, Article))
-        return found, any_ok
+        return found, any_ok, errors
 
     # search ------------------------------------------------------------------
     def search_for_market(self, title: str, option: Optional[str], since: Optional[float], until: Optional[float], limit: int = 20) -> List[Article]:
-        """Relevant articles for a market, most relevant (then newest) first."""
+        """Relevant articles for a market, most relevant (then newest) first.
+
+        Use :meth:`search_market` to also learn whether the search worked at all.
+        """
+        return self.search_market(title, option, since, until, limit).articles
+
+    def search_market(self, title: str, option: Optional[str], since: Optional[float], until: Optional[float],
+                      limit: int = 20) -> MarketNews:
+        """Like :meth:`search_for_market`, plus whether any provider answered (``ok``) and the
+        provider errors, so a news outage is not mistaken for "no news"."""
         terms = _select_terms(title or "", option)
         if not terms or limit <= 0:
-            return []
+            return MarketNews([])
         query = " ".join(_quote(t.text) for t in terms)
         words = [t.text.lower() for t in terms]
         strong = _strong_terms(title or "", option)
@@ -913,22 +953,27 @@ class NewsSearcher:
         key = self._cache_key(query, since, until)
         cached = self._cache_get(key, now)
         if cached is not None:
-            return self._rank(cached, words, strong)[:limit]
+            return MarketNews(self._rank(cached, words, strong)[:limit], cached=True)
 
-        raw, any_ok = self._query_all(query, since, until, limit)
+        raw, any_ok, errors = self._query_all(query, since, until, limit)
         ranked = self._rank(self._dedup(raw), words, strong)
         if not ranked and any_ok and self.relax and len(terms) > 3:
             # An over-specified query can miss real coverage: retry once with the top terms.
             top = sorted(terms, key=lambda t: (_PRIORITY[t.kind], t.pos))[:3]
             relaxed = " ".join(_quote(t.text) for t in sorted(top, key=lambda t: (t.kind != "option", t.pos)))
             log.debug("no news for %r; retrying with %r", query, relaxed)
-            more, ok2 = self._query_all(relaxed, since, until, limit)
+            more, ok2, errors2 = self._query_all(relaxed, since, until, limit)
             any_ok = any_ok or ok2
+            errors = errors + [e for e in errors2 if e not in errors]
             ranked = self._rank(self._dedup(more), words, strong)
         ranked = ranked[:limit]
         if any_ok:  # do not cache an outage as "no news"
             self._cache_put(key, ranked, now)
-        return ranked
+        else:
+            if not self.providers:
+                errors = ["no news providers are configured"]
+            log.warning("news search failed for %r: %s", query, "; ".join(errors) or "every provider failed")
+        return MarketNews(ranked, ok=any_ok, errors=errors)
 
     @staticmethod
     def _dedup(articles: Sequence[Article]) -> List[Article]:

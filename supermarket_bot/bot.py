@@ -51,11 +51,26 @@ class ContextError(SuperMarketError):
     """The trading context could not be determined automatically."""
 
 
+# Problems with the key or the account that owns it: every read fails until the user fixes them.
+FATAL_CODES = frozenset(AUTH_CODES - {"ADMIN_REQUIRED"})
+
+
 def is_fatal(exc: BaseException) -> bool:
-    """Errors no retry can fix: bad/expired key, missing scope, unconfirmed email, terms…"""
+    """Errors no retry can fix because the *key itself* is unusable.
+
+    That is any 401, the key/account codes (invalid, revoked or expired key, missing scope,
+    banned account, terms or residence not acknowledged) and the 403 asking to confirm the
+    account's email. A plain ``403 FORBIDDEN`` on one optional read (a leaderboard before the
+    first trade enrols you, a tournament the key cannot see, a portfolio read) is not fatal:
+    the caller reports it and carries on. A cancelled request (shutdown) also stops the caller.
+    """
     if isinstance(exc, RequestCancelled):
         return True
-    return isinstance(exc, ApiError) and (exc.code in AUTH_CODES or exc.status == 401 or (exc.code == "FORBIDDEN" and exc.status == 403))
+    if not isinstance(exc, ApiError):
+        return False
+    if exc.status == 401 or exc.code in FATAL_CODES:
+        return True
+    return exc.status == 403 and exc.code == "FORBIDDEN" and "confirm the email" in (exc.message or "").lower()
 
 
 @dataclass(frozen=True)
@@ -118,7 +133,8 @@ def resolve_context(client: SuperMarketClient, slug: Optional[str] = None, publi
         names = ", ".join(f"{t.get('slug')} ({t.get('name')})" for t in active)
         raise ContextError(
             f"Your key can access {len(active)} active tournaments: {names}. "
-            "Choose one with --tournament <slug> or SUPERMARKET_TOURNAMENT."
+            "Choose one with --tournament <slug> (before or after the command, e.g. "
+            "`python -m supermarket_bot dashboard --tournament <slug>`) or SUPERMARKET_TOURNAMENT."
         )
     every = list(client.iter_tournaments(status="any"))
     if len(every) == 1:

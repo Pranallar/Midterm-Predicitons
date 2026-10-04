@@ -90,7 +90,8 @@ def _usable(points: List[PricePoint], now: float) -> List[PricePoint]:
     return [p for p in points if p.price is not None and p.ts <= now]
 
 
-def _fake_detect(points: List[PricePoint], now: float, exchange_id: str, market_id: str, windows: Any = None, z_threshold: float = 3.0) -> List[Surge]:
+def _fake_detect(points: List[PricePoint], now: float, exchange_id: str, market_id: str, windows: Any = None,
+                 z_threshold: float = 3.0, *, partial: bool = False) -> List[Surge]:
     """A 5-minute window only: latest mark vs the latest point at least 300 s older."""
     pts = _usable(points, now)
     if not pts:
@@ -158,6 +159,10 @@ def _fake_downsample(points: List[PricePoint], max_points: int) -> List[PricePoi
     return [pts[int(round(i * step))] for i in range(max_points)]
 
 
+def _fake_downsample_by_time(points: List[PricePoint], max_points: int, start: Any = None, end: Any = None) -> List[PricePoint]:
+    return _fake_downsample(points, max_points)
+
+
 FAKE_ANALYTICS = SimpleNamespace(
     mark_price=fallback_mark_price,
     detect_surges=_fake_detect,
@@ -165,6 +170,7 @@ FAKE_ANALYTICS = SimpleNamespace(
     high_band=_fake_band,
     change_over=_fake_change,
     downsample=_fake_downsample,
+    downsample_by_time=_fake_downsample_by_time,
 )
 
 
@@ -979,3 +985,331 @@ class TestRealAnalytics:
         card = tracker.view()["surges"][0]
         assert card["attribution"]["verdict"] == "participants"
         json.dumps(tracker.view())
+
+
+# --------------------------------------------------------------------------- round-1 QA regressions
+
+
+def problems(tracker: Tracker) -> Dict[str, Dict[str, Any]]:
+    return {p["source"]: p for p in tracker.status()["problems"]}
+
+
+def replace_route(fake: Any, path: str, *replies: Any) -> None:
+    fake.routes.pop(("GET", path), None)
+    fake.add("GET", path, *replies)
+
+
+FORBIDDEN_MEMBER = (403, error_body("FORBIDDEN", "You are not a member of this tournament."))
+STANDINGS_UPDATING = (
+    503,
+    error_body("SERVICE_UNAVAILABLE", "Standings are updating.", {"reason": "STANDINGS_UPDATING", "retryAfterSeconds": 10}),
+    {"Retry-After": "10"},
+)
+
+
+def test_live_api_1_leaderboard_403_is_not_fatal(make_tracker: Any, fake: Any, world: World, data_clock: FakeClock) -> None:
+    replace_route(fake, f"/tournaments/{SLUG}/leaderboard", FORBIDDEN_MEMBER)
+    tracker = make_tracker(context_refresh=60)
+    summary = tracker.run_once()
+    status = tracker.status()
+    assert status["fatal_error"] is None and summary["ticks"] == 5 and summary["context_refreshed"]
+    view = tracker.view()
+    assert len(view["exchanges"]) == 5
+    assert view["context"]["leaderboard"] is None and view["context"]["balance"] == 101250.5  # the rest still loads
+    p = problems(tracker)["leaderboard"]
+    assert p["severity"] == "warning" and p["count"] == 1 and p["since"] == p["last"] == T0
+    assert "403 FORBIDDEN: You are not a member of this tournament." in p["message"]
+    assert set(p) == {"source", "message", "since", "last", "count", "severity"}
+
+    step(tracker, data_clock)
+    p = problems(tracker)["leaderboard"]
+    assert p["count"] == 2 and p["since"] == T0 and p["last"] == T0 + 60
+    replace_route(fake, f"/tournaments/{SLUG}/leaderboard", LEADERBOARD)
+    step(tracker, data_clock)
+    assert "leaderboard" not in problems(tracker)
+    assert tracker.view()["context"]["leaderboard"]["my_rank"] == 17
+
+
+def test_live_api_1_other_optional_403s_are_problems_not_stops(make_tracker: Any, fake: Any) -> None:
+    replace_route(fake, "/relationships/constraints", FORBIDDEN_MEMBER)
+    replace_route(fake, f"/tournaments/{SLUG}", FORBIDDEN_MEMBER)
+    replace_route(fake, "/markets/m3/orderbook", FORBIDDEN_MEMBER)
+    tracker = make_tracker()
+    tracker.run_once()
+    assert tracker.status()["fatal_error"] is None
+    assert {"constraints", "balance", "order books"} <= set(problems(tracker))
+    assert "1 of 1 market order book read(s) failed" in problems(tracker)["order books"]["message"]
+
+
+def test_live_api_1_threaded_tracker_keeps_running_after_a_leaderboard_403(make_tracker: Any, fake: Any) -> None:
+    replace_route(fake, f"/tournaments/{SLUG}/leaderboard", FORBIDDEN_MEMBER)
+    tracker = make_tracker(interval=0.02)
+    tracker.start()
+    try:
+        assert wait_for(lambda: "leaderboard" in problems(tracker))
+        assert wait_for(lambda: tracker.status()["cycles"] >= 3)
+        assert tracker.status()["running"] is True and tracker.status()["fatal_error"] is None
+        assert len(tracker.view()["exchanges"]) == 5
+    finally:
+        tracker.stop(timeout=2)
+
+
+def test_live_api_9_context_reads_are_single_attempts(make_tracker: Any, fake: Any, client: Any, clock: FakeClock,
+                                                      sleeper: Any) -> None:
+    replace_route(fake, f"/tournaments/{SLUG}/leaderboard", STANDINGS_UPDATING)
+    tracker = make_tracker()
+    tracker.run_once()
+    assert len(fake.calls_to(f"/tournaments/{SLUG}/leaderboard")) == 1  # no inline retries
+    assert sleeper.calls == []  # and no Retry-After wait inside the cycle
+    assert client.read_limiter._paused_until <= clock.now  # the optional read does not hold snapshots back
+    assert client.max_retries == 4  # snapshots keep the client's retries
+    assert "STANDINGS_UPDATING" not in problems(tracker)["leaderboard"]["message"]  # the message, not the details
+    assert "Standings are updating." in problems(tracker)["leaderboard"]["message"]
+    assert tracker.status()["read_budget"]["requests_sent"] == len(fake.calls)
+
+
+def test_live_api_9_slow_context_reads_do_not_stall_price_snapshots(make_tracker: Any, fake: Any) -> None:
+    gate = threading.Event()
+
+    def slow(request: httpx.Request) -> httpx.Response:
+        gate.wait(5)
+        return httpx.Response(200, json=LEADERBOARD)
+
+    replace_route(fake, f"/tournaments/{SLUG}/leaderboard", slow)
+    tracker = make_tracker(interval=0.02)
+    tracker.start()
+    try:
+        assert wait_for(lambda: len(fake.calls_to(f"/tournaments/{SLUG}/leaderboard")) == 1)
+        before = tracker.status()["cycles"]
+        assert wait_for(lambda: tracker.status()["cycles"] >= before + 5)  # snapshots go on meanwhile
+        assert {t.name for t in tracker._threads} >= {"tracker-loop", "tracker-context"}
+    finally:
+        gate.set()
+        tracker.stop(timeout=2)
+    assert tracker.view()["context"]["leaderboard"]["my_rank"] == 17
+
+
+def test_live_api_9_rate_limits_still_pause_every_caller(make_tracker: Any, fake: Any, client: Any, clock: FakeClock) -> None:
+    replace_route(fake, f"/tournaments/{SLUG}/leaderboard", (429, error_body("RATE_LIMITED", "slow down"), {"Retry-After": "7"}))
+    tracker = make_tracker()
+    start = clock.now
+    tracker.run_once()
+    assert client.read_limiter._paused_until == pytest.approx(start + 7)  # the account budget is shared
+    assert clock.now >= start + 7  # the next read (an order book) waited it out
+
+
+def test_live_api_6_backfill_stays_inside_its_budget_when_history_503s(make_tracker: Any, world: World, fake: Any,
+                                                                      data_clock: FakeClock, sleeper: Any) -> None:
+    for eid in world.quotes:
+        fake.add("GET", f"/exchanges/{eid}/price-history", (503, error_body("SERVICE_UNAVAILABLE", "busy")))
+    tracker = make_tracker(backfill=True, backfill_reads_per_min=1000)  # the client retries 503s 4 times
+    tracker.run_once()
+    reads = tracker.backfill_step(100)
+    calls = [c for c in fake.calls if c.path.endswith("/price-history")]
+    # one request per attempt, charged to the backfill budget; then the whole queue rests
+    assert reads == len(calls) == tracker_mod.BACKFILL_FAIL_STREAK
+    assert tracker.status()["read_budget"]["backfill"]["used"] == reads
+    assert sleeper.calls == []
+    assert tracker.backfill_step(100) == 0  # resting: no more reads for now
+    p = problems(tracker)["price history"]
+    assert p["count"] == reads and "503 SERVICE_UNAVAILABLE" in p["message"]
+    assert tracker.status()["backfill"]["pending"] == 10 and tracker.status()["backfill"]["failed"] == 0
+
+    # price history comes back: after the rest the queue drains and the problem clears
+    world.add_history(data_clock)
+    for eid in world.quotes:
+        fake.routes[("GET", f"/exchanges/{eid}/price-history")].popleft()
+    tracker._bf_pause_until = 0.0
+    assert tracker.backfill_step(100) == 10
+    assert "price history" not in problems(tracker)
+    assert tracker.status()["backfill"]["done"] == 10
+
+
+def test_live_api_6_single_attempt_client_shares_budget_and_cancel(client: Any) -> None:
+    view = tracker_mod.single_attempt_client(client)
+    assert view is not client and view.max_retries == 0 and client.max_retries == 4
+    before = client.read_limiter.used
+    view.read_limiter.acquire()
+    assert client.read_limiter.used == before + 1 and view.read_limiter.limit == client.read_limiter.limit
+    view.read_limiter.pause(30)  # server waits stay with the worker
+    assert client.read_limiter._paused_until == 0.0
+    client.cancel()
+    assert view.cancelled
+    client.reset_cancel()
+    sentinel = object()
+    assert tracker_mod.single_attempt_client(sentinel) is sentinel
+
+
+def test_live_api_7_surges_of_closed_markets_are_closed(make_tracker: Any, world: World, data_clock: FakeClock) -> None:
+    from supermarket_bot.models import SURGE_CLOSED
+
+    tracker = make_tracker(market_refresh=60)
+    summary = jump_scenario(tracker, world, data_clock)
+    [sid] = summary["new_surges"]
+    assert tracker.store.get_surge(sid).status == SURGE_OPEN
+    everything = list(world.markets)
+    world.markets = [m for m in world.markets if m["id"] != "m1"]  # Pennsylvania closes
+    step(tracker, data_clock)
+    surge = tracker.store.get_surge(sid)
+    assert surge.status == SURGE_CLOSED and surge.current_price == 0.60
+    view = tracker.view()
+    assert all(r["exchange_id"] != "e1" for r in view["exchanges"])
+    card = next(r for r in view["surges"] if r["id"] == sid)
+    assert card["status"] == "closed" and card["title"]
+    assert tracker.store.surges(status=SURGE_OPEN) == []
+
+    world.markets = everything  # listed again: the surge is evaluated like any open one
+    step(tracker, data_clock)
+    assert tracker.store.get_surge(sid).status == SURGE_OPEN
+
+
+def test_live_api_7_market_list_failure_does_not_close_surges(make_tracker: Any, world: World, fake: Any,
+                                                              data_clock: FakeClock) -> None:
+    tracker = make_tracker(market_refresh=60)
+    [sid] = jump_scenario(tracker, world, data_clock)["new_surges"]
+    for _ in range(5):  # the first try and the client's 4 retries
+        fake.routes[("GET", f"/tournaments/{SLUG}/markets")].appendleft((503, error_body("SERVICE_UNAVAILABLE", "down")))
+    step(tracker, data_clock)
+    assert tracker.store.get_surge(sid).status == SURGE_OPEN  # the last good list still applies
+    p = problems(tracker)["markets"]
+    assert p["severity"] == "error" and "503" in p["message"]
+    step(tracker, data_clock)
+    assert "markets" not in problems(tracker)
+
+
+def test_live_api_11_unanalysed_surges_are_requeued_after_a_restart(make_tracker: Any, world: World,
+                                                                     data_clock: FakeClock) -> None:
+    store = TrackerStore()
+    first = make_tracker(store=store, attributor=FakeAttributor())
+    [sid] = jump_scenario(first, world, data_clock)["new_surges"]
+    assert store.get_surge(sid).attribution is None
+    assert first.view()["surges"][0]["analysis_pending"] is True
+    assert first.status()["analysis"]["queued_ids"] == [sid]
+    first.stop()
+    world.set("e1", 0.40)  # the spike reverts while the dashboard is down
+
+    second = make_tracker(store=store, attributor=FakeAttributor())
+    summary = step(second, data_clock)
+    assert sid in summary["queued"] and second.status()["queues"]["analysis"] == 1
+    assert store.get_surge(sid).status == SURGE_REVERTED
+    assert second.view()["surges"][0]["analysis_pending"] is True
+    assert second.analyze_pending(5) == 1 and store.get_surge(sid).attribution is not None
+    card = second.view()["surges"][0]
+    assert card["analysis_pending"] is False and card["attribution"]["verdict"] == "participants"
+    step(second, data_clock)
+    assert second.status()["queues"]["analysis"] == 0  # analysed: not queued again
+
+    # without an attributor nothing is pending, so the card can say "not analysed yet"
+    third = make_tracker(store=TrackerStore())
+    [sid3] = jump_scenario(third, world, data_clock, to=0.70)["new_surges"]
+    assert third.view()["surges"][0]["id"] == sid3 and third.view()["surges"][0]["analysis_pending"] is False
+
+
+def test_live_api_8_news_outage_is_a_problem(make_tracker: Any, world: World, data_clock: FakeClock) -> None:
+    class OutageAttributor(FakeAttributor):
+        status = "unavailable"
+
+        def analyze(self, surge: Surge) -> Attribution:
+            out = super().analyze(surge)
+            out.news_status = self.status
+            out.reasons.append("News search failed (gdelt: HTTP 503): missing headlines are not evidence that there was no news")
+            return out
+
+    attributor = OutageAttributor()
+    tracker = make_tracker(attributor=attributor)
+    jump_scenario(tracker, world, data_clock)
+    tracker.analyze_pending(1)
+    p = problems(tracker)["news"]
+    assert p["message"] == "News search failed (gdelt: HTTP 503)" and p["severity"] == "warning"
+    attributor.status = "ok"
+    sid = tracker.store.surges()[0].id
+    assert tracker.request_analysis(sid) and tracker.analyze_pending(1) == 1
+    assert "news" not in problems(tracker)
+
+
+def test_live_api_2_3_5_status_shapes(make_tracker: Any, fake: Any, world: World, data_clock: FakeClock) -> None:
+    tracker = make_tracker()
+    status = tracker.status()
+    assert status["problems"] == []
+    assert status["detection"] == {"enabled": True, "waiting_for_history": 0, "live_only": 0, "reason": None}
+    fake.routes[("GET", f"/tournaments/{SLUG}/markets")].appendleft((400, error_body("VALIDATION_ERROR", "bad cursor")))
+    tracker.run_once()
+    status = tracker.status()
+    assert [p["source"] for p in status["problems"]] == ["markets"]
+    assert status["detection"]["enabled"] is False and "market list" in status["detection"]["reason"]
+    step(tracker, data_clock)
+    status = tracker.status()
+    assert status["problems"] == []
+    det = status["detection"]  # backfill is off in this tracker: live prices only
+    assert det["enabled"] and det["live_only"] == 5 and "backfill is off" in det["reason"]
+    json.dumps(tracker.view())
+
+
+class TestRound1RealAnalytics:
+    real_analytics = True
+
+    def test_live_api_4_history_outage_does_not_switch_detection_off(self, make_tracker: Any, world: World, fake: Any,
+                                                                     data_clock: FakeClock) -> None:
+        for eid in world.quotes:
+            fake.add("GET", f"/exchanges/{eid}/price-history", (503, error_body("SERVICE_UNAVAILABLE", "down")))
+        tracker = make_tracker(backfill=True, backfill_reads_per_min=1000)
+        tracker.run_once()
+        det = tracker.status()["detection"]
+        assert det["waiting_for_history"] == 5 and det["enabled"] is False and "Waiting for price history" in det["reason"]
+        tracker.backfill_step(100)  # every read fails: price history is down
+        for _ in range(4):
+            step(tracker, data_clock, 5)
+        world.set("e1", 0.56)
+        summary = step(tracker, data_clock, 5)
+        assert len(summary["new_surges"]) == 1
+        s = tracker.store.get_surge(summary["new_surges"][0])
+        assert (s.window, s.direction, s.start_ts, s.start_price, s.end_price) == ("5m", "up", T0, 0.40, 0.56)
+        det = tracker.status()["detection"]
+        assert det["enabled"] and det["waiting_for_history"] == 0 and det["live_only"] == 5
+        assert "price history is unavailable" in det["reason"] and "503" in det["reason"]
+
+    def test_live_api_4_waiting_for_history_is_capped(self, make_tracker: Any, world: World, data_clock: FakeClock) -> None:
+        tracker = make_tracker(backfill=True, backfill_reads_per_min=1000)
+        tracker.run_once()  # backfill planned, the worker has not read anything yet
+        assert tracker.status()["detection"]["waiting_for_history"] == 5
+        step(tracker, data_clock, tracker_mod.HISTORY_WAIT_MAX_S)
+        det = tracker.status()["detection"]
+        assert det["waiting_for_history"] == 0 and det["enabled"] is True
+
+    def test_visual_9_sparkline_spreads_over_the_whole_day(self, make_tracker: Any, world: World,
+                                                           data_clock: FakeClock) -> None:
+        world.add_history(data_clock)
+        tracker = make_tracker(backfill=True, backfill_reads_per_min=1000)
+        tracker.run_once()
+        tracker.backfill_step(100)
+        for _ in range(240):  # 20 minutes of 5 s live ticks
+            step(tracker, data_clock, 5)
+        spark = row(tracker.view(), "e1")["sparkline"]
+        now = data_clock.now
+        assert 2 <= len(spark) <= 96 and spark[-1][0] == now and spark[0][0] >= now - 86400
+        assert sum(1 for ts, _ in spark if ts > now - 3600) <= 6  # not most of the points in the last hour
+        gaps = [b[0] - a[0] for a, b in zip(spark, spark[1:])]
+        assert max(gaps) <= 2 * 86400 / 95
+
+    def test_functional_3_change_1h_on_trade_bucket_candles(self, make_tracker: Any, world: World, fake: Any,
+                                                            data_clock: FakeClock) -> None:
+        """Candles only for buckets that had trades: the 1h change still has a reference."""
+
+        def sparse(request: httpx.Request) -> httpx.Response:
+            res = request.url.params.get("resolution", "1h")
+            length = 3600.0 if res == "1h" else 300.0
+            last_start = math.floor(data_clock.now / length) * length
+            starts = [last_start - 95 * 60 - length] if res == "5m" else [last_start - 26 * 3600]
+            candles = [{"time": iso_ts(t), "open": 0.40, "high": 0.40, "low": 0.40, "close": 0.40, "vwap": 0.40,
+                        "volume": 5, "tradeCount": 1} for t in starts]
+            return httpx.Response(200, json={"exchangeId": "e1", "marketId": "m1", "resolution": res, "candles": candles})
+
+        fake.add("GET", "/exchanges/e1/price-history", sparse)
+        tracker = make_tracker(backfill=True, backfill_reads_per_min=1000)
+        tracker.run_once()
+        tracker.backfill_step(2)  # e1's 1h then e2's 1h; the rest is not needed for e1's row
+        tracker.backfill_step(100)
+        world.set("e1", 0.55)
+        step(tracker, data_clock, 60)
+        e1 = row(tracker.view(), "e1")
+        assert e1["change_1h"] == pytest.approx(0.15) and e1["change_5m"] == pytest.approx(0.15)
