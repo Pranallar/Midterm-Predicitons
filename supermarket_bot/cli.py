@@ -103,6 +103,19 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--resync-interval", type=float, default=90.0, help="seconds between REST book resyncs per market")
     s.add_argument("--max-markets", type=positive_int, default=50, help="cap on markets when following all of them")
     s.add_argument("--no-log", action="store_true", help="do not write data/<tournament>/stream-<date>.jsonl")
+
+    s = sub.add_parser(
+        "dashboard",
+        help="web dashboard: tracks every market, flags surges and high-90s, explains them and ranks ideas",
+        description="Start the local web dashboard. It tracks all markets in the background and opens in your browser.",
+    )
+    s.add_argument("--port", type=bounded_int(0, 65535), default=8765, help="port to serve on (default 8765; 0 picks a free one)")
+    s.add_argument("--host", default="127.0.0.1", help="address to bind (default 127.0.0.1, this computer only)")
+    s.add_argument("--interval", type=float, default=30.0, help="seconds between price snapshots (default 30)")
+    s.add_argument("--demo", action="store_true", help="run on a simulated market (no API key or internet needed)")
+    s.add_argument("--no-browser", action="store_true", help="do not open a browser tab")
+    s.add_argument("--llm", action="store_true", help="also ask Claude to judge surges (needs ANTHROPIC_API_KEY; costs money)")
+    s.add_argument("--no-news", action="store_true", help="do not search online news for surges")
     return p
 
 
@@ -563,6 +576,10 @@ def main(argv: Optional[Sequence[str]] = None, out: Optional[TextIO] = None, tra
     args = parser.parse_args(argv)
     configure_logging(args.verbose)
     out = out or sys.stdout
+    if args.command == "dashboard":
+        from .web import run_dashboard  # loads settings itself; --demo needs no API key
+
+        return run_dashboard(None, args, out=out)
     try:
         overrides: Dict[str, Any] = {}
         if args.data_dir:
