@@ -152,6 +152,19 @@ async function waitDrawerClosed(page) {
   await page.waitForFunction(() => !document.getElementById('drawer').open);
 }
 
+/** The chart's hover target; re-read when the chart redraws (for example when the order book arrives
+ *  and the drawer gains a scrollbar, the chart is redrawn at the new width). */
+async function hitBox(page) {
+  const deadline = Date.now() + 10000;
+  for (;;) {
+    const handle = await page.$('#drawer .chart svg rect.hit');
+    const box = handle && (await handle.boundingBox().catch(() => null));
+    if (box) return box;
+    if (Date.now() > deadline) throw new Error('the chart hover target never settled');
+    await page.waitForTimeout(100);
+  }
+}
+
 async function activeKey(page) {
   return page.evaluate(() => document.activeElement && document.activeElement.getAttribute('data-focus-key'));
 }
@@ -168,9 +181,10 @@ async function overview(page) {
   await page.waitForSelector('#look-surges li a', { timeout: 30000 });
   check(await page.isVisible('#demo-badge'), 'DEMO badge is shown');
   check(/Read-only/.test(await page.textContent('#readonly-note')), 'read-only note is shown');
-  check((await page.getAttribute('#updated', 'aria-live')) === 'polite', 'the update time is the polite live region');
-  const live = await page.$$eval('[aria-live]', (els) => els.map((e) => e.id));
-  check(live.length === 1 && live[0] === 'updated', 'aria-live only on the update time, got ' + live.join(','));
+  // a11y-1: the ticking update time is plain text; the live indicator speaks only when its state changes
+  check((await page.getAttribute('#updated', 'aria-live')) === null, 'the ticking update time is not a live region');
+  check((await page.getAttribute('#live', 'role')) === 'status', 'the live indicator is the status region');
+  check(/Prices are live/.test(await page.textContent('#live-sentence')), 'the status region says "Prices are live."');
   check(/\d/.test(await page.textContent('#tile-balance')), 'balance tile has a value');
   check(/\d/.test(await page.textContent('#budget-text')), 'read budget shows numbers');
   const title = await page.getAttribute('#updated', 'title');
@@ -199,7 +213,7 @@ async function markets(page) {
   await page.focus('#markets-table th[data-sort="title"] button');
   await page.keyboard.press('Enter');
   check((await page.getAttribute('#markets-table th[data-sort="title"]', 'aria-sort')) === 'ascending', 'Enter on a header sorts');
-  const titles = await page.$$eval('#markets-body tr .row-link', (as) => as.map((a) => a.textContent.toLowerCase()));
+  const titles = await page.$$eval('#markets-body tr .row-link > span:first-child', (as) => as.map((a) => a.textContent.toLowerCase()));
   for (let i = 1; i < titles.length; i++) check(titles[i - 1].localeCompare(titles[i]) <= 0, 'titles sorted A to Z');
 
   // search
@@ -261,7 +275,7 @@ async function drawer(page, theme) {
   check((await page.$$('#drawer .chart svg text.tick')).length >= 4, 'axis ticks are drawn');
 
   // hover crosshair + tooltip
-  const box = await page.locator('#drawer .chart svg rect.hit').boundingBox();
+  const box = await hitBox(page);
   await page.mouse.move(box.x + box.width * 0.6, box.y + box.height / 2);
   await page.waitForSelector('#drawer .tooltip:not([hidden])');
   check(/\d\.\d{3}/.test(await page.textContent('#drawer .tooltip')), 'tooltip shows a 3 dp price');
@@ -278,6 +292,7 @@ async function drawer(page, theme) {
   await page.click('#drawer button[data-action="table-toggle"]');
   await page.waitForSelector('#drawer .chart-table-wrap table tbody tr');
   check((await page.getAttribute('#drawer button[data-action="table-toggle"]', 'aria-pressed')) === 'true', 'table toggle pressed');
+  check((await page.textContent('#drawer button[data-action="table-toggle"]')).trim() === 'Table view', 'the toggle keeps its label');
   await page.click('#drawer button[data-action="table-toggle"]');
   await page.waitForSelector('#drawer .chart svg .price-line');
 
@@ -357,7 +372,7 @@ async function strategy(page) {
   await gotoView(page, 'strategy');
   await page.waitForSelector('#strategy-body .risk-banner');
   await page.waitForSelector('#strategy-body .idea');
-  check(/BUY (YES|NO) @ \d\.\d{3}/.test(await page.textContent('#strategy-body .idea .idea-action')), 'ideas say BUY YES/NO @ price');
+  check(/BUY (YES|NO)( on every outcome)? @ \d\.\d{3}|Buy \d+ legs @ \d\.\d{3}/.test(await page.textContent('#strategy-body .idea .idea-action')), 'ideas say BUY YES/NO @ price');
   await page.click('#strategy-body .idea details summary');
   check(await page.evaluate(() => document.querySelector('#strategy-body .idea details').open), 'rationale expands');
   check(/Read-only/.test(await page.textContent('#strategy-body .disclaimer')), 'disclaimer shown');
@@ -381,7 +396,7 @@ async function darkShots(page) {
   await page.click('#markets-body tr[data-eid="9001"] a.row-link');
   await waitDrawerOpen(page);
   await page.waitForSelector('#drawer table.ladder tbody tr');
-  const box = await page.locator('#drawer .chart svg rect.hit').boundingBox();
+  const box = await hitBox(page);
   await page.mouse.move(box.x + box.width * 0.7, box.y + box.height / 2);
   await page.waitForSelector('#drawer .tooltip:not([hidden])');
   await shot(page, 'drawer-dark');

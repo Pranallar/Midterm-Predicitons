@@ -1,9 +1,11 @@
-"""End-to-end browser test of the dashboard UI (Playwright via node).
+"""End-to-end browser tests of the dashboard UI (Playwright via node).
 
-Runs ``tests/e2e/ui_smoke.cjs`` against ``tests/e2e/serve_demo.py`` (the simulated market: no
-API key, no network). It is skipped when node or the Playwright package is not installed.
-Screenshots go to a temporary folder here; run ``node tests/e2e/ui_smoke.cjs`` directly to
-refresh ``docs/screenshots/``. Deselect with ``pytest -m "not e2e"``.
+Runs ``tests/e2e/ui_smoke.cjs`` (every view, the drawer, themes, outages, phone layout, hostile
+data) and ``tests/e2e/regressions.cjs`` (one check per UI bug fixed after QA, named after its id)
+against ``tests/e2e/serve_demo.py`` (the simulated market: no API key, no network). Both are
+skipped when node or the Playwright package is not installed. Screenshots go to a temporary
+folder here; run ``node tests/e2e/ui_smoke.cjs`` directly to refresh ``docs/screenshots/``.
+Deselect with ``pytest -m "not e2e"``.
 """
 
 from __future__ import annotations
@@ -17,6 +19,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 SMOKE = ROOT / "tests" / "e2e" / "ui_smoke.cjs"
+REGRESSIONS = ROOT / "tests" / "e2e" / "regressions.cjs"
 DEFAULT_PLAYWRIGHT = "/opt/node-tools/node_modules/playwright"
 
 
@@ -38,13 +41,38 @@ def _have_playwright(node: str) -> bool:
     return done.returncode == 0
 
 
-@pytest.mark.e2e
-def test_dashboard_ui_smoke(tmp_path: Path) -> None:
+def _node() -> str:
     node = shutil.which("node")
     if node is None:
         pytest.skip("node is not installed")
     if not _have_playwright(node):
         pytest.skip(f"the playwright package is not available at {_playwright_module()}")
+    return node
+
+
+@pytest.mark.e2e
+def test_dashboard_ui_regressions() -> None:
+    node = _node()
+    env = dict(os.environ)
+    env.setdefault("PYTHON", os.environ.get("PYTHON") or shutil.which("python3") or "python3")
+    env["PLAYWRIGHT_MODULE"] = _playwright_module()
+    done = subprocess.run(
+        [node, str(REGRESSIONS)],
+        cwd=str(ROOT),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=900,
+        check=False,
+    )
+    output = (done.stdout or "") + (done.stderr or "")
+    assert done.returncode == 0, "UI regression checks failed:\n" + output[-8000:]
+    assert "all regression checks passed" in done.stdout, output[-8000:]
+
+
+@pytest.mark.e2e
+def test_dashboard_ui_smoke(tmp_path: Path) -> None:
+    node = _node()
     env = dict(os.environ)
     env.setdefault("PYTHON", os.environ.get("PYTHON") or shutil.which("python3") or "python3")
     env["E2E_SCREENSHOT_DIR"] = os.environ.get("E2E_SCREENSHOT_DIR") or str(tmp_path / "screenshots")

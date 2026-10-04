@@ -7,7 +7,9 @@ simulated market, so they need no API key and never touch the network.
 | --- | --- |
 | `serve_demo.py` | Starts the demo dashboard on a free `127.0.0.1` port with a 2 s snapshot interval. Prints the URL as its first line of stdout; stops on stdin EOF, SIGTERM or Ctrl-C. |
 | `ui_smoke.cjs` | Playwright script (CommonJS). Opens every view, sorts, filters and searches the markets table, opens and closes the detail drawer (button, Esc, backdrop) and checks focus returns, uses the chart range buttons, crosshair and table view, re-analyzes a surge, toggles the theme (and checks it persists), simulates an outage and a revoked-key error, waits for poll cycles and checks the 390 px phone layout. It fails on any console error, page error, failed request, HTTP error response or unhandled promise rejection. |
-| `../test_e2e.py` | Pytest wrapper (`@pytest.mark.e2e`). Skips when node or Playwright is missing. |
+| `regressions.cjs` | One check per UI bug fixed after QA round 1, named after its id (`visual-3`, `a11y-2`, `robustness-1`, …), plus `contract-*` checks for the optional API fields the UI renders (closed surges, `news_status`, `problems`, `detection`, `book_pending`, `assumptions`, arbitrage `legs`). Unusual server states are simulated with `page.route()`; 15–60 s timers are skipped with `page.clock`. Prints `all regression checks passed`. `--only id,id` runs a subset. |
+| `lib.cjs` | Shared helpers (browser launch, starting `serve_demo.py`, `check`). |
+| `../test_e2e.py` | Pytest wrapper (`@pytest.mark.e2e`) for both scripts. Skips when node or Playwright is missing. |
 
 ## Run
 
@@ -15,6 +17,8 @@ simulated market, so they need no API key and never touch the network.
 python3 -m pytest -m e2e -q              # through pytest (screenshots go to a temp folder)
 node tests/e2e/ui_smoke.cjs              # directly; refreshes docs/screenshots/
 node tests/e2e/ui_smoke.cjs http://127.0.0.1:8765   # against a dashboard you started yourself
+node tests/e2e/regressions.cjs           # the per-bug regression checks (starts its own demo)
+node tests/e2e/regressions.cjs http://127.0.0.1:8765 --only visual-3,a11y-2
 python3 -m pytest -m "not e2e" -q        # everything except the browser test
 ```
 

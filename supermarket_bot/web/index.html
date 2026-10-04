@@ -13,6 +13,7 @@
 </head>
 <body>
 <a class="skip-link" href="#main">Skip to main content</a>
+<div class="sr-only" id="announcer" role="status" aria-live="polite" aria-atomic="true"></div>
 
 <header class="app-header">
   <div class="header-top">
@@ -29,11 +30,12 @@
     </div>
     <div class="header-status">
       <span class="badge badge-demo" id="demo-badge" hidden title="Simulated market data: no API key or internet used">DEMO</span>
-      <span class="live" id="live" data-state="loading">
+      <span class="live" id="live" data-state="loading" role="status" aria-atomic="true">
         <span class="live-dot" aria-hidden="true"></span>
-        <span id="live-label">Connecting…</span>
+        <span id="live-label" aria-hidden="true">Connecting…</span>
+        <span class="sr-only" id="live-sentence">Connecting to the dashboard server.</span>
       </span>
-      <span class="updated">Updated <time id="updated" aria-live="polite">—</time></span>
+      <span class="updated">Updated <time id="updated">—</time></span>
       <div class="budget" id="budget">
         <span class="budget-label" id="budget-label">Read budget</span>
         <span class="meter" id="budget-meter" role="meter" aria-labelledby="budget-label" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
@@ -60,7 +62,7 @@
 </header>
 
 <div class="banners" id="banners">
-  <section class="banner banner-critical" id="fatal-banner" aria-labelledby="fatal-title" hidden>
+  <section class="banner banner-critical" id="fatal-banner" role="alert" aria-labelledby="fatal-title" hidden>
     <svg class="icon icon-lg" aria-hidden="true" viewBox="0 0 16 16"><circle cx="8" cy="8" r="7"/><path d="M8 4.5v4.5M8 11.2v.3"/></svg>
     <div class="banner-body">
       <h2 class="banner-title" id="fatal-title">The tracker has stopped</h2>
@@ -68,17 +70,26 @@
       <p class="banner-hint" id="fatal-hint"></p>
     </div>
   </section>
-  <section class="banner banner-warning" id="offline-banner" aria-labelledby="offline-title" hidden>
-    <svg class="icon icon-lg" aria-hidden="true" viewBox="0 0 16 16"><path d="M8 1.5l7 13H1z"/><path d="M8 6v4M8 12v.3"/></svg>
+  <section class="banner banner-neutral" id="offline-banner" role="alert" aria-labelledby="offline-title" hidden>
+    <svg class="icon icon-lg" aria-hidden="true" viewBox="0 0 16 16"><path d="M1.5 6.5a9.5 9.5 0 0 1 13 0M4 9.2a6 6 0 0 1 8 0M6.4 11.8a2.4 2.4 0 0 1 3.2 0"/><path d="M2.5 2.5l11 11"/></svg>
     <div class="banner-body">
       <h2 class="banner-title" id="offline-title">Can't reach the bot</h2>
       <p id="offline-message">The dashboard server is not answering. Is it still running in your terminal?</p>
+      <p class="banner-hint" id="offline-countdown" aria-live="off"></p>
     </div>
     <div class="banner-actions">
       <button type="button" class="btn" id="offline-retry">Retry now</button>
       <button type="button" class="btn btn-ghost btn-icon" id="offline-dismiss" aria-label="Dismiss this message">
         <svg class="icon" aria-hidden="true" viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8"/></svg>
       </button>
+    </div>
+  </section>
+  <section class="banner banner-warning" id="problems-banner" aria-labelledby="problems-title" hidden>
+    <svg class="icon icon-lg" aria-hidden="true" viewBox="0 0 16 16"><path d="M8 1.5l7 13H1z"/><path d="M8 6v4M8 12v.3"/></svg>
+    <div class="banner-body">
+      <h2 class="banner-title" id="problems-title">Some data is unavailable</h2>
+      <p class="banner-hint" id="problems-intro">The bot is still running and keeps retrying. Everything else on the page is up to date.</p>
+      <ul class="problem-list" id="problems-list"></ul>
     </div>
   </section>
   <section class="banner banner-warning" id="view-error-banner" aria-labelledby="view-error-title" hidden>
@@ -103,6 +114,7 @@
 <main id="main" tabindex="-1">
 
   <section class="view" id="view-overview" data-view="overview" aria-labelledby="h-overview" hidden>
+    <div class="view-errors" id="view-errors-overview" hidden></div>
     <div class="view-head">
       <h2 id="h-overview">Overview</h2>
       <p class="view-sub" id="overview-sub">What the bot is watching right now.</p>
@@ -154,6 +166,7 @@
   </section>
 
   <section class="view" id="view-markets" data-view="markets" aria-labelledby="h-markets" hidden>
+    <div class="view-errors" id="view-errors-markets" hidden></div>
     <div class="view-head">
       <h2 id="h-markets">Markets</h2>
       <p class="view-sub" id="markets-sub">Every open outcome with its latest prices and moves.</p>
@@ -174,16 +187,17 @@
           High 90s <span class="chip-count" id="chip-count-high"></span>
         </button>
       </div>
-      <p class="result-count" id="markets-count"></p>
+      <p class="result-count" id="markets-count" role="status" aria-atomic="true"></p>
     </div>
-    <div class="table-wrap" id="markets-wrap" tabindex="0" role="region" aria-labelledby="h-markets">
+    <div class="table-frame" id="markets-frame">
+    <div class="table-wrap" id="markets-wrap" tabindex="0" role="region" aria-label="Markets table">
       <table class="data-table markets-table" id="markets-table">
         <caption class="sr-only">Markets. Select a column heading to sort. Select a market to open its details.</caption>
         <thead>
           <tr>
             <th scope="col" data-sort="title"><button type="button" class="sort-btn">Market<span class="sort-ind" aria-hidden="true"></span></button></th>
             <th scope="col" data-sort="option"><button type="button" class="sort-btn">Outcome<span class="sort-ind" aria-hidden="true"></span></button></th>
-            <th scope="col" class="num" data-sort="last"><button type="button" class="sort-btn">Last<span class="sort-ind" aria-hidden="true"></span></button></th>
+            <th scope="col" class="num" data-sort="last" title="Last tournament trade (— when nobody has traded yet)"><button type="button" class="sort-btn">Last<span class="sort-ind" aria-hidden="true"></span></button></th>
             <th scope="col" class="num" data-sort="bid"><button type="button" class="sort-btn">Bid<span class="sort-ind" aria-hidden="true"></span></button></th>
             <th scope="col" class="num" data-sort="ask"><button type="button" class="sort-btn">Ask<span class="sort-ind" aria-hidden="true"></span></button></th>
             <th scope="col" class="num" data-sort="spread"><button type="button" class="sort-btn">Spread<span class="sort-ind" aria-hidden="true"></span></button></th>
@@ -198,10 +212,12 @@
         <tbody id="markets-body"></tbody>
       </table>
     </div>
-    <p class="empty" id="markets-empty" hidden></p>
+    </div>
+    <div role="status" class="empty-live"><p class="empty" id="markets-empty" hidden></p></div>
   </section>
 
   <section class="view" id="view-surges" data-view="surges" aria-labelledby="h-surges" hidden>
+    <div class="view-errors" id="view-errors-surges" hidden></div>
     <div class="view-head">
       <h2 id="h-surges">Surges</h2>
       <p class="view-sub" id="surges-sub">Sudden price moves, newest first, with the bot's verdict on what caused them.</p>
@@ -212,16 +228,19 @@
       <span class="verdict-key"><span class="verdict verdict-participants"><svg class="icon" aria-hidden="true" viewBox="0 0 16 16"><circle class="f" cx="5.5" cy="5" r="2.2"/><circle class="f" cx="11" cy="5.5" r="1.8"/><path class="f" d="M1.5 13.5c0-2.6 1.8-4.3 4-4.3s4 1.7 4 4.3zM10 13.5c0-1.5-.4-2.7-1.2-3.6.6-.4 1.3-.6 2.2-.6 1.9 0 3.5 1.5 3.5 4.2z"/></svg>Participants</span> a few Cup traders moved it</span>
       <span class="verdict-key"><span class="verdict verdict-unclear"><svg class="icon" aria-hidden="true" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6.5"/><path d="M6 6.2a2 2 0 1 1 2.8 1.8c-.6.3-.8.7-.8 1.3v.4M8 11.6v.3"/></svg>Unclear</span> mixed or weak evidence</span>
     </div>
+    <p class="muted-note detection-note" id="surges-note" hidden></p>
     <div class="cards" id="surge-cards"></div>
     <p class="empty" id="surges-empty" hidden></p>
   </section>
 
   <section class="view" id="view-high" data-view="high" aria-labelledby="h-high" hidden>
+    <div class="view-errors" id="view-errors-high" hidden></div>
     <div class="view-head">
       <h2 id="h-high">High 90s</h2>
       <p class="view-sub" id="high-sub">Outcomes whose favourite side has sat at 0.95 or more. Buying the favourite pays a little if it wins, and loses the whole stake on an upset.</p>
     </div>
-    <div class="table-wrap" id="high-wrap" tabindex="0" role="region" aria-labelledby="h-high">
+    <div class="table-frame" id="high-frame">
+    <div class="table-wrap" id="high-wrap" tabindex="0" role="region" aria-label="High 90s table">
       <table class="data-table high-table" id="high-table">
         <caption class="sr-only">Outcomes in the high 90s. Select a market to open its details.</caption>
         <thead>
@@ -240,10 +259,12 @@
         <tbody id="high-body"></tbody>
       </table>
     </div>
+    </div>
     <p class="empty" id="high-empty" hidden></p>
   </section>
 
   <section class="view" id="view-strategy" data-view="strategy" aria-labelledby="h-strategy" hidden>
+    <div class="view-errors" id="view-errors-strategy" hidden></div>
     <div class="view-head">
       <h2 id="h-strategy">Strategy</h2>
       <p class="view-sub">Ranked, read-only trade ideas. Nothing is traded for you.</p>
@@ -269,6 +290,7 @@
         <svg class="icon" aria-hidden="true" viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8"/></svg>
       </button>
     </header>
+    <div class="sr-only" id="drawer-announcer" role="status" aria-live="polite" aria-atomic="true"></div>
     <div class="drawer-body" id="drawer-body"></div>
   </div>
 </dialog>

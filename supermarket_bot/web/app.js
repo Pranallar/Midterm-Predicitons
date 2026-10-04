@@ -8,10 +8,12 @@
  *   - no eval / new Function / style attributes (the server's CSP is default-src 'self'); sizes and
  *     positions are set through the CSSOM (element.style.width), which the CSP allows.
  *
- * Data flow: poll() fetches /api/status plus the active view's endpoint every 5 s (backing off
- * exponentially on errors, pausing while the tab is hidden); the detail drawer polls
- * /api/exchange/<id> every 10 s while it is open. Renders update the DOM in place so sort,
- * filter, scroll position and keyboard focus survive each poll.
+ * Data flow: poll() fetches /api/status every 5 s (backing off exponentially while it fails,
+ * pausing while the tab is hidden) and starts the active view's endpoints alongside it. Each view
+ * endpoint loads on its own: a slow or failing one shows an inline error in its own view and never
+ * holds up the status poll or flips the page to Offline (only /api/status failures mean offline).
+ * The detail drawer polls /api/exchange/<id> every 10 s while it is open. Renders update the DOM
+ * in place so sort, filter, scroll position, text selection and keyboard focus survive each poll.
  */
 (function () {
   'use strict';
@@ -43,6 +45,8 @@
   const DRAWER_POLL_MS = 10000;
   const MAX_BACKOFF_MS = 60000;
   const REQUEST_TIMEOUT_MS = 15000;
+  const BOOK_PENDING_POLL_MS = 2000; // the server is still fetching the order book: ask again soon
+  const ANALYZE_MSG_MS = 60000; // how long a Re-analyze confirmation or error stays on the card
   const VIEWS = ['overview', 'markets', 'surges', 'high', 'strategy'];
   const VIEW_TITLES = { overview: 'Overview', markets: 'Markets', surges: 'Surges', high: 'High 90s', strategy: 'Strategy' };
   const VIEW_DATA = {
@@ -61,6 +65,7 @@
   };
   const RANGES = { '6h': 6 * 3600, '24h': 24 * 3600, '7d': 7 * 24 * 3600 };
   const RANGE_LABELS = { '6h': '6 hours', '24h': '24 hours', '7d': '7 days' };
+  const DATA_LABELS = { markets: 'the markets list', surges: 'the surges', high: 'the high-90s list', strategy: 'the strategy ideas' };
   const DASH = '—';
   const MINUS = '−';
   const ARROW = '→';
@@ -77,6 +82,13 @@
     failures: 0,
     failureText: '',
     nextRetryMs: 0,
+    nextRetryAt: 0,
+    inflight: {}, // view endpoint name -> true while its request is out
+    viewErrors: {}, // view endpoint name -> {message, status, since}
+    loadedAt: {}, // view endpoint name -> server time of the last successful load
+    startedAt: null, // the server's started_at: a change means the dashboard restarted
+    liveState: null,
+    bannerShown: {},
     offlineDismissed: false,
     pollTimer: null,
     polling: false,
@@ -85,14 +97,18 @@
     filter: 'all',
     query: '',
     openIdeas: new Set(),
-    analyze: {}, // surge id -> {state, text, at}
+    analyze: {}, // surge id -> {state, text, at (browser ms), serverAt (server s)}
+    analyzeTimers: {},
     sigs: {},
+    strategyParts: null,
+    strategyIdeas: null,
     pendingReturnKey: null,
     drawer: {
       id: null,
       gen: 0,
       data: null,
       error: null,
+      okAt: null, // server time of the last successful drawer load
       timer: null,
       inflight: false,
       again: false,
@@ -106,7 +122,10 @@
       sigs: {},
       chartWidth: 0,
       ro: null,
+      headRo: null,
       closing: false,
+      scrollY: 0,
+      liveTimer: null,
     },
   };
 
@@ -244,6 +263,7 @@
   const DT_DAY_YEAR = new Intl.DateTimeFormat(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
   const DT_TIME = new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' });
   const DT_SHORT = new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+  const DT_TIME_SECONDS = new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit', second: '2-digit' });
 
   function nowS() {
     return Date.now() / 1000 + S.offset;
@@ -280,6 +300,15 @@
   function fmtShort(ts) {
     const d = dateOf(ts);
     return d ? DT_SHORT.format(d) : DASH;
+  }
+
+  /** A compact table time: '9:20:05 AM' today (seconds tell 5 s snapshots apart), else 'Oct 3, 9:20 AM'. */
+  function fmtTableTime(ts) {
+    const d = dateOf(ts);
+    if (!d) return DASH;
+    const today = new Date(nowS() * 1000);
+    const sameDay = d.getFullYear() === today.getFullYear() && d.getMonth() === today.getMonth() && d.getDate() === today.getDate();
+    return sameDay ? DT_TIME_SECONDS.format(d) : DT_SHORT.format(d);
   }
 
   function fmtSpan(seconds) {
@@ -397,6 +426,27 @@
     }
   }
 
+  /** Say a short message politely to screen readers (inside the drawer while it is open: a modal
+   *  dialog makes live regions outside it inert). Re-saying the same text still announces it. */
+  function announce(text) {
+    const region = S.drawer.id && $('drawer').open ? $('drawer-announcer') : $('announcer');
+    if (!region || !text) return;
+    region.textContent = '';
+    setTimeout(function () { region.textContent = String(text); }, 60);
+  }
+
+  /** True while the user has text selected inside node: rebuilding it would wipe the selection. */
+  function selectionInside(node) {
+    const sel = window.getSelection ? window.getSelection() : null;
+    if (!node || !sel || sel.isCollapsed || !sel.rangeCount) return false;
+    const range = sel.getRangeAt(0);
+    try {
+      return range.intersectsNode(node);
+    } catch (e) {
+      return false;
+    }
+  }
+
   function timeEl(ts, fmt, cls) {
     ts = num(ts);
     const el = h('time', { class: cls });
@@ -456,6 +506,8 @@
     table: [['rect', { x: 2, y: 3, width: 12, height: 10, rx: 1 }], ['path', { d: 'M2 6.5h12M2 9.8h12M6.5 3v10' }]],
     chart: [['path', { d: 'M2 13.5h12M3 10.5l3-3 2.5 2L13 4' }]],
     calendar: [['rect', { x: 2, y: 3, width: 12, height: 11, rx: 1.5 }], ['path', { d: 'M2 6.5h12M5.5 1.5v3M10.5 1.5v3' }]],
+    chevron: [['path', { d: 'M6 3.5l4.5 4.5L6 12.5' }]],
+    closed: [['circle', { cx: 8, cy: 8, r: 6.5 }], ['path', { d: 'M5 8h6' }]],
   };
 
   function icon(name, cls) {
@@ -466,10 +518,15 @@
 
   // ---------------------------------------------------------------- shared visual pieces
 
-  function priceEl(v) {
+  function priceEl(v, missing) {
     v = num(v);
-    if (v == null) return h('span', { class: 'nil', title: 'No price yet' }, DASH);
+    if (v == null) return h('span', { class: 'nil', title: missing || 'No price yet' }, h('span', { 'aria-hidden': 'true' }, DASH), h('span', { class: 'sr-only' }, missing || 'No price yet'));
     return h('span', { class: 'tabular', title: fmtPctOf(v) + ' implied chance' }, fmtPrice(v));
+  }
+
+  /** The last tournament trade, or a dash: a bid/ask mid is never presented as a traded price. */
+  function lastTradeEl(v) {
+    return priceEl(v, 'No tournament trades yet');
   }
 
   function deltaEl(v, big) {
@@ -530,7 +587,9 @@
       open: ['pulse', 'Open', 'Still moving or recent: the 24 hour watch is on'],
       reverted: ['undo', 'Reverted', 'Half or more of the move has come back'],
       held: ['pin', 'Held', 'The move has held for 24 hours'],
+      closed: ['closed', 'Market closed', 'The market has closed or settled: this surge can no longer be traded'],
     };
+    if (st === 'closed') extra = '';
     const m = map[st] || ['question', st ? st.charAt(0).toUpperCase() + st.slice(1) : 'Unknown', ''];
     return h('span', { class: 'status-badge status-' + (map[st] ? st : 'unknown'), title: m[2] || null }, icon(m[0]), m[1] + extra);
   }
@@ -620,16 +679,15 @@
     return body;
   }
 
-  function isOutage(err) {
-    const st = err && err.status;
-    return !st || st >= 500;
+  function sentence(text, fallback) {
+    let t = str(text).trim() || fallback || '';
+    if (t && !/[.!?…]$/.test(t)) t += '.';
+    return t;
   }
 
   function noteFailure(err) {
     S.failures += 1;
-    let text = str(err && err.message).trim() || 'The dashboard server did not answer.';
-    if (!/[.!?]$/.test(text)) text += '.';
-    S.failureText = text;
+    S.failureText = sentence(err && err.message, 'The dashboard server did not answer.');
     S.nextRetryMs = Math.min(MAX_BACKOFF_MS, POLL_MS * Math.pow(2, S.failures));
   }
 
@@ -646,6 +704,10 @@
     S.pollTimer = setTimeout(poll, ms);
   }
 
+  function isOffline() {
+    return S.failures > 0;
+  }
+
   async function poll() {
     if (S.polling) {
       S.pollAgain = true;
@@ -655,27 +717,23 @@
     S.pollTimer = null;
     if (document.hidden) return;
     S.polling = true;
-    let outage = null;
+    // The view's own endpoints load alongside, each on its own: a slow or failing one never holds
+    // up the status poll, and only a failing /api/status means the dashboard is offline.
+    for (const name of VIEW_DATA[S.view] || []) loadView(name);
+    let failed = null;
     try {
-      const names = ['status'].concat(VIEW_DATA[S.view] || []);
-      const results = await Promise.allSettled(names.map(function (n) { return getJSON(ENDPOINTS[n]); }));
-      results.forEach(function (res, i) {
-        const name = names[i];
-        if (res.status === 'fulfilled') {
-          S.data[name] = res.value;
-          if (name === 'status' && num(res.value.now) != null) S.offset = res.value.now - Date.now() / 1000;
-        } else if (name === 'status' || isOutage(res.reason)) {
-          // Any status failure counts (for example 421 when the page was opened at an address the
-          // server does not accept): the banner then shows the server's own explanation.
-          outage = outage || res.reason;
-        }
-      });
+      const st = await getJSON(ENDPOINTS.status);
+      S.data.status = st;
+      if (num(st.now) != null) S.offset = st.now - Date.now() / 1000;
+      noteRestart(st);
     } catch (e) {
-      outage = e;
+      // Any status failure counts (for example 421 when the page was opened at an address the
+      // server does not accept): the banner then shows the server's own explanation.
+      failed = e;
     } finally {
       S.polling = false;
     }
-    if (outage) noteFailure(outage);
+    if (failed) noteFailure(failed);
     else noteSuccess();
     renderAll();
     if (S.pollAgain) {
@@ -683,7 +741,41 @@
       poll();
       return;
     }
-    schedule(outage ? S.nextRetryMs : POLL_MS);
+    schedule(failed ? S.nextRetryMs : POLL_MS);
+    S.nextRetryAt = failed ? Date.now() + S.nextRetryMs : 0;
+    if (failed) renderOfflineCountdown();
+  }
+
+  /** Fetch one view endpoint; on failure keep the last good data and remember the error for that view only. */
+  async function loadView(name) {
+    if (S.inflight[name] || !ENDPOINTS[name]) return;
+    S.inflight[name] = true;
+    try {
+      S.data[name] = await getJSON(ENDPOINTS[name]);
+      S.loadedAt[name] = nowS();
+      delete S.viewErrors[name];
+    } catch (e) {
+      const prev = S.viewErrors[name];
+      S.viewErrors[name] = { message: sentence(e && e.message, 'The request failed.'), status: (e && e.status) || 0, since: prev ? prev.since : nowS() };
+    } finally {
+      S.inflight[name] = false;
+    }
+    if ((VIEW_DATA[S.view] || []).indexOf(name) !== -1) {
+      safe('view', function () { renderView(S.view); });
+      refreshTimes(document);
+    }
+  }
+
+  /** The server restarted (its started_at changed): surge ids restart at 1, so per-surge notes are dropped. */
+  function noteRestart(st) {
+    const started = num(st && st.started_at);
+    if (started == null) return;
+    if (S.startedAt != null && started !== S.startedAt) {
+      for (const id of Object.keys(S.analyzeTimers)) clearTimeout(S.analyzeTimers[id]);
+      S.analyze = {};
+      S.analyzeTimers = {};
+    }
+    S.startedAt = started;
   }
 
   async function pollDrawer() {
@@ -704,6 +796,7 @@
       if (gen === D.gen) {
         D.data = data;
         D.error = null;
+        D.okAt = num(data.now) != null ? data.now : nowS();
       }
     } catch (e) {
       if (gen === D.gen) D.error = e;
@@ -720,7 +813,9 @@
       pollDrawer();
       return;
     }
-    if (D.id && !document.hidden) D.timer = setTimeout(pollDrawer, DRAWER_POLL_MS);
+    // While the server is still fetching the order book (book_pending), ask again soon.
+    const pending = !!(D.data && D.data.book_pending && !D.data.book && !D.error);
+    if (D.id && !document.hidden) D.timer = setTimeout(pollDrawer, pending ? BOOK_PENDING_POLL_MS : DRAWER_POLL_MS);
   }
 
   // ---------------------------------------------------------------- render: shell
@@ -734,6 +829,7 @@
   }
 
   function renderView(view) {
+    safe('view-errors', function () { renderViewErrors(view); });
     if (view === 'overview') renderOverview();
     else if (view === 'markets') renderMarkets();
     else if (view === 'surges') renderSurges();
@@ -741,20 +837,78 @@
     else if (view === 'strategy') renderStrategy();
   }
 
+  /** The error to show for a view endpoint (none while the whole dashboard is offline: the banner says it). */
+  function viewError(name) {
+    return isOffline() ? null : S.viewErrors[name] || null;
+  }
+
+  /** The empty-state text while a view endpoint has no data yet: loading, or the reason it failed. */
+  function loadingMsg(name, text) {
+    return viewError(name) ? 'Could not load ' + DATA_LABELS[name] + '. Retrying every ' + fmtSpan(POLL_MS / 1000) + '.' : text;
+  }
+
+  /** Inline errors at the top of a view: one line per failing endpoint, the rest of the page is unaffected. */
+  function renderViewErrors(view) {
+    const box = $('view-errors-' + view);
+    if (!box) return;
+    const names = (VIEW_DATA[view] || []).filter(function (n) { return viewError(n); });
+    const key = sig(names.map(function (n) { return [n, S.viewErrors[n].message, !!S.data[n]]; }));
+    if (box.dataset.sig === key) return;
+    const wasShown = !box.hidden;
+    box.dataset.sig = key;
+    show(box, names.length > 0);
+    rebuild(box, names.map(function (n) {
+      const e = S.viewErrors[n];
+      const has = !!S.data[n] && S.loadedAt[n] != null;
+      return h('p', { class: 'inline-error' }, icon('warn'),
+        h('span', null,
+          h('strong', null, (has ? 'Could not refresh ' : 'Could not load ') + DATA_LABELS[n] + ': '),
+          e.message,
+          has ? [' Showing what was loaded ', timeEl(S.loadedAt[n], 'ago'), '.'] : null,
+          ' Retrying every ' + fmtSpan(POLL_MS / 1000) + '.'));
+    }));
+    if (names.length && !wasShown) announce('Could not refresh ' + names.map(function (n) { return DATA_LABELS[n]; }).join(' or ') + '.');
+  }
+
+  const LIVE_SENTENCES = {
+    fresh: 'Prices are live.',
+    stale: 'Prices are stale: no new price snapshot recently.',
+    offline: 'Offline: the dashboard server is not answering.',
+    stopped: 'The tracker has stopped. Prices are no longer updating.',
+    loading: 'Waiting for the first price snapshot.',
+  };
+
   function liveState() {
-    if (S.failures > 0) return { state: 'offline', label: 'Offline', title: 'The dashboard server is not answering' };
+    if (isOffline()) return { state: 'offline', label: 'Offline', title: 'The dashboard server is not answering' };
     const st = S.data.status;
     if (!st) return { state: 'loading', label: 'Connecting…', title: 'Waiting for the dashboard server' };
     const tr = obj(st.tracker);
     const interval = num(st.interval) || num(tr.interval) || 30;
     if (tr.fatal_error) return { state: 'stopped', label: 'Stopped', title: 'The tracker stopped: see the message below' };
     const last = num(tr.last_snapshot_at);
-    if (last == null) return { state: 'loading', label: 'Starting…', title: 'Waiting for the first price snapshot' };
-    const age = nowS() - last;
+    if (last == null) {
+      if (st.view_error) return { state: 'stale', label: 'Stale', title: 'Live data is temporarily unavailable' };
+      return { state: 'loading', label: 'Starting…', title: 'Waiting for the first price snapshot' };
+    }
+    // The snapshot's age when the status was fetched: between polls the server has newer snapshots
+    // we have not seen yet, so ticking this against the browser clock would flicker Live/Stale.
+    const age = (num(st.now) != null ? st.now : nowS()) - last;
     if (age < 2 * interval) {
       return { state: 'fresh', label: 'Live', title: 'Prices refresh every ' + fmtSpan(interval) + '; the last snapshot was ' + fmtAgo(last) };
     }
     return { state: 'stale', label: 'Stale', title: 'No new price snapshot for ' + fmtSpan(age) + ' (expected every ' + fmtSpan(interval) + ')' };
+  }
+
+  /** The read-budget meter: usage, or a paused / rate-limited state when the API is throttling us. */
+  function budgetState(st) {
+    const tr = obj(st.tracker);
+    const rb = obj(tr.read_budget);
+    const now = nowS();
+    const pausedFor = num(rb.paused_for);
+    const pausedUntil = [rb.paused_until, rb.retry_at, rb.blocked_until, tr.rate_limited_until, pausedFor > 0 ? now + pausedFor : null]
+      .map(num).filter(function (v) { return v != null && v > now; });
+    const limited = pausedUntil.length > 0 || currentProblems(st).some(function (p) { return p.rateLimit; });
+    return { used: num(rb.used), limit: num(rb.limit), limited: limited, until: pausedUntil.length ? Math.max.apply(null, pausedUntil) : null };
   }
 
   function renderHeader() {
@@ -764,6 +918,13 @@
     setAttr(liveEl, 'data-state', live.state);
     setAttr(liveEl, 'title', live.title);
     setText($('live-label'), live.label);
+    // The status region speaks only when the state changes (never on a plain poll).
+    if (S.liveState !== live.state) {
+      const recovered = live.state === 'fresh' && ['stale', 'offline', 'stopped'].indexOf(S.liveState) !== -1;
+      setText($('live-sentence'), recovered ? 'Prices are live again.' : LIVE_SENTENCES[live.state] || live.label);
+      S.liveState = live.state;
+    }
+    renderUpdated();
     if (!st) return;
 
     const t = obj(st.tournament);
@@ -774,36 +935,47 @@
     if (document.title !== title) document.title = title;
     show($('demo-badge'), !!st.demo);
 
-    const tr = obj(st.tracker);
-    const last = num(tr.last_snapshot_at);
-    const upd = $('updated');
-    if (last != null && dateOf(last)) {
-      setText(upd, fmtAgo(last));
-      setAttr(upd, 'title', 'Last price snapshot: ' + fmtAbs(last));
-      setAttr(upd, 'datetime', dateOf(last).toISOString());
-    } else {
-      setText(upd, 'not yet');
-      setAttr(upd, 'title', 'No price snapshot yet');
-    }
-
-    const rb = obj(tr.read_budget);
-    const used = num(rb.used);
-    const limit = num(rb.limit);
+    const b = budgetState(st);
     const meter = $('budget-meter');
-    if (used == null || !limit) {
+    if (b.limited) {
+      const wait = b.until != null ? Math.max(1, Math.ceil(b.until - nowS())) : null;
+      const text = wait != null ? 'Paused ' + wait + ' s' : 'Rate limited';
+      $('budget-fill').style.width = '100%';
+      setText($('budget-text'), text);
+      setAttr(meter, 'aria-valuenow', 100);
+      setAttr(meter, 'aria-valuetext', 'Rate limited by the API' + (wait != null ? ': reads paused for ' + wait + ' seconds' : ''));
+      setAttr(meter, 'data-level', 'critical');
+      setAttr($('budget'), 'title', 'The API is rate-limiting this account, so the bot is waiting before it reads again');
+    } else if (b.used == null || !b.limit) {
       setText($('budget-text'), DASH);
       $('budget-fill').style.width = '0%';
       setAttr(meter, 'aria-valuenow', 0);
       setAttr(meter, 'aria-valuetext', 'Unknown');
       setAttr(meter, 'data-level', null);
     } else {
-      const frac = clamp(used / limit, 0, 1);
+      const frac = clamp(b.used / b.limit, 0, 1);
       $('budget-fill').style.width = (frac * 100).toFixed(1) + '%';
-      setText($('budget-text'), fmtInt(used) + ' / ' + fmtInt(limit) + ' per min');
+      setText($('budget-text'), fmtInt(b.used) + ' / ' + fmtInt(b.limit) + ' per min');
       setAttr(meter, 'aria-valuenow', Math.round(frac * 100));
-      setAttr(meter, 'aria-valuetext', fmtInt(used) + ' of ' + fmtInt(limit) + ' API reads used in the last minute');
+      setAttr(meter, 'aria-valuetext', fmtInt(b.used) + ' of ' + fmtInt(b.limit) + ' API reads used in the last minute');
       setAttr(meter, 'data-level', frac >= 0.95 ? 'critical' : frac >= 0.8 ? 'warning' : null);
       setAttr($('budget'), 'title', 'API reads used in the last minute (the account limit is shared by every key)');
+    }
+  }
+
+  /** "Updated N s ago": plain text (not a live region) that ticks every second. */
+  function renderUpdated() {
+    const st = S.data.status;
+    const last = num(obj(st && st.tracker).last_snapshot_at);
+    const upd = $('updated');
+    if (last != null && dateOf(last)) {
+      setText(upd, fmtAgo(last));
+      setAttr(upd, 'title', 'Last price snapshot: ' + fmtAbs(last));
+      setAttr(upd, 'datetime', dateOf(last).toISOString());
+    } else {
+      setText(upd, st ? 'not yet' : DASH);
+      setAttr(upd, 'title', st ? 'No price snapshot yet' : null);
+      setAttr(upd, 'datetime', null);
     }
   }
 
@@ -815,31 +987,125 @@
     return 'Restart the dashboard. If this keeps happening, run it with -v to see more detail in the terminal.';
   }
 
+  const PROBLEM_SOURCES = {
+    prices: 'Price snapshots', snapshot: 'Price snapshots', snapshots: 'Price snapshots', price_snapshot: 'Price snapshots',
+    history: 'Price history', backfill: 'Price history', price_history: 'Price history',
+    markets: 'Market list', market_list: 'Market list', exchanges: 'Market list',
+    leaderboard: 'Leaderboard', balance: 'Your balance', tournament_balance: 'Your balance', context: 'Tournament context',
+    constraints: 'Constraint checks', news: 'News search', trades: 'Trade tape', book: 'Order books', books: 'Order books',
+    rate_limit: 'Rate limit', ratelimit: 'Rate limit', analysis: 'Surge analysis', attribution: 'Surge analysis', detection: 'Surge detection',
+    order_books: 'Order books', storage: 'Saving data', analytics: 'Price analytics',
+  };
+
+  function problemSource(raw) {
+    const key = str(raw).trim();
+    const known = PROBLEM_SOURCES[key.toLowerCase().replace(/[\s-]+/g, '_')];
+    if (known) return known;
+    return key ? key.charAt(0).toUpperCase() + key.slice(1).replace(/_/g, ' ') : 'Market data';
+  }
+
+  /** Non-fatal data problems: the server's "problems" list, or (older servers) its recent tracker errors. */
+  function currentProblems(st) {
+    if (!st) return [];
+    const now = nowS();
+    let list;
+    if (Array.isArray(st.problems)) {
+      list = objs(st.problems).map(function (p) {
+        return { source: str(p.source), message: str(p.message), since: num(p.since), last: num(p.last), count: num(p.count), severity: str(p.severity) };
+      });
+    } else {
+      // Older servers: group the tracker's recent errors by where they happened; keep the recent ones.
+      const tr = obj(st.tracker);
+      const window = Math.max(120, 4 * (num(st.interval) || num(tr.interval) || 30));
+      const groups = {};
+      for (const e of objs(tr.recent_errors)) {
+        const at = num(e.at);
+        const where = str(e.where) || 'tracker';
+        const g = groups[where] || (groups[where] = { source: where, message: '', since: at, last: at, count: 0, severity: 'warning' });
+        g.count += 1;
+        g.message = str(e.error || e.message) || g.message;
+        if (at != null) {
+          g.since = g.since == null ? at : Math.min(g.since, at);
+          g.last = g.last == null ? at : Math.max(g.last, at);
+        }
+      }
+      list = Object.keys(groups).map(function (k) { return groups[k]; }).filter(function (g) { return g.last != null && now - g.last <= window; });
+    }
+    for (const p of list) {
+      p.rateLimit = /rate|429|too many|throttl/i.test(p.source + ' ' + p.message) && (p.last == null || now - p.last <= 300);
+    }
+    list.sort(function (a, b) {
+      return (b.severity === 'error') - (a.severity === 'error') || (a.since || 0) - (b.since || 0);
+    });
+    return list.filter(function (p) { return p.message || p.source; });
+  }
+
+  function problemItem(p) {
+    const li = h('li', { class: 'problem' + (p.severity === 'error' ? ' is-error' : '') },
+      h('strong', null, problemSource(p.source) + ': '), sentence(p.message, 'not available.'));
+    const meta = h('span', { class: 'problem-meta' });
+    if (p.since != null && dateOf(p.since)) meta.append(' since ', timeEl(p.since, 'short'), ' (', timeEl(p.since, 'ago'), ')');
+    if (p.count != null && p.count > 1) meta.append(' · ' + fmtInt(p.count) + ' failed attempts');
+    if (meta.childNodes.length) li.appendChild(meta);
+    return li;
+  }
+
+  /** Show or hide a banner; announce it the first time it appears (its text, once). */
+  function showBanner(id, visible, announceText) {
+    const el = $(id);
+    const was = !!S.bannerShown[id];
+    if (!visible && was && el.contains(document.activeElement)) {
+      // the banner is going away with keyboard focus inside it (for example on "Retry now"): keep the user's place
+      $('main').focus({ preventScroll: true });
+    }
+    show(el, visible);
+    S.bannerShown[id] = !!visible;
+    if (visible && !was && announceText) announce(announceText);
+  }
+
+  function renderOfflineCountdown() {
+    if (!isOffline()) return;
+    const left = Math.ceil((S.nextRetryAt - Date.now()) / 1000);
+    setText($('offline-countdown'), S.polling || !S.nextRetryAt || left <= 0 ? 'Retrying…' : 'Trying again in ' + left + ' s.');
+  }
+
   function renderBanners() {
     const st = S.data.status;
     const tr = obj(st && st.tracker);
 
     const fatal = str(tr.fatal_error);
-    show($('fatal-banner'), !!fatal);
     if (fatal) {
       setText($('fatal-message'), fatal);
       setText($('fatal-hint'), fatalHint(fatal));
     }
+    showBanner('fatal-banner', !!fatal);
 
-    const offline = S.failures > 0 && !S.offlineDismissed;
-    show($('offline-banner'), offline);
+    const offline = isOffline() && !S.offlineDismissed;
     if (offline) {
-      const secs = Math.round(S.nextRetryMs / 1000);
-      setText($('offline-message'), S.failureText + ' Is the dashboard still running in your terminal? Trying again in ' + secs + ' s.');
+      setText($('offline-message'), S.failureText + ' Is the dashboard still running in your terminal?');
+      renderOfflineCountdown();
     }
+    showBanner('offline-banner', offline);
 
-    const viewError = str(st && st.view_error);
-    show($('view-error-banner'), !!viewError && !fatal);
-    if (viewError) setText($('view-error-message'), 'The tracker could not build its live view: ' + viewError);
+    const viewErr = str(st && st.view_error);
+    if (viewErr) setText($('view-error-message'), 'The tracker could not build its live view: ' + viewErr + ' Showing the last data it had.');
+    showBanner('view-error-banner', !!viewErr && !fatal && !isOffline(), 'Live data is temporarily unavailable.');
+
+    const problems = fatal || isOffline() ? [] : currentProblems(st);
+    const pkey = sig(problems.map(function (p) { return [p.source, p.message, p.since, p.count, p.severity]; }));
+    const list = $('problems-list');
+    if (list.dataset.sig !== pkey) {
+      list.dataset.sig = pkey;
+      const items = problems.slice(0, 6).map(problemItem);
+      if (problems.length > 6) items.push(h('li', { class: 'problem' }, 'and ' + (problems.length - 6) + ' more.'));
+      rebuild(list, items);
+    }
+    showBanner('problems-banner', problems.length > 0,
+      'Some data is unavailable: ' + problems.map(function (p) { return problemSource(p.source); }).filter(function (v, i, a) { return a.indexOf(v) === i; }).join(', ') + '.');
 
     let startup = '';
     let progress = null;
-    if (st && !fatal) {
+    if (st && !fatal && !viewErr) { // a view error is not a fresh start: its banner explains what is going on
       const bf = obj(tr.backfill);
       const done = num(bf.done);
       const total = num(bf.total);
@@ -850,7 +1116,7 @@
         progress = clamp(done / total, 0, 1);
       }
     }
-    show($('startup-banner'), !!startup);
+    showBanner('startup-banner', !!startup);
     if (startup) setText($('startup-message'), startup);
     const meter = $('startup-meter');
     show(meter, progress != null);
@@ -858,6 +1124,18 @@
       $('startup-fill').style.width = (progress * 100).toFixed(1) + '%';
       setAttr(meter, 'aria-valuenow', Math.round(progress * 100));
     }
+  }
+
+  /** Once a second: relative times, the retry countdown and the drawer's staleness note keep ticking. */
+  function tick() {
+    if (document.hidden) return;
+    safe('tick', function () {
+      renderUpdated();
+      refreshTimes(document);
+      renderOfflineCountdown();
+      const live = liveState();
+      if (live.state !== S.liveState) renderHeader();
+    });
   }
 
   function renderNav() {
@@ -877,8 +1155,9 @@
     const key = sig([value, unit]);
     if (el.dataset.sig !== key) {
       el.dataset.sig = key;
-      el.replaceChildren(document.createTextNode(value));
-      if (unit) el.appendChild(h('span', { class: 'tile-unit' }, unit));
+      // The number never splits; the unit wraps as a whole word after a real space.
+      el.replaceChildren(h('span', { class: 'tile-num' }, value));
+      if (unit) el.append(h('span', { class: 'tile-gap' }, ' '), h('span', { class: 'tile-unit' }, unit)); // a real space, at the unit's size
     }
     setText($('tile-' + id + '-sub'), sub || ' ');
   }
@@ -918,11 +1197,40 @@
     return [str(o.kind), hasId(o.exchange_id) ? 'x' + o.exchange_id : 'm' + str(o.market_id), str(o.side), str(o.surge_id)].join(':');
   }
 
+  /** An arbitrage idea is a set of trades: its legs (newer servers), or "every outcome" of its market. */
+  function isSet(o) {
+    return str(o.kind) === 'arbitrage';
+  }
+
+  function ideaLegs(o) {
+    return objs(o.legs).filter(function (l) { return str(l.side) || num(l.price) != null; });
+  }
+
+  function legText(l) {
+    return 'BUY ' + (str(l.side).toUpperCase() || '?') + (str(l.option) ? ' ' + str(l.option) : '') + ' @ ' + fmtPrice(l.price);
+  }
+
   function actionText(o) {
     const side = str(o.side).toUpperCase() || '?';
-    let text = 'BUY ' + side + ' @ ' + fmtPrice(o.entry_price);
-    if (!hasId(o.exchange_id) && str(o.kind) === 'arbitrage') text += ' per full set';
-    return text;
+    if (isSet(o)) {
+      const legs = ideaLegs(o);
+      if (legs.length) return 'Buy ' + legs.length + ' legs @ ' + fmtPrice(o.entry_price) + ' per full set';
+      return 'BUY ' + side + ' on every outcome @ ' + fmtPrice(o.entry_price) + ' per full set';
+    }
+    return 'BUY ' + side + ' @ ' + fmtPrice(o.entry_price);
+  }
+
+  /** The outcome an idea trades, or none for a set (a set never names just its first leg). */
+  function ideaOption(o) {
+    return isSet(o) ? '' : str(o.option);
+  }
+
+  function ideaHref(o) {
+    return !isSet(o) && hasId(o.exchange_id) ? exchangeHref(o.exchange_id) : '#strategy';
+  }
+
+  function sizeUnit(o, n) {
+    return isSet(o) ? (n === 1 ? 'set' : 'sets') : n === 1 ? 'share' : 'shares';
   }
 
   function outcomeLabel(title, option) {
@@ -936,7 +1244,7 @@
     const d = S.data.strategy;
     let items = null;
     let msg = '';
-    if (!d) msg = 'Loading ideas…';
+    if (!d) msg = loadingMsg('strategy', 'Loading ideas…');
     else if (d.available === false) msg = str(d.error) || 'The strategy report is not available yet.';
     else {
       items = objs(d.opportunities).slice(0, 5);
@@ -948,18 +1256,19 @@
     show(empty, !!msg);
     setText(empty, msg);
     rebuild(list, (items || []).map(function (o, i) {
-      const href = hasId(o.exchange_id) ? exchangeHref(o.exchange_id) : '#strategy';
+      const href = ideaHref(o);
+      const eid = href !== '#strategy' ? String(o.exchange_id) : null;
       return h('li', { class: 'look-item' },
-        h('a', { href: href, 'data-focus-key': 'idea:' + ideaKey(o), 'data-eid': hasId(o.exchange_id) ? String(o.exchange_id) : null },
+        h('a', { href: href, 'data-focus-key': 'idea:' + ideaKey(o), 'data-eid': eid },
           h('span', { class: 'look-rank' }, h('span', { class: 'sr-only' }, 'Rank '), String(i + 1)),
           h('span', { class: 'look-main' },
-            h('span', { class: 'look-title' }, outcomeLabel(o.title, o.option)),
+            h('span', { class: 'look-title' }, outcomeLabel(o.title, ideaOption(o))),
             h('span', { class: 'look-meta' }, kindBadge(o.kind), h('strong', null, actionText(o)))),
           h('span', { class: 'look-side' },
             num(o.prob_win) != null
               ? h('span', null, 'Win ' + fmtPct0(o.prob_win))
               : h('span', null, 'Return ' + fmtPctOf(o.expected_return)),
-            h('span', null, 'Edge ' + fmtSigned(o.edge) + '/share'))));
+            h('span', null, 'Edge ' + fmtSigned(o.edge) + '/' + sizeUnit(o, 1)))));
     }));
   }
 
@@ -969,18 +1278,13 @@
     const d = S.data.surges;
     let items = null;
     let msg = '';
-    if (!d) msg = 'Loading surges…';
+    if (!d) msg = loadingMsg('surges', 'Loading surges…');
     else {
       items = objs(d.surges).slice(0, 5);
-      if (!items.length) {
-        const n = outcomesWatched();
-        msg = trackerStarted() || n
-          ? 'No surges yet — watching ' + fmtInt(n) + ' outcomes.'
-          : 'Waiting for the first price snapshot…';
-      }
+      if (!items.length) msg = noSurgesMsg();
     }
     const key = sig([msg, items && items.map(function (s) {
-      return [s.id, s.change, s.window, s.status, s.attribution && s.attribution.verdict, s.attribution && s.attribution.confidence, s.title, s.option];
+      return [s.id, moveOf(s), s.window, s.status, s.attribution && s.attribution.verdict, s.attribution && s.attribution.confidence, s.title, s.option];
     })]);
     if (S.sigs.lookSurges !== key) {
       S.sigs.lookSurges = key;
@@ -993,8 +1297,8 @@
             h('span', { class: 'look-rank', 'aria-hidden': 'true' }, icon('bolt')),
             h('span', { class: 'look-main' },
               h('span', { class: 'look-title' }, outcomeLabel(s.title, s.option)),
-              h('span', { class: 'look-meta' }, deltaEl(s.change), h('span', null, 'over ' + str(s.window || '?')),
-                timeEl(s.detected_at, 'ago'))),
+              h('span', { class: 'look-meta' }, deltaEl(moveOf(s)), h('span', null, 'over ' + str(s.window || '?')),
+                timeEl(s.detected_at, 'ago'), s.status === 'closed' ? h('span', null, 'market closed') : null)),
             h('span', { class: 'look-side' }, verdictBadge(s.attribution))));
       }));
     }
@@ -1007,7 +1311,7 @@
   const SORT_KEYS = {
     title: function (r) { return str(r.title).toLowerCase(); },
     option: function (r) { return str(r.option).toLowerCase(); },
-    last: function (r) { return num(r.last) != null ? num(r.last) : num(r.mark); },
+    last: function (r) { return num(r.last); },
     bid: function (r) { return num(r.bid); },
     ask: function (r) { return num(r.ask); },
     spread: function (r) { return num(r.spread); },
@@ -1058,8 +1362,13 @@
       return td;
     }
     const link = h('a', { class: 'row-link', href: exchangeHref(eid), 'data-focus-key': 'row:' + eid, 'data-eid': eid });
+    const linkText = h('span');
+    const linkOption = h('span', { class: 'sr-only' }); // the outcome is part of the link's name: several rows share a title
+    link.append(linkText, linkOption);
     cell('title', 'cell-title').appendChild(link);
     cells.link = link;
+    cells.linkText = linkText;
+    cells.linkOption = linkOption;
     cell('option', 'cell-option');
     ['last', 'bid', 'ask', 'spread', 'change_5m', 'change_1h', 'change_24h'].forEach(function (n) { cell(n, 'num'); });
     cell('spark', 'spark-cell');
@@ -1083,17 +1392,17 @@
     const after = end != null && ts > end;
     const wrap = h('span', { title: 'Settles ' + fmtAbs(ts) + (after ? ' — after the Cup ends' : '') });
     wrap.appendChild(document.createTextNode(fmtDay(ts)));
-    if (after) wrap.appendChild(h('span', { class: 'cell-sub settle-after' }, icon('clock'), 'after Cup end'));
+    if (after) wrap.appendChild(h('span', { class: 'cell-sub settle-after' }, icon('clock'), 'after Cup end')); // its own line
     return wrap;
   }
 
   function updateMarketRow(tr, r) {
     const rec = ROWS.get(tr);
     const c = rec.cells;
-    setText(c.link, str(r.title) || 'Untitled market');
+    setText(c.linkText, str(r.title) || 'Untitled market');
+    setText(c.linkOption, str(r.option) ? ' — ' + str(r.option) : '');
     setCell(rec, 'option', [r.option], function () { return document.createTextNode(str(r.option) || DASH); });
-    const last = num(r.last) != null ? r.last : r.mark;
-    setCell(rec, 'last', [last], function () { return priceEl(last); });
+    setCell(rec, 'last', [r.last], function () { return lastTradeEl(r.last); });
     setCell(rec, 'bid', [r.bid], function () { return priceEl(r.bid); });
     setCell(rec, 'ask', [r.ask], function () { return priceEl(r.ask); });
     setCell(rec, 'spread', [r.spread], function () {
@@ -1187,20 +1496,38 @@
 
     let msg = '';
     let action = null;
-    if (!d) msg = 'Loading markets…';
-    else if (!rows.length) msg = trackerStarted() ? 'No open markets were found in this tournament.' : 'Waiting for the first price snapshot…';
+    if (!d) msg = loadingMsg('markets', 'Loading markets…');
+    else if (!rows.length) {
+      msg = viewUnavailable() ? 'Live data is temporarily unavailable; the markets appear again when the tracker recovers.'
+        : trackerStarted() ? 'No open markets were found in this tournament.' : 'Waiting for the first price snapshot…';
+    }
     else if (!shown.length) {
       const what = S.filter === 'surging' ? ' surging' : S.filter === 'high' ? ' high-90s' : '';
       msg = terms.length ? 'No' + what + ' markets match “' + S.query.trim() + '”.' : 'No' + what + ' markets right now.';
       action = h('button', { type: 'button', class: 'btn', onclick: clearMarketFilters }, 'Show all markets');
     }
-    show(wrap, !!shown.length);
+    show($('markets-frame'), !!shown.length);
     show(empty, !!msg);
     if (msg && empty.dataset.msg !== msg) {
       empty.dataset.msg = msg;
       rebuild(empty, [document.createTextNode(msg), action]);
     }
     setText($('markets-count'), d ? 'Showing ' + fmtInt(shown.length) + ' of ' + fmtInt(rows.length) + ' outcomes' : '');
+    updateScrollCue($('markets-frame'), wrap);
+  }
+
+  /** Edge shadows on a horizontally scrolling table: they show which side has more columns. */
+  function updateScrollCue(frame, wrap) {
+    if (!frame || !wrap) return;
+    const max = wrap.scrollWidth - wrap.clientWidth;
+    const first = wrap.querySelector('thead th');
+    if (first) frame.style.setProperty('--sticky-w', Math.round(first.getBoundingClientRect().width + 1) + 'px');
+    setAttr(frame, 'data-more-left', max > 1 && wrap.scrollLeft > 1 ? '' : null);
+    setAttr(frame, 'data-more-right', max > 1 && wrap.scrollLeft < max - 1 ? '' : null);
+  }
+
+  function viewUnavailable() {
+    return !!str(S.data.status && S.data.status.view_error);
   }
 
   function clearMarketFilters() {
@@ -1219,6 +1546,7 @@
   // ---------------------------------------------------------------- render: surges
 
   const CARD_SIGS = new WeakMap();
+  const CARD_PARTS = new WeakMap(); // card -> {volatile: key of its move line and badges, compact}
 
   function surgeKey(s) {
     return hasId(s.id) ? 'id' + s.id : 'x' + str(s.exchange_id) + ':' + str(s.detected_at) + ':' + str(s.window);
@@ -1265,10 +1593,67 @@
     return list;
   }
 
+  /** The move a card prints: end − start, so the arrow value always matches the two prices beside it. */
+  function moveOf(s) {
+    const a = num(s.start_price), b = num(s.end_price);
+    return a != null && b != null ? Number((b - a).toFixed(6)) : num(s.change);
+  }
+
+  function noSurgesMsg() {
+    if (viewUnavailable()) return 'Live data is temporarily unavailable; surges appear again when the tracker recovers.';
+    const det = obj(S.data.status && S.data.status.detection);
+    const reason = str(det.reason).trim();
+    const n = outcomesWatched();
+    if (det.enabled === false) return 'Surge detection is off' + (reason ? ': ' + sentence(reason) : '.');
+    if (det.waiting_for_history || num(det.live_only) > 0) {
+      return 'No surges yet. ' + (reason ? sentence(reason) : 'Surge detection is waiting for enough price history.') + ' Watching ' + fmtInt(n) + ' outcomes.';
+    }
+    return trackerStarted() || n ? 'No surges yet — watching ' + fmtInt(n) + ' outcomes.' : 'Waiting for the first price snapshot…';
+  }
+
+  /** A note above the surge cards while detection is limited (waiting for history, or live prices only). */
+  function detectionNote() {
+    const det = obj(S.data.status && S.data.status.detection);
+    const reason = str(det.reason).trim();
+    if (!reason || !(det.enabled === false || det.waiting_for_history || num(det.live_only) > 0)) return '';
+    return (det.enabled === false ? 'Surge detection is off: ' : 'Surge detection: ') + sentence(reason);
+  }
+
+  /** Drop a Re-analyze note once it has expired or a newer analysis has landed. */
+  function pruneAnalyze(s) {
+    const cur = S.analyze[s.id];
+    if (!cur || cur.state === 'pending') return;
+    const analyzed = num(obj(s.attribution).analyzed_at);
+    if (Date.now() - cur.at > ANALYZE_MSG_MS || (analyzed != null && cur.serverAt != null && analyzed > cur.serverAt)) clearAnalyze(s.id);
+  }
+
+  function clearAnalyze(id) {
+    clearTimeout(S.analyzeTimers[id]);
+    delete S.analyzeTimers[id];
+    delete S.analyze[id];
+  }
+
+  function setAnalyze(id, entry) {
+    clearTimeout(S.analyzeTimers[id]);
+    delete S.analyzeTimers[id];
+    S.analyze[id] = entry;
+    if (entry.state !== 'pending') {
+      // expire the note on a timer: a reverted or held surge's card is otherwise never rebuilt
+      S.analyzeTimers[id] = setTimeout(function () {
+        if (S.analyze[id] === entry) {
+          clearAnalyze(id);
+          rerenderSurgeViews();
+        }
+      }, ANALYZE_MSG_MS);
+    }
+  }
+
+  function surgeName(s) {
+    return outcomeLabel(s.title, s.option);
+  }
+
   function analyzeFooter(s, key) {
     if (!hasId(s.id) || !/^[0-9]{1,12}$/.test(String(s.id))) return null; // the server only knows numeric surge ids
-    const st = S.analyze[s.id];
-    if (st && st.state === 'done' && Date.now() - st.at > 60000) delete S.analyze[s.id];
     const cur = S.analyze[s.id];
     const pending = !!(cur && cur.state === 'pending');
     const btn = h('button', {
@@ -1278,8 +1663,8 @@
       'data-surge-id': String(s.id),
       'aria-disabled': pending ? 'true' : null,
       title: 'Search the news and the trade tape again for this move',
-    }, icon('refresh'), pending ? 'Sending…' : 'Re-analyze');
-    const msg = h('span', { class: 'action-msg' + (cur && cur.state === 'error' ? ' is-error' : '') });
+    }, icon('refresh'), pending ? 'Sending…' : 'Re-analyze', h('span', { class: 'sr-only' }, ' ' + surgeName(s)));
+    const msg = h('span', { class: 'action-msg' + (cur && cur.state === 'error' ? ' is-error' : ''), role: 'status' });
     if (cur && cur.state !== 'pending') {
       msg.appendChild(icon(cur.state === 'error' ? 'alert' : 'check'));
       msg.appendChild(document.createTextNode(' ' + cur.text));
@@ -1293,6 +1678,49 @@
     return foot;
   }
 
+  function surgeBadges(s, att) {
+    return h('div', { class: 'card-badges' }, verdictBadge(att), statusBadge(s));
+  }
+
+  function moveLine(s, compact) {
+    const move = moveOf(s);
+    const peakMove = num(s.peak_change);
+    return h('div', { class: 'move-line' },
+      h('span', { class: 'move-main' },
+        h('span', { title: fmtPctOf(s.start_price) + ' ' + ARROW + ' ' + fmtPctOf(s.end_price) }, fmtPrice(s.start_price) + ' ' + ARROW + ' ' + fmtPrice(s.end_price)),
+        ' ', deltaEl(move, 0)),
+      peakMove != null && move != null && Math.abs(peakMove - move) >= 0.0005
+        ? h('span', { class: 'move-fact', title: 'The largest move seen since this surge was detected' }, 'Peak move ', h('strong', null, fmtSigned(peakMove)))
+        : null,
+      h('span', { class: 'move-fact' }, 'Window ', h('strong', null, str(s.window) || DASH)),
+      h('span', { class: 'move-fact', title: 'How unusual the move is versus this outcome’s own recent volatility (3 or more is unusual)' },
+        'z-score ', h('strong', null, fmtZ(s.zscore))),
+      h('span', { class: 'move-fact' }, 'Peak ', h('strong', null, fmtPrice(s.peak_price))),
+      h('span', { class: 'move-fact' }, s.status === 'closed' ? 'Final ' : 'Now ', h('strong', null, fmtPrice(s.current_price))),
+      compact ? null : h('span', { class: 'move-fact' }, 'Detected ', h('strong', null, timeEl(s.detected_at, 'ago'))));
+  }
+
+  function headlinesNote(att) {
+    const ns = str(att.news_status);
+    if (ns === 'unavailable') return h('p', { class: 'muted-note' }, icon('warn'), ' News search unavailable: headlines could not be checked for this move, so the verdict leans on the trade tape.');
+    if (ns === 'disabled' || !newsEnabled()) return h('p', { class: 'muted-note' }, 'News search off for this dashboard.');
+    return h('p', { class: 'muted-note' }, 'No matching headlines were found around the move.');
+  }
+
+  /** The fields that change on nearly every poll (live price, revert share, the move's end): updated in place. */
+  function surgeVolatileKey(s) {
+    return sig([s.start_price, s.end_price, s.change, s.peak_change, s.window, s.zscore, s.peak_price, s.current_price, s.detected_at, s.status, s.reverted_fraction]);
+  }
+
+  /** The rest of a card: a change rebuilds the card (unless the user is selecting text in it). */
+  function surgeStableKey(s, compact) {
+    const rest = {};
+    for (const k of Object.keys(s)) {
+      if (['start_price', 'end_price', 'change', 'peak_change', 'zscore', 'peak_price', 'current_price', 'reverted_fraction', 'end_ts', 'start_ts', 'status'].indexOf(k) === -1) rest[k] = s[k];
+    }
+    return sig([rest, S.analyze[s.id] || null, analysisEnabled(), newsEnabled(), !!compact]);
+  }
+
   function surgeCard(s, compact) {
     s = obj(s);
     const key = surgeKey(s);
@@ -1304,22 +1732,14 @@
       titles.appendChild(h('h4', { class: 'card-title' }, str(s.window || '?') + ' surge, detected ', timeEl(s.detected_at, 'ago')));
     } else {
       titles.appendChild(h('h3', { class: 'card-title' }, hasId(s.exchange_id)
-        ? h('a', { href: exchangeHref(s.exchange_id), 'data-focus-key': key + ':title', 'data-eid': String(s.exchange_id) }, str(s.title) || 'Untitled market')
+        ? h('a', { href: exchangeHref(s.exchange_id), 'data-focus-key': key + ':title', 'data-eid': String(s.exchange_id) }, str(s.title) || 'Untitled market',
+          str(s.option) ? h('span', { class: 'sr-only' }, ' — ' + str(s.option)) : null)
         : str(s.title) || 'Untitled market'));
       titles.appendChild(h('p', { class: 'card-sub' }, 'Outcome: ' + (str(s.option) || DASH)));
     }
-    card.appendChild(h('div', { class: 'card-head' }, titles, h('div', { class: 'card-badges' }, verdictBadge(att), statusBadge(s))));
-
-    card.appendChild(h('div', { class: 'move-line' },
-      h('span', { class: 'move-main' },
-        h('span', { title: fmtPctOf(s.start_price) + ' ' + ARROW + ' ' + fmtPctOf(s.end_price) }, fmtPrice(s.start_price) + ' ' + ARROW + ' ' + fmtPrice(s.end_price)),
-        ' ', deltaEl(s.change, 0)),
-      h('span', { class: 'move-fact' }, 'Window ', h('strong', null, str(s.window) || DASH)),
-      h('span', { class: 'move-fact', title: 'How unusual the move is versus this outcome’s own recent volatility (3 or more is unusual)' },
-        'z-score ', h('strong', null, fmtZ(s.zscore))),
-      h('span', { class: 'move-fact' }, 'Peak ', h('strong', null, fmtPrice(s.peak_price))),
-      h('span', { class: 'move-fact' }, 'Now ', h('strong', null, fmtPrice(s.current_price))),
-      compact ? null : h('span', { class: 'move-fact' }, 'Detected ', h('strong', null, timeEl(s.detected_at, 'ago')))));
+    card.appendChild(h('div', { class: 'card-head' }, titles, surgeBadges(s, att)));
+    card.appendChild(moveLine(s, compact));
+    CARD_PARTS.set(card, { volatile: surgeVolatileKey(s), compact: !!compact });
 
     if (!att) {
       card.appendChild(h('p', { class: 'pending-note' },
@@ -1340,14 +1760,36 @@
         h('h4', { class: 'card-section-title' }, 'Trade flow'),
         flowFacts(att.flow, num(att.book_depth)),
         h('h4', { class: 'card-section-title' }, 'Headlines'),
-        objs(att.articles).length
-          ? headlineList(att.articles, key)
-          : h('p', { class: 'muted-note' }, newsEnabled() ? 'No matching headlines were found around the move.' : 'News search is turned off for this dashboard.'));
+        objs(att.articles).length ? headlineList(att.articles, key) : headlinesNote(att));
       card.appendChild(h('div', { class: 'card-grid' }, left, right));
     }
     const foot = analyzeFooter(s, key);
     if (foot) card.appendChild(foot);
     return card;
+  }
+
+  /** Swap only the move line and badges of a card (keeps the reasons, headlines and any selection intact). */
+  function updateSurgeVolatile(card, s) {
+    const parts = CARD_PARTS.get(card);
+    const vkey = surgeVolatileKey(s);
+    if (!parts || parts.volatile === vkey) return;
+    const line = card.querySelector(':scope > .move-line');
+    const badges = card.querySelector(':scope > .card-head > .card-badges');
+    if (selectionInside(line) || selectionInside(badges)) return; // try again on the next poll
+    if (line) line.replaceWith(moveLine(s, parts.compact));
+    if (badges) badges.replaceWith(surgeBadges(s, s.attribution ? obj(s.attribution) : null));
+    parts.volatile = vkey;
+  }
+
+  /** Replace a card with a fresh one, keeping keyboard focus on the same control. */
+  function swapCard(el, fresh) {
+    const active = document.activeElement;
+    const fkey = active && el.contains(active) ? active.getAttribute('data-focus-key') : null;
+    el.replaceWith(fresh);
+    if (fkey) {
+      const t = fresh.querySelector('[data-focus-key="' + CSS.escape(fkey) + '"]');
+      if (t) t.focus({ preventScroll: true });
+    }
   }
 
   function renderSurges() {
@@ -1356,13 +1798,13 @@
     const empty = $('surges-empty');
     const list = d ? objs(d.surges) : null;
     let msg = '';
-    if (!d) msg = 'Loading surges…';
-    else if (!list.length) {
-      const n = outcomesWatched();
-      msg = trackerStarted() || n ? 'No surges yet — watching ' + fmtInt(n) + ' outcomes.' : 'Waiting for the first price snapshot…';
-    }
+    if (!d) msg = loadingMsg('surges', 'Loading surges…');
+    else if (!list.length) msg = noSurgesMsg();
     show(empty, !!msg);
     setText(empty, msg);
+    const note = list && list.length ? detectionNote() : '';
+    show($('surges-note'), !!note);
+    setText($('surges-note'), note);
     if (d) {
       const n = list.length;
       const open = list.filter(function (s) { return s.status === 'open'; }).length;
@@ -1374,21 +1816,18 @@
     for (const el of box.children) existing.set(el.dataset.key, el);
     const wanted = (list || []).map(function (s) {
       s = obj(s);
+      pruneAnalyze(s);
       const key = surgeKey(s);
-      const k = sig([s, S.analyze[s.id] || null, analysisEnabled(), newsEnabled()]);
+      const k = surgeStableKey(s, false);
       let el = existing.get(key);
-      if (!el || CARD_SIGS.get(el) !== k) {
+      if (el && CARD_SIGS.get(el) === k) {
+        updateSurgeVolatile(el, s);
+      } else if (el && selectionInside(el)) {
+        updateSurgeVolatile(el, s); // the user is selecting text in this card: rebuild it later
+      } else {
         const fresh = surgeCard(s, false);
         CARD_SIGS.set(fresh, k);
-        if (el) {
-          const active = document.activeElement;
-          const fkey = active && el.contains(active) ? active.getAttribute('data-focus-key') : null;
-          el.replaceWith(fresh);
-          if (fkey) {
-            const t = fresh.querySelector('[data-focus-key="' + CSS.escape(fkey) + '"]');
-            if (t) t.focus({ preventScroll: true });
-          }
-        }
+        if (el) swapCard(el, fresh);
         el = fresh;
       }
       return el;
@@ -1406,8 +1845,10 @@
 
   async function reanalyze(id) {
     if (S.analyze[id] && S.analyze[id].state === 'pending') return;
-    S.analyze[id] = { state: 'pending', text: '', at: Date.now() };
+    setAnalyze(id, { state: 'pending', text: '', at: Date.now(), serverAt: nowS() });
     rerenderSurgeViews();
+    const ctrl = new AbortController();
+    const timer = setTimeout(function () { ctrl.abort(); }, REQUEST_TIMEOUT_MS);
     let result;
     try {
       const resp = await fetch('/api/surges/' + encodeURIComponent(String(id)) + '/analyze', {
@@ -1416,6 +1857,7 @@
         body: '{}',
         cache: 'no-store',
         credentials: 'same-origin',
+        signal: ctrl.signal,
       });
       let body = null;
       try {
@@ -1423,13 +1865,21 @@
       } catch (e) {
         body = null;
       }
-      if (resp.ok) result = { state: 'done', text: str(body && body.message) || 'Queued for analysis.', at: Date.now() };
-      else result = { state: 'error', text: str(body && body.error) || 'Could not queue the analysis (HTTP ' + resp.status + ').', at: Date.now() };
+      if (resp.ok) result = { state: 'done', text: str(body && body.message) || 'Queued for analysis.' };
+      else result = { state: 'error', text: str(body && body.error) || 'Could not queue the analysis (HTTP ' + resp.status + ').' };
     } catch (e) {
-      result = { state: 'error', text: 'Could not reach the bot to queue the analysis.', at: Date.now() };
+      result = {
+        state: 'error',
+        text: e && e.name === 'AbortError' ? 'The bot did not answer; try again.' : 'Could not reach the bot to queue the analysis.',
+      };
+    } finally {
+      clearTimeout(timer);
     }
-    S.analyze[id] = result;
+    result.at = Date.now();
+    result.serverAt = S.analyze[id] ? S.analyze[id].serverAt : nowS();
+    setAnalyze(id, result);
     rerenderSurgeViews();
+    announce(result.text);
     if (result.state === 'done') {
       setTimeout(function () {
         poll();
@@ -1454,18 +1904,23 @@
     const empty = $('high-empty');
     const bands = d ? objs(d.bands).filter(function (b) { return hasId(b.exchange_id); }) : [];
     let msg = '';
-    if (!d) msg = 'Loading…';
+    if (!d) msg = loadingMsg('high', 'Loading…');
     else if (!bands.length) {
       const n = outcomesWatched();
-      msg = trackerStarted() || n
-        ? 'Nothing is hovering in the high 90s right now — watching ' + fmtInt(n) + ' outcomes.'
-        : 'Waiting for the first price snapshot…';
+      msg = viewUnavailable() ? 'Live data is temporarily unavailable; the high-90s list appears again when the tracker recovers.'
+        : trackerStarted() || n
+          ? 'Nothing is hovering in the high 90s right now — watching ' + fmtInt(n) + ' outcomes.'
+          : 'Waiting for the first price snapshot…';
     }
     show(empty, !!msg);
     setText(empty, msg);
-    show($('high-wrap'), bands.length > 0);
+    show($('high-frame'), bands.length > 0);
     const key = sig([bands, cupEnd()]);
-    if (S.sigs.high === key) return;
+    if (S.sigs.high === key) {
+      updateScrollCue($('high-frame'), $('high-wrap'));
+      return;
+    }
+    if (selectionInside(tbody)) return; // keep the user's text selection; rebuild on a later poll
     S.sigs.high = key;
     rebuild(tbody, bands.map(function (b) {
       b = obj(b);
@@ -1475,7 +1930,8 @@
       const settleTs = num(b.settlement_ts) != null ? b.settlement_ts : toTs(b.settlement_date);
       const entry = num(b.entry_price);
       return h('tr', { class: 'clickable', 'data-eid': eid },
-        h('td', { class: 'cell-title' }, h('a', { class: 'row-link', href: exchangeHref(eid), 'data-focus-key': 'high:' + eid, 'data-eid': eid }, str(b.title) || 'Untitled market')),
+        h('td', { class: 'cell-title' }, h('a', { class: 'row-link', href: exchangeHref(eid), 'data-focus-key': 'high:' + eid, 'data-eid': eid }, str(b.title) || 'Untitled market',
+          str(b.option) ? h('span', { class: 'sr-only' }, ' — ' + str(b.option)) : null)),
         h('td', { class: 'cell-option' }, str(b.option) || DASH),
         h('td', null, h('span', { class: 'side-pill', title: side === 'NO' ? 'NO is the favourite: YES trades at 0.05 or less' : 'YES is the favourite' }, side)),
         h('td', { class: 'num' }, priceEl(b.favorite_price),
@@ -1487,10 +1943,11 @@
         h('span', { class: 'cell-sub' }, fmtPrice(b.low) + '–' + fmtPrice(b.high))),
         h('td', null, settleTs == null ? DASH : timeEl(settleTs, 'day'),
           settleTs == null ? null : h('span', { class: 'cell-sub' }, timeEl(settleTs, 'ago'))),
-        h('td', null, yesNo(b.settles_before_cup_end, 'Yes, pays out', 'No — valued at market price', 'Unknown date')),
+        h('td', { class: 'cell-cupend' }, yesNo(b.settles_before_cup_end, 'Yes, pays out', 'No — valued at market price', 'Unknown date')),
         h('td', { class: 'num' }, num(b.payout_per_share) == null ? DASH : fmtSigned(b.payout_per_share) + '/share',
           h('span', { class: 'cell-sub' }, num(b.return_pct) == null ? '' : nf(1, 2).format(b.return_pct) + '% return')));
     }));
+    updateScrollCue($('high-frame'), $('high-wrap'));
   }
 
   // ---------------------------------------------------------------- render: strategy
@@ -1510,23 +1967,42 @@
     },
   };
 
+  function legList(o) {
+    const legs = ideaLegs(o);
+    if (!legs.length) return null;
+    const parent = str(o.title);
+    return h('ul', { class: 'legs', 'aria-label': 'Legs of this set' }, legs.map(function (l) {
+      const other = str(l.title) && str(l.title) !== parent ? str(l.title) : '';
+      const text = h('span', { class: 'leg-action' }, legText(l));
+      const node = hasId(l.exchange_id)
+        ? h('a', { href: exchangeHref(l.exchange_id), 'data-eid': String(l.exchange_id), 'data-focus-key': 'leg:' + ideaKey(o) + ':' + l.exchange_id }, text,
+          other ? h('span', { class: 'leg-market' }, ' · ' + other) : null)
+        : h('span', null, text, other ? h('span', { class: 'leg-market' }, ' · ' + other) : null);
+      return h('li', null, node);
+    }));
+  }
+
   function ideaCard(o, i) {
     o = obj(o);
     const key = ideaKey(o);
     const titleText = str(o.title) || 'Untitled market';
-    const titleNode = hasId(o.exchange_id)
-      ? h('a', { href: exchangeHref(o.exchange_id), 'data-focus-key': 'st:' + key + ':title', 'data-eid': String(o.exchange_id) }, titleText)
+    const option = ideaOption(o);
+    const href = ideaHref(o);
+    const titleNode = href !== '#strategy'
+      ? h('a', { href: href, 'data-focus-key': 'st:' + key + ':title', 'data-eid': String(o.exchange_id) }, titleText,
+        option ? h('span', { class: 'sr-only' }, ' — ' + option) : null)
       : document.createTextNode(titleText);
     const action = h('p', { class: 'idea-action' }, h('strong', null, actionText(o)));
     if (num(o.target_price) != null) action.appendChild(document.createTextNode(' · target ' + fmtPrice(o.target_price)));
     if (num(o.stop_price) != null) action.appendChild(document.createTextNode(' · stop ' + fmtPrice(o.stop_price)));
     const shares = num(o.suggested_shares) || 0;
     const sizeText = shares > 0
-      ? fmtInt(shares) + ' shares · ' + fmtMoney(o.suggested_cost) + ' ' + currency()
+      ? fmtInt(shares) + ' ' + sizeUnit(o, shares) + ' · ' + fmtMoney(o.suggested_cost) + ' ' + currency()
       : 'none yet: wait for confirmation';
+    const per = sizeUnit(o, 1);
     const facts = factList([
       ['Win probability', fmtPct0(o.prob_win), num(o.prob_win) == null ? 'Not estimated for this kind of idea' : null],
-      ['Edge per share', num(o.edge) == null ? DASH : fmtSigned(o.edge), 'Expected profit per share after the stop'],
+      ['Edge per ' + per, num(o.edge) == null ? DASH : fmtSigned(o.edge), 'Expected profit per ' + per + ' after the stop'],
       ['Expected return', fmtPctOf(o.expected_return), 'Edge as a share of the entry price'],
       ['Suggested size', sizeText, null, 'wide'],
       ['Score', fmtScore(o.score), 'Expected return × confidence, adjusted for the risk mode'],
@@ -1535,12 +2011,12 @@
       ['Settles before Cup end', o.settles_before_cup_end === true ? 'Yes' : o.settles_before_cup_end === false ? 'No' : 'Unknown'],
     ]);
     const details = h('details', { 'data-idea': key },
-      h('summary', { 'data-focus-key': 'st:' + key + ':why' }, 'Why this idea, and the risks'),
-      h('h4', null, 'Rationale'),
+      h('summary', { 'data-focus-key': 'st:' + key + ':why' }, icon('chevron', 'chev'), 'Why this idea, and the risks'),
+      h('h5', null, 'Rationale'),
       texts(o.rationale).length
         ? h('ul', { class: 'reasons' }, texts(o.rationale).map(function (r) { return h('li', null, r); }))
         : h('p', { class: 'muted-note' }, 'No rationale given.'),
-      h('h4', null, 'Risks'),
+      h('h5', null, 'Risks'),
       texts(o.risks).length
         ? h('ul', { class: 'reasons' }, texts(o.risks).map(function (r) { return h('li', null, r); }))
         : h('p', { class: 'muted-note' }, 'No specific risks listed.'));
@@ -1549,12 +2025,12 @@
       if (details.open) S.openIdeas.add(key);
       else S.openIdeas.delete(key);
     });
-    return h('li', { class: 'card idea' },
+    return h('li', { class: 'card idea', 'data-key': key },
       h('span', { class: 'idea-rank' }, h('span', { class: 'sr-only' }, 'Rank '), String(i + 1)),
       h('div', { class: 'idea-main' },
         h('div', { class: 'idea-head' }, kindBadge(o.kind),
-          h('h3', { class: 'idea-title' }, titleNode, o.option ? h('span', { class: 'card-sub' }, ' — ' + str(o.option)) : null)),
-        action, facts, details));
+          h('h4', { class: 'idea-title' }, titleNode, option ? h('span', { class: 'card-sub', 'aria-hidden': href !== '#strategy' ? 'true' : null }, ' — ' + option) : null)),
+        action, legList(o), facts, details));
   }
 
   function backtestPanel(d) {
@@ -1592,22 +2068,18 @@
     return panel;
   }
 
-  function renderStrategy() {
-    const d = S.data.strategy;
-    const root = $('strategy-body');
-    const key = sig([d, S.data.status && S.data.status.tournament && S.data.status.tournament.currency]);
-    if (S.sigs.strategy === key) return;
-    S.sigs.strategy = key;
-    if (!d) {
-      rebuild(root, [emptyNote('Loading the strategy report…')]);
-      return;
-    }
-    if (d.available === false) {
-      rebuild(root, [h('div', { class: 'banner banner-warning' }, icon('warn', 'icon-lg'),
-        h('div', { class: 'banner-body' }, h('h3', { class: 'banner-title' }, 'The strategy report is not available'),
-          h('p', null, str(d.error) || 'Try again in a few seconds.')))]);
-      return;
-    }
+  /** Replace one part of the strategy page only when its content changed (and the user is not selecting text in it). */
+  function strategyPart(name, key, build) {
+    const parts = S.strategyParts;
+    const cur = parts[name];
+    if (cur && cur.key === key) return cur.el;
+    if (cur && selectionInside(cur.el)) return cur.el;
+    const el = build();
+    parts[name] = { key: key, el: el };
+    return el;
+  }
+
+  function riskPanel(d) {
     const mode = MODES[str(d.risk_mode)] || MODES.balanced;
     const factsItems = [
       ['Balance', num(d.balance) == null ? DASH : fmtMoney(d.balance) + ' ' + currency()],
@@ -1615,26 +2087,113 @@
       ['Leader (est.)', num(d.leader_value) == null ? DASH : fmtInt(d.leader_value) + ' ' + currency(), 'Starting balance plus the leader’s reported profit'],
       ['Days left', num(d.days_left) == null ? DASH : nf(0, 1).format(d.days_left)],
     ];
-    const risk = h('section', { class: 'risk-banner', 'data-mode': str(d.risk_mode) || 'balanced', 'aria-labelledby': 'h-risk' },
+    const assumptions = texts(d.assumptions);
+    return h('section', { class: 'risk-banner', 'data-mode': str(d.risk_mode) || 'balanced', 'aria-labelledby': 'h-risk' },
       icon(mode.icon),
       h('div', { class: 'banner-body' },
         h('h3', { class: 'risk-mode', id: 'h-risk' }, mode.label),
         h('p', { class: 'risk-explain' }, mode.text),
-        factList(factsItems, 'risk-facts')));
+        factList(factsItems, 'risk-facts'),
+        assumptions.length
+          ? h('div', { class: 'assumptions' }, h('p', { class: 'assumptions-title' }, icon('info'), 'Based on assumptions:'),
+            h('ul', null, assumptions.map(function (t) { return h('li', null, t); })))
+          : null));
+  }
+
+  function ideasList(opps) {
+    const list = S.strategyIdeas || (S.strategyIdeas = h('ol', { class: 'ideas' }));
+    const existing = new Map();
+    for (const el of list.children) existing.set(el.dataset.key, el);
+    const seen = {};
+    const wanted = opps.map(function (o, i) {
+      let k = ideaKey(o);
+      seen[k] = (seen[k] || 0) + 1;
+      if (seen[k] > 1) k += '#' + seen[k];
+      const cardKey = sig([o, i, currency()]);
+      let el = existing.get(k);
+      if (!el || (CARD_SIGS.get(el) !== cardKey && !selectionInside(el))) {
+        const fresh = ideaCard(o, i);
+        fresh.dataset.key = k;
+        CARD_SIGS.set(fresh, cardKey);
+        if (el) swapCard(el, fresh);
+        el = fresh;
+      }
+      return el;
+    });
+    const keep = new Set(wanted);
+    for (const el of Array.prototype.slice.call(list.children)) if (!keep.has(el)) el.remove();
+    let same = list.children.length === wanted.length;
+    for (let i = 0; same && i < wanted.length; i++) same = list.children[i] === wanted[i];
+    if (!same) {
+      const active = document.activeElement;
+      for (const el of wanted) list.appendChild(el);
+      if (active && active.isConnected && document.activeElement !== active) active.focus({ preventScroll: true });
+    }
+    return list;
+  }
+
+  function renderStrategy() {
+    const d = S.data.strategy;
+    const root = $('strategy-body');
+    if (!d || d.available === false) {
+      const key = sig(['empty', d && d.error, !d && viewError('strategy') ? 'err' : '']);
+      if (S.sigs.strategy === key) return;
+      S.sigs.strategy = key;
+      S.strategyParts = {};
+      S.strategyIdeas = null;
+      if (!d) rebuild(root, [emptyNote(loadingMsg('strategy', 'Loading the strategy report…'))]);
+      else {
+        rebuild(root, [h('div', { class: 'banner banner-warning' }, icon('warn', 'icon-lg'),
+          h('div', { class: 'banner-body' }, h('h3', { class: 'banner-title' }, 'The strategy report is not available'),
+            h('p', null, str(d.error) || 'Try again in a few seconds.')))]);
+      }
+      return;
+    }
+    S.sigs.strategy = 'report';
+    if (!S.strategyParts) S.strategyParts = {};
+    // Volatile fields (now, generated_at) are left out of every key: an unchanged report keeps its DOM.
+    const cur = currency();
+    const risk = strategyPart('risk', sig([d.risk_mode, d.balance, d.my_rank, d.leader_value, d.days_left != null ? Number(num(d.days_left) || 0).toFixed(1) : null, d.assumptions, cur]),
+      function () { return riskPanel(d); });
+    const principles = strategyPart('principles', sig([d.headline, d.principles]), function () {
+      return h('section', { class: 'panel', 'aria-labelledby': 'h-principles' },
+        h('p', { class: 'headline-text' }, str(d.headline)),
+        h('h3', { class: 'panel-title', id: 'h-principles' }, 'How to play the Cup'),
+        texts(d.principles).length ? h('ol', { class: 'principles' }, texts(d.principles).map(function (t) { return h('li', null, t); })) : null);
+    });
     const opps = objs(d.opportunities);
-    const ideasPanel = h('section', { class: 'panel', 'aria-labelledby': 'h-ideas' },
-      h('h3', { class: 'panel-title', id: 'h-ideas' }, opps.length ? 'Ranked ideas (' + opps.length + ')' : 'Ranked ideas'),
-      opps.length
-        ? h('ol', { class: 'ideas' }, opps.map(ideaCard))
-        : emptyNote('No trade ideas right now. Ideas appear when the bot sees a participant-driven surge, a stable high-90s favourite or prices that do not add up.'));
-    const principles = h('section', { class: 'panel', 'aria-labelledby': 'h-principles' },
-      h('p', { class: 'headline-text' }, str(d.headline)),
-      h('h3', { class: 'panel-title', id: 'h-principles' }, 'How to play the Cup'),
-      texts(d.principles).length
-        ? h('ol', { class: 'principles' }, texts(d.principles).map(function (p) { return h('li', null, p); }))
-        : null);
-    const disclaimer = h('p', { class: 'disclaimer' }, icon('lock'), str(d.disclaimer) || 'Read-only analysis. Nothing is traded automatically.');
-    rebuild(root, [risk, principles, ideasPanel, backtestPanel(d), disclaimer]);
+    const ideasPanel = strategyPart('ideasPanel', sig([opps.length > 0]), function () {
+      S.strategyIdeas = null;
+      return h('section', { class: 'panel', 'aria-labelledby': 'h-ideas' }, h('h3', { class: 'panel-title', id: 'h-ideas' }));
+    });
+    setText(ideasPanel.querySelector('#h-ideas'), opps.length ? 'Ranked ideas (' + opps.length + ')' : 'Ranked ideas');
+    if (opps.length) {
+      const list = ideasList(opps);
+      if (list.parentNode !== ideasPanel) ideasPanel.appendChild(list);
+    } else if (!ideasPanel.querySelector('.empty')) {
+      ideasPanel.appendChild(emptyNote('No trade ideas right now. Ideas appear when the bot sees a participant-driven surge, a stable high-90s favourite or prices that do not add up.'));
+    }
+    const backtest = strategyPart('backtest', sig([d.backtest_status, d.backtest_error, d.backtest]), function () { return backtestPanel(d); });
+    const disclaimer = strategyPart('disclaimer', sig([d.disclaimer]), function () {
+      return h('p', { class: 'disclaimer' }, icon('lock'), str(d.disclaimer) || 'Read-only analysis. Nothing is traded automatically.');
+    });
+    const wanted = [risk, principles, ideasPanel, backtest, disclaimer];
+    if (root.children.length !== wanted.length || !root.querySelector(':scope > .risk-banner')) {
+      rebuild(root, wanted);
+      return;
+    }
+    // swap only the parts that changed: moving an unchanged part would drop a text selection inside it
+    wanted.forEach(function (el, i) {
+      const curEl = root.children[i];
+      if (curEl === el) return;
+      const active = document.activeElement;
+      const fkey = active && curEl.contains(active) ? active.getAttribute('data-focus-key') : null;
+      curEl.replaceWith(el);
+      if (fkey) {
+        const t = el.querySelector('[data-focus-key="' + CSS.escape(fkey) + '"]');
+        if (t) t.focus({ preventScroll: true });
+      }
+    });
   }
 
   // ---------------------------------------------------------------- drawer
@@ -1662,11 +2221,63 @@
       D.returnFocus = active && active !== document.body ? active : null;
       D.returnKey = S.pendingReturnKey || (active && active.getAttribute ? active.getAttribute('data-focus-key') : null);
       S.pendingReturnKey = null;
+      // lock the page behind the modal: the wheel over the backdrop must not scroll the list away
+      lockPageScroll(true);
       dlg.showModal();
       $('drawer-inner').scrollTop = 0;
       $('drawer-title').focus({ preventScroll: true });
+      watchDrawerHead();
     }
     pollDrawer();
+  }
+
+  /** Lock the page behind the modal drawer (the wheel over the backdrop must not scroll the list
+   *  away); the body is padded by the scrollbar's width so nothing behind the backdrop shifts. */
+  function lockPageScroll(on) {
+    const root = document.documentElement;
+    const D = S.drawer;
+    if (on) {
+      if (root.classList.contains('drawer-open')) return;
+      D.scrollY = window.scrollY;
+      const bar = window.innerWidth - root.clientWidth;
+      root.classList.add('drawer-open');
+      if (bar > 0) document.body.style.paddingRight = bar + 'px';
+    } else {
+      if (!root.classList.contains('drawer-open')) return;
+      root.classList.remove('drawer-open');
+      document.body.style.paddingRight = '';
+      if (Math.abs(window.scrollY - D.scrollY) > 1) window.scrollTo(0, D.scrollY);
+    }
+  }
+
+  /** Keep --drawer-head-h equal to the sticky header's height, so focused controls scroll in below it. */
+  function watchDrawerHead() {
+    const D = S.drawer;
+    const head = document.querySelector('#drawer .drawer-head');
+    const inner = $('drawer-inner');
+    const update = function () {
+      const sticky = head && getComputedStyle(head).position === 'sticky';
+      inner.style.setProperty('--drawer-head-h', (sticky ? Math.ceil(head.getBoundingClientRect().height) : 0) + 'px');
+    };
+    update();
+    if (D.headRo || typeof ResizeObserver !== 'function' || !head) return;
+    D.headRo = new ResizeObserver(update);
+    D.headRo.observe(head);
+    window.addEventListener('resize', update);
+  }
+
+  /** Scroll a newly focused control in the drawer out from under the sticky header (WCAG 2.4.11). */
+  function keepFocusVisible(ev) {
+    const inner = $('drawer-inner');
+    const head = document.querySelector('#drawer .drawer-head');
+    const el = ev.target;
+    if (!inner || !head || !el || head.contains(el) || el === inner) return;
+    if (getComputedStyle(head).position !== 'sticky') return;
+    const r = el.getBoundingClientRect();
+    const top = head.getBoundingClientRect().bottom + 8;
+    const box = inner.getBoundingClientRect();
+    if (r.top < top) inner.scrollTop -= top - r.top;
+    else if (r.bottom > box.bottom - 8 && r.height < box.height - (top - box.top)) inner.scrollTop += r.bottom - (box.bottom - 8);
   }
 
   function closeDrawerUI() {
@@ -1683,6 +2294,7 @@
     D.chartWidth = 0;
     const dlg = drawerEl();
     if (dlg.open) dlg.close();
+    lockPageScroll(false);
     const key = D.returnKey;
     let target = null;
     if (key) target = document.querySelector('#view-' + S.view + ' [data-focus-key="' + CSS.escape(key) + '"]');
@@ -1728,15 +2340,18 @@
     const row = drawerRow();
     if (d) {
       setText($('drawer-title'), str(row.title) || 'Untitled market');
+      setAttr($('drawer-title'), 'title', str(row.title) || null); // the visible title is clamped to two lines
       const bits = ['Outcome: ' + (str(row.option) || DASH)];
       if (row.exchange_id != null) bits.push('exchange ' + str(row.exchange_id));
       if (row.market_id != null) bits.push('market ' + str(row.market_id));
       setText($('drawer-sub'), bits.join(' · '));
     } else if (err) {
       setText($('drawer-title'), err.status === 404 ? 'Outcome not found' : 'Could not load this outcome');
+      setAttr($('drawer-title'), 'title', null);
       setText($('drawer-sub'), 'Exchange ' + D.id);
     } else {
       setText($('drawer-title'), 'Loading…');
+      setAttr($('drawer-title'), 'title', null);
       setText($('drawer-sub'), 'Exchange ' + D.id);
     }
 
@@ -1756,6 +2371,7 @@
     D.sigs.placeholder = null;
     if (!D.sections) {
       D.sections = {
+        stale: h('div', { class: 'drawer-stale', hidden: true }),
         facts: h('section', { class: 'panel', 'aria-label': 'Prices' }),
         chart: buildChartSection(),
         book: h('section', { class: 'panel', 'aria-labelledby': 'h-book' }),
@@ -1763,8 +2379,9 @@
         surge: h('section', { class: 'panel', 'aria-labelledby': 'h-dsurge' }),
       };
       D.sigs = {};
-      rebuild(body, [D.sections.facts, D.sections.chart.root, D.sections.surge, D.sections.book, D.sections.trades]);
+      rebuild(body, [D.sections.stale, D.sections.facts, D.sections.chart.root, D.sections.surge, D.sections.book, D.sections.trades]);
     }
+    renderDrawerStale(err);
     renderDrawerFacts(d);
     renderChartSection(d);
     renderDrawerSurge(d);
@@ -1773,16 +2390,40 @@
     refreshTimes(body);
   }
 
+  /** The drawer still shows its last good data while refreshes fail: say so, with the data's age. */
+  function renderDrawerStale(err) {
+    const D = S.drawer;
+    const box = D.sections.stale;
+    const failing = !!err || isOffline();
+    const reason = isOffline() ? S.failureText : err ? sentence(err.message, 'The request failed.') : '';
+    const key = sig([failing, reason, D.okAt]);
+    if (D.sigs.stale === key) return;
+    const was = !box.hidden;
+    D.sigs.stale = key;
+    show(box, failing);
+    if (!failing) {
+      box.replaceChildren();
+      if (was) announce('The details are updating again.');
+      return;
+    }
+    box.replaceChildren(icon('warn'), h('p', null,
+      h('strong', null, isOffline() ? 'Can’t reach the bot: ' : 'Could not refresh these details: '), reason,
+      D.okAt != null ? [' Showing data from ', timeEl(D.okAt, 'ago'), '.'] : null, ' Retrying automatically.'));
+    if (!was) announce('These details are not updating: showing older data.');
+  }
+
   function renderDrawerFacts(d) {
     const row = obj(d.exchange);
     const band = d.high_band ? obj(d.high_band) : null;
     const key = sig([row.last, row.mark, row.bid, row.ask, row.spread, row.change_5m, row.change_1h, row.change_24h, row.settlement_date, band, cupEnd()]);
+    if (S.drawer.sigs.facts !== key && selectionInside(S.drawer.sections.facts)) return;
     if (S.drawer.sigs.facts === key) return;
     S.drawer.sigs.facts = key;
     const settle = toTs(row.settlement_date);
     const end = cupEnd();
     const items = [
-      ['Last', priceEl(num(row.last) != null ? row.last : row.mark)],
+      ['Last trade', lastTradeEl(row.last), 'The last tournament trade'],
+      ['Mark', priceEl(row.mark), 'The price the chart plots: the bid/ask mid when the spread is tight, else the last trade'],
       ['Bid', priceEl(row.bid)],
       ['Ask', priceEl(row.ask)],
       ['Spread', num(row.spread) == null ? DASH : fmtPrice(row.spread)],
@@ -1811,20 +2452,26 @@
         onclick: function () { setRange(r); },
       }, r));
     }
+    // A toggle keeps one label; aria-pressed (and the pressed style) says whether the table is showing.
     const toggle = h('button', {
-      type: 'button', class: 'btn', 'data-action': 'table-toggle', 'aria-pressed': S.drawer.table ? 'true' : 'false',
+      type: 'button', class: 'btn btn-toggle', 'data-action': 'table-toggle', 'aria-pressed': S.drawer.table ? 'true' : 'false',
+      title: 'Show the prices as a table instead of a chart',
       onclick: function () { setTableView(!S.drawer.table); },
-    });
+    }, icon('table'), 'Table view');
     const host = h('div', {
       class: 'chart', tabindex: '0', role: 'group',
-      'aria-label': 'Price chart. Use the left and right arrow keys to read individual prices.',
+      'aria-label': 'Price chart',
+      'aria-describedby': 'chart-help',
     });
+    const help = h('p', { class: 'sr-only', id: 'chart-help' },
+      'Left and right arrow keys step through the prices, Home and End jump to the first and last. Table view lists every price.');
+    const readout = h('p', { class: 'sr-only', role: 'status', 'aria-live': 'polite', 'aria-atomic': 'true' });
     const tableBox = h('div', { class: 'chart-table-wrap', tabindex: '0', role: 'region', 'aria-label': 'Price history table' });
     const legend = h('div', { class: 'legend' });
     const summary = h('p', { class: 'view-sub chart-summary' });
     const root = h('section', { class: 'panel', 'aria-labelledby': 'h-chart' },
       h('div', { class: 'section-head' }, h('h3', { id: 'h-chart' }, 'Price history'), h('div', { class: 'controls' }, rangeGroup, toggle)),
-      summary, host, tableBox, legend);
+      summary, host, help, readout, tableBox, legend);
     host.addEventListener('keydown', chartKey);
     host.addEventListener('focus', function () { chartFocus(true); });
     host.addEventListener('blur', function () { chartFocus(false); });
@@ -1841,7 +2488,7 @@
       ro.observe(host);
       S.drawer.ro = ro;
     }
-    return { root: root, host: host, tableBox: tableBox, legend: legend, toggle: toggle, rangeGroup: rangeGroup, summary: summary, chart: null };
+    return { root: root, host: host, tableBox: tableBox, legend: legend, toggle: toggle, rangeGroup: rangeGroup, summary: summary, readout: readout, chart: null };
   }
 
   function setRange(r) {
@@ -1867,11 +2514,6 @@
     if (!sec) return;
     for (const b of sec.rangeGroup.querySelectorAll('button[data-range]')) setAttr(b, 'aria-pressed', b.dataset.range === S.drawer.range ? 'true' : 'false');
     setAttr(sec.toggle, 'aria-pressed', S.drawer.table ? 'true' : 'false');
-    const tkey = sig([S.drawer.table]);
-    if (sec.toggle.dataset.sig !== tkey) {
-      sec.toggle.dataset.sig = tkey;
-      sec.toggle.replaceChildren(icon(S.drawer.table ? 'chart' : 'table'), S.drawer.table ? 'Show chart' : 'Show table');
-    }
     show(sec.host, !S.drawer.table);
     show(sec.tableBox, S.drawer.table);
     const series = arr(d.series);
@@ -1895,10 +2537,12 @@
       else break;
     }
     const t1 = Math.max(now, inRange.length ? inRange[inRange.length - 1].ts : now);
+    const tolerance = Math.max(3600, span * 0.1);
+    const startPoint = before && t0 - before.ts <= tolerance ? before : inRange[0] || null;
     const surges = objs(d.surges).filter(function (s) {
       return num(s.start_ts) != null && num(s.end_ts) != null && s.end_ts >= t0 && s.start_ts <= t1;
     });
-    return { all: all, inRange: inRange, before: before, t0: t0, t1: t1, surges: surges };
+    return { all: all, inRange: inRange, before: before, startPoint: startPoint, t0: t0, t1: t1, surges: surges };
   }
 
   function niceStep(span, maxTicks) {
@@ -2079,16 +2723,25 @@
       return Math.abs(pts[lo2].ts - t) <= Math.abs(pts[hi2].ts - t) ? lo2 : hi2;
     }
     chart.nearest = nearest;
-    hit.addEventListener('pointermove', function (ev) {
+    function pointAt(ev) {
       const rect = svg.getBoundingClientRect();
       const scale = rect.width ? W / rect.width : 1;
       const x = (ev.clientX - rect.left) * scale;
       const t = R.t0 + ((x - M.l) / plotW) * (R.t1 - R.t0);
       chart.pointer = true;
       showPoint(chart, nearest(t));
+    }
+    hit.addEventListener('pointermove', pointAt);
+    // A tap fires no pointermove: read the tapped point (pointerdown comes before the focus it causes,
+    // so chartFocus keeps this point instead of jumping to the latest one).
+    hit.addEventListener('pointerdown', function (ev) {
+      chart.tapped = Date.now();
+      pointAt(ev);
     });
-    hit.addEventListener('pointerleave', function () {
+    hit.addEventListener('pointerleave', function (ev) {
       chart.pointer = false;
+      // a finger "leaves" right after every tap (before the tap focuses the chart): keep the tapped point
+      if (ev.pointerType && ev.pointerType !== 'mouse') return;
       if (document.activeElement !== host) hidePoint(chart);
     });
 
@@ -2101,8 +2754,15 @@
     if (surgeShown) legendItems.push(h('span', { class: 'legend-item' }, h('span', { class: 'key-line surge', 'aria-hidden': 'true' }), 'Surge move'));
     if (bandShown) legendItems.push(h('span', { class: 'legend-item' }, h('span', { class: 'key-band', 'aria-hidden': 'true' }), 'Favourite at 0.95 or more (YES ≥ 0.95 or ≤ 0.05)'));
     rebuild(sec.legend, legendItems);
-    setText(sec.summary, 'Last ' + RANGE_LABELS[S.drawer.range] + ': ' + fmtPrice(first) + ' ' + ARROW + ' ' + fmtPrice(lastP.price) +
-      ' (' + fmtSigned(lastP.price - first) + '), low ' + fmtPrice(minV) + ', high ' + fmtPrice(maxV) + '.');
+    // The summary's change is the same number as the "Change 24h" fact: the mark now minus the value
+    // 24 hours ago (not the first point drawn), and it always equals end − start as printed.
+    const row = obj(d.exchange);
+    const ch24 = S.drawer.range === '24h' ? num(row.change_24h) : null;
+    const start = ch24 != null ? lastP.price - ch24 : R.startPoint ? R.startPoint.price : first;
+    const change = ch24 != null ? ch24 : lastP.price - start;
+    setText(sec.summary, 'Last ' + RANGE_LABELS[S.drawer.range] + ': ' + fmtPrice(start) + ' ' + ARROW + ' ' + fmtPrice(lastP.price) +
+      ' (' + fmtSigned(change) + '), low ' + fmtPrice(minV) + ', high ' + fmtPrice(maxV) + '. The line is the mark price.');
+    setAttr(host, 'aria-label', 'Price chart, last ' + RANGE_LABELS[S.drawer.range] + ': ' + fmtPrice(start) + ' to ' + fmtPrice(lastP.price));
   }
 
   function showPoint(chart, i) {
@@ -2148,8 +2808,22 @@
     const sec = S.drawer.sections && S.drawer.sections.chart;
     const chart = sec && sec.chart;
     if (!chart) return;
-    if (focused) showPoint(chart, chart.index >= 0 ? chart.index : chart.pts.length - 1);
-    else if (!chart.pointer) hidePoint(chart);
+    if (focused) {
+      if (chart.tapped && Date.now() - chart.tapped < 1000 && chart.index >= 0) return; // focus came from a tap: keep the tapped point
+      showPoint(chart, chart.index >= 0 ? chart.index : chart.pts.length - 1);
+    } else if (!chart.pointer) hidePoint(chart);
+  }
+
+  /** Arrow-key reading for screen readers: the point's price, chance and time, said politely (debounced). */
+  function speakPoint(chart) {
+    const sec = S.drawer.sections && S.drawer.sections.chart;
+    if (!sec || !chart || chart.index < 0) return;
+    const p = chart.pts[chart.index];
+    const s = surgeAt(p.ts, chart.surges);
+    const text = 'Price ' + fmtPrice(p.price) + ', ' + fmtPctOf(p.price) + ', ' + fmtAbs(p.ts) + (s ? ', during a ' + str(s.window) + ' surge' : '') +
+      '. Point ' + (chart.index + 1) + ' of ' + chart.pts.length + '.';
+    clearTimeout(S.drawer.liveTimer);
+    S.drawer.liveTimer = setTimeout(function () { setText(sec.readout, text); }, 250);
   }
 
   function chartKey(ev) {
@@ -2167,6 +2841,7 @@
     else return;
     ev.preventDefault();
     showPoint(chart, clamp(i, 0, n - 1));
+    speakPoint(chart);
   }
 
   function renderChartTable(d) {
@@ -2180,13 +2855,16 @@
     }
     const table = h('table', { class: 'data-table' },
       h('caption', { class: 'sr-only' }, 'Price history for the last ' + RANGE_LABELS[S.drawer.range]),
-      h('thead', null, h('tr', null, h('th', { scope: 'col' }, 'Time'), h('th', { scope: 'col', class: 'num' }, 'Price'),
-        h('th', { scope: 'col', class: 'num' }, 'Implied chance'), h('th', { scope: 'col' }, 'Source'), h('th', { scope: 'col' }, 'Surge'))),
+      h('thead', null, h('tr', null, h('th', { scope: 'col', class: 'col-time' }, 'Time'), h('th', { scope: 'col', class: 'num' }, 'Price'),
+        h('th', { scope: 'col', class: 'num col-chance' }, 'Chance'), h('th', { scope: 'col', class: 'col-source' }, 'Source'), h('th', { scope: 'col' }, 'Surge'))),
       h('tbody', null, rows.map(function (p) {
         const s = surgeAt(p.ts, R.surges);
-        return h('tr', null, h('td', { title: fmtAbs(p.ts) }, fmtShort(p.ts)), h('td', { class: 'num' }, fmtPrice(p.price)),
-          h('td', { class: 'num' }, fmtPctOf(p.price)), h('td', null, p.source === 'candle' ? 'History candle' : p.source === 'tick' ? 'Live snapshot' : p.source || DASH),
-          h('td', null, s ? str(s.window) + ' surge' : ''));
+        const source = p.source === 'candle' ? 'Candle' : p.source === 'tick' ? 'Snapshot' : p.source || DASH;
+        return h('tr', null, h('td', { class: 'col-time', title: fmtAbs(p.ts) }, h('time', { datetime: dateOf(p.ts) ? dateOf(p.ts).toISOString() : null }, fmtTableTime(p.ts))),
+          h('td', { class: 'num' }, fmtPrice(p.price)),
+          h('td', { class: 'num col-chance' }, fmtPctOf(p.price)),
+          h('td', { class: 'col-source', title: p.source === 'candle' ? 'From the price-history candles' : p.source === 'tick' ? 'A live price snapshot taken by the bot' : null }, source),
+          h('td', null, s ? h('span', { class: 'surge-tag', title: 'During a ' + str(s.window) + ' surge' }, icon('bolt'), str(s.window), h('span', { class: 'sr-only' }, ' surge')) : ''));
       })));
     rebuild(sec.tableBox, [table]);
     rebuild(sec.legend, []);
@@ -2197,11 +2875,16 @@
   function renderBook(d) {
     const sec = S.drawer.sections.book;
     const book = d.book ? obj(d.book) : null;
-    const key = sig([book, d.book_error, d.book_fetched_at]);
+    const key = sig([book, d.book_error, d.book_fetched_at, !!d.book_pending]);
     if (S.drawer.sigs.book === key) return;
+    if (S.drawer.sigs.book != null && selectionInside(sec)) return;
     S.drawer.sigs.book = key;
     const head = h('div', { class: 'section-head' }, h('h3', { id: 'h-book' }, 'Order book (YES)'),
       num(d.book_fetched_at) != null ? h('span', { class: 'view-sub' }, 'Fetched ', timeEl(d.book_fetched_at, 'ago')) : null);
+    if (!book && d.book_pending) {
+      rebuild(sec, [head, h('p', { class: 'pending-note' }, h('span', { class: 'spinner', 'aria-hidden': 'true' }), 'Loading the order book…')]);
+      return;
+    }
     if (!book) {
       rebuild(sec, [head, h('p', { class: 'muted-note' }, str(d.book_error) || 'No live order book is available for this outcome.')]);
       return;
@@ -2278,8 +2961,13 @@
     const sec = S.drawer.sections.surge;
     const surges = objs(d.surges);
     const latest = surges[0] || null;
-    const key = sig([latest, latest ? S.analyze[latest.id] || null : null, surges.length, analysisEnabled(), newsEnabled()]);
-    if (S.drawer.sigs.surge === key) return;
+    if (latest) pruneAnalyze(latest);
+    const key = sig([latest ? surgeStableKey(latest, true) : null, surges.length]);
+    const card = sec.querySelector('.surge-card');
+    if (S.drawer.sigs.surge === key || (card && S.drawer.sigs.surge != null && selectionInside(card))) {
+      if (card && latest) updateSurgeVolatile(card, latest); // live price and revert share change on every refresh
+      return;
+    }
     S.drawer.sigs.surge = key;
     const head = h('div', { class: 'section-head' }, h('h3', { id: 'h-dsurge' }, 'Latest surge'),
       surges.length > 1 ? h('span', { class: 'view-sub' }, surges.length + ' surges in the last 7 days') : null);
@@ -2395,6 +3083,14 @@
     $('markets-body').addEventListener('click', rowClick);
     $('high-body').addEventListener('click', rowClick);
 
+    // scroll cues on the wide tables
+    [['markets-frame', 'markets-wrap'], ['high-frame', 'high-wrap']].forEach(function (pair) {
+      const frame = $(pair[0]);
+      const wrap = $(pair[1]);
+      wrap.addEventListener('scroll', function () { updateScrollCue(frame, wrap); }, { passive: true });
+      if (typeof ResizeObserver === 'function') new ResizeObserver(function () { updateScrollCue(frame, wrap); }).observe(wrap);
+    });
+
     // surge re-analysis (delegated: cards are rebuilt on every poll)
     document.addEventListener('click', function (ev) {
       const btn = ev.target.closest('button.reanalyze');
@@ -2406,7 +3102,11 @@
     });
 
     // banners
-    $('offline-retry').addEventListener('click', function () { poll(); });
+    $('offline-retry').addEventListener('click', function () {
+      S.nextRetryAt = 0;
+      renderOfflineCountdown();
+      poll();
+    });
     $('offline-dismiss').addEventListener('click', function () {
       S.offlineDismissed = true;
       show($('offline-banner'), false);
@@ -2427,8 +3127,10 @@
       downOnBackdrop = false;
     });
     dlg.addEventListener('close', function () {
+      lockPageScroll(false);
       if (S.drawer.id) requestCloseDrawer(); // closed some other way: keep the URL in sync
     });
+    $('drawer-inner').addEventListener('focusin', keepFocusVisible);
 
     const skip = document.querySelector('.skip-link');
     if (skip) {
@@ -2453,6 +3155,7 @@
 
     route(false);
     if (!S.viewShown) showView(S.view);
+    setInterval(tick, 1000);
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
