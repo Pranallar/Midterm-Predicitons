@@ -345,7 +345,7 @@ async function desktopChecks(browser) {
     const look = await page.$$eval('#look-ideas li', (els) => els.map((e) => e.textContent.replace(/\s+/g, ' ')));
     check(!look.some((l) => /BUY NO @ 0\.970/.test(l)), 'Overview never shows the set as one order: ' + look[0]);
     check(/per full set/.test(look[0]) && /\/set/.test(look[0]), 'Overview labels the set and its edge per set: ' + look[0]);
-    check((await page.getAttribute('#look-ideas li:first-child a', 'href')) === '#strategy', 'a set links to the strategy page, not to one leg');
+    check(/^#strategy\/./.test(await page.getAttribute('#look-ideas li:first-child a', 'href')), 'a set links to its card on the strategy page, not to one leg');
   });
 
   await run('functional-6', page, async () => {
@@ -395,14 +395,16 @@ async function desktopChecks(browser) {
   });
 
   await run('a11y-2', page, async () => {
+    // (r2-a11y-8 changed how: the result is announced once, through the announcer, when typing pauses)
     await page.route('**/api/surges/*/analyze', (route) => route.fulfill({ status: 200, contentType: 'application/json', body: '{"queued":true,"message":"Queued for analysis."}' }));
     await open(page, '#markets');
     const inLive = (sel) => page.evaluate((s) => { const el = document.querySelector(s); return !!(el && el.closest('[aria-live],[role=status],[role=alert],[role=log],output')); }, sel);
     await page.fill('#market-search', 'senate');
-    check(await inLive('#markets-count'), 'the result count is announced');
+    await page.waitForFunction(() => /^Showing \d+ of \d+ outcomes$/.test(document.getElementById('announcer').textContent), null, { timeout: 5000 });
     await page.fill('#market-search', 'zzzz');
     await page.waitForSelector('#markets-empty:not([hidden])');
-    check(await inLive('#markets-empty'), 'the no-results message is announced');
+    await page.waitForFunction(() => /No markets match “zzzz”/.test(document.getElementById('announcer').textContent), null, { timeout: 5000 });
+    check(!(await inLive('#markets-count')) && !(await inLive('#markets-empty')), 'the count and the empty state are not live regions of their own');
     await page.click('#markets-empty button');
     await gotoView(page, 'surges');
     await page.waitForSelector('#surge-cards button.reanalyze');

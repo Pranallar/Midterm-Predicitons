@@ -31,7 +31,7 @@ import httpx
 
 from . import __version__
 from .config import DEFAULT_BASE_URL, DEFAULT_READS_PER_MIN, DEFAULT_WRITES_PER_MIN, Settings
-from .errors import ApiError, InvalidPathParam, NetworkError, RequestCancelled
+from .errors import ApiError, InvalidPathParam, NetworkError, RequestCancelled, redact, redact_json, register_secret
 from .ratelimit import SlidingWindowLimiter
 
 log = logging.getLogger("supermarket_bot")
@@ -113,6 +113,8 @@ class SuperMarketClient:
     ) -> None:
         if not api_key:
             raise ValueError("api_key is required")
+        self._secrets = (api_key,)  # masked in every error this client raises (see _to_error)
+        register_secret(api_key)  # and in every package log line
         self.base_url = base_url.rstrip("/")
         self.max_retries = max_retries
         self.max_retry_wait = max_retry_wait
@@ -213,7 +215,10 @@ class SuperMarketClient:
         return delay
 
     @staticmethod
-    def _to_error(resp: httpx.Response, method: str, path: str) -> ApiError:
+    def _to_error(resp: httpx.Response, method: str, path: str, secrets: Sequence[str] = ()) -> ApiError:
+        """The ``ApiError`` for a non-2xx response. Its message and details are masked: an
+        upstream error that echoes the ``Authorization`` header must not carry the key into a
+        log line or a status message, however it is printed or cut later."""
         code = f"HTTP_{resp.status_code}"
         message = resp.reason_phrase or "error"
         details: Dict[str, Any] = {}
@@ -236,9 +241,9 @@ class SuperMarketClient:
             message = resp.text.strip()[:200]
         return ApiError(
             status=resp.status_code,
-            code=code,
-            message=message,
-            details=details,
+            code=redact(code, secrets),
+            message=redact(message, secrets),
+            details=redact_json(details, secrets),
             retry_after=parse_retry_after(resp.headers.get("Retry-After")),
             method=method,
             path=path,
@@ -277,7 +282,7 @@ class SuperMarketClient:
                     log.warning("%s %s failed (%s); retry %d in %.1fs", method, path, exc, attempt, delay)
                     self._sleep(delay)
                     continue
-                raise NetworkError(f"{method} {path}: {exc}") from exc
+                raise NetworkError(redact(f"{method} {path}: {exc}", self._secrets)) from exc
 
             if 200 <= resp.status_code < 300:
                 if not resp.content:
@@ -287,7 +292,7 @@ class SuperMarketClient:
                 except ValueError as exc:
                     raise ApiError(resp.status_code, "INVALID_RESPONSE", "Response was not JSON", method=method, path=path) from exc
 
-            err = self._to_error(resp, method, path)
+            err = self._to_error(resp, method, path, self._secrets)
             hint = self._server_hint(err)
             if err.status == 429 or (err.status == 503 and hint is not None):
                 # The budget is per account: make every caller honour the server's wait,

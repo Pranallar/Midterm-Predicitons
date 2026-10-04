@@ -388,6 +388,27 @@ def test_verbose_flags_and_logging_configuration(run, fake):
         assert logging.getLogger(noisy).level == logging.WARNING
 
 
+def test_r2_robustness_9_log_lines_mask_the_api_key(monkeypatch):
+    """Every handler configure_logging sets up masks the key, also in other libraries' records."""
+    import io
+
+    from supermarket_bot.errors import RedactingFilter, register_secret
+
+    root = logging.getLogger()
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    monkeypatch.setattr(root, "handlers", [handler])
+    cli.configure_logging(0)
+    assert any(isinstance(f, RedactingFilter) for f in handler.filters)
+    register_secret("sk_live_QA_SECRET_9f8e7d6c5b4a")
+    logging.getLogger("some.library").warning("upstream said: Bearer sk_live_QA_SECRET_9f8e7d6c5b4a")
+    logging.getLogger("supermarket_bot").warning("tracker: leaderboard failed: %s", "key sk_live_QA_SECRET_9f8e7d6c5b4a")
+    text = stream.getvalue()
+    assert "sk_live_QA" not in text and "Bearer ***" in text and "key ***" in text
+    cli.configure_logging(0)  # idempotent: one filter per handler
+    assert sum(isinstance(f, RedactingFilter) for f in handler.filters) == 1
+
+
 def test_stream_argument_parsing_only():
     args = cli.build_parser().parse_args(["-t", "cup", "stream", "26", "27", "--duration", "5", "--no-log", "--max-markets", "3"])
     assert args.command == "stream"

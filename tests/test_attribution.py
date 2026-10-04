@@ -789,6 +789,24 @@ def test_analyze_empty_book_and_empty_tape(fake: Any, client: Any) -> None:
     assert any("No trades at all" in r for r in result.reasons)
 
 
+def test_r2_functional_1_depth_per_side_and_the_book_is_kept(fake: Any, client: Any) -> None:
+    """A fade buys one side of the book: the analysis keeps the depth of each side (not both
+    together) and stores the levels so the strategy can size the trade by what it can fill."""
+    from supermarket_bot.store import TrackerStore
+
+    route_spike(fake)
+    store = TrackerStore()
+    store.upsert_markets([{"id": "m1", "title": INFO.market_title, "exchanges": [{"id": "ex1", "option": "YES"}]}])
+    result = Attributor(client, CTX, store, FakeNews([]), clock=lambda: NOW, flow_fn=simple_flow).analyze(make_surge())
+    # THIN_BOOK around the 0.64 mid: bids 0.62 (100) and asks 0.66 (150) lie within 5 cents
+    assert (result.book_depth, result.bid_depth, result.ask_depth) == (250.0, 100.0, 150.0)
+    book = store.book("ex1")
+    assert book is not None and book["at"] == NOW
+    assert book["bids"] == [[0.62, 100.0], [0.58, 200.0], [0.50, 5000.0]] and book["asks"] == [[0.66, 150.0], [0.70, 300.0]]
+    assert attr_mod._side_depths(THIN_BOOK, None) == (100.0, 150.0, 0.64)
+    assert attr_mod._side_depths(None, 0.5) == (None, None, None)
+
+
 def test_book_depth_helper() -> None:
     depth, mid = attr_mod._book_depth(THIN_BOOK, None)
     assert (depth, mid) == (250.0, 0.64)

@@ -27,7 +27,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from . import analytics
 from .books import Book, parse_time
 from .bot import is_fatal
-from .errors import ApiError
+from .errors import ApiError, redact
 from .models import (
     NEWS_DISABLED,
     NEWS_OK,
@@ -569,21 +569,33 @@ def merge(heuristic: Attribution, llm: Optional[Dict[str, Any]], articles: Seque
 # --------------------------------------------------------------------------- orchestration
 
 
-def _book_depth(payload: Any, fallback_mid: Optional[float]) -> Tuple[Optional[float], Optional[float]]:
-    """Resting shares within +/- 0.05 of the mid, and the mid used (YES prices)."""
+def _side_depths(payload: Any, fallback_mid: Optional[float]) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    """(YES bid shares within 0.05 below the mid, YES ask shares within 0.05 above it, the mid).
+
+    A NO buy (or a YES sale) fills against the bids, a YES buy against the asks: a trade
+    idea must be capped by the side it takes, not by both together.
+    """
     if not isinstance(payload, dict):
-        return None, None
+        return None, None, None
     book = Book.from_payload(payload)
     mid = book.mid
     if mid is None:
         best = book.best_bid or book.best_ask
         mid = best.price if best is not None else fallback_mid
     if mid is None:
-        return 0.0, None
+        return 0.0, 0.0, None
     eps = 1e-9
-    depth = sum(lv.quantity for lv in book.bids if lv.price >= mid - BOOK_BAND - eps)
-    depth += sum(lv.quantity for lv in book.asks if lv.price <= mid + BOOK_BAND + eps)
-    return float(depth), mid
+    bids = sum(lv.quantity for lv in book.bids if lv.price >= mid - BOOK_BAND - eps)
+    asks = sum(lv.quantity for lv in book.asks if lv.price <= mid + BOOK_BAND + eps)
+    return float(bids), float(asks), mid
+
+
+def _book_depth(payload: Any, fallback_mid: Optional[float]) -> Tuple[Optional[float], Optional[float]]:
+    """Resting shares within +/- 0.05 of the mid (both sides), and the mid used (YES prices)."""
+    bids, asks, mid = _side_depths(payload, fallback_mid)
+    if bids is None or asks is None:
+        return None, None
+    return float(bids + asks), mid
 
 
 def _trade_records(exchange_id: str, trades: Sequence[Any]) -> List[TradeRecord]:
@@ -626,7 +638,7 @@ def flow_until(surge: Surge) -> float:
 
 
 def _short_error(exc: BaseException) -> str:
-    text = str(exc).split(" — ")[0]  # drop the long hint suffix ApiError adds
+    text = redact(str(exc)).split(" — ")[0]  # drop the long hint suffix ApiError adds; no key, ever
     if not isinstance(exc, ApiError):
         text = f"{type(exc).__name__}: {text}"
     return _clip(text, 160)
@@ -717,6 +729,12 @@ class Attributor:
             return None
 
     def _depth(self, surge: Surge, notes: List[str]) -> Optional[float]:
+        depth, _bids, _asks = self._depths(surge, notes)
+        return depth
+
+    def _depths(self, surge: Surge, notes: List[str]) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+        """(depth within 5 cents of the mid on both sides, bid side, ask side); the book read is
+        also kept in the store, so the strategy can size a fade by the levels it would hit."""
         try:
             self._acquire()
             payload = self.client.get_exchange_orderbook(surge.exchange_id, depth=20, tournament_id=self.tournament_id)
@@ -725,10 +743,19 @@ class Attributor:
                 raise
             log.warning("order book for exchange %s unavailable: %s", surge.exchange_id, exc)
             notes.append(f"Order book read failed ({_short_error(exc)})")
-            return None
+            return None, None, None
         reference = surge.current_price if _num(surge.current_price) else surge.end_price
-        depth, _mid = _book_depth(payload, reference)
-        return depth
+        bids, asks, _mid = _side_depths(payload, reference)
+        put_book = getattr(self.store, "put_book", None)
+        if callable(put_book) and isinstance(payload, dict):
+            try:
+                book = Book.from_payload(payload)
+                put_book(surge.exchange_id, self._clock(), book.bids, book.asks)
+            except Exception as exc:
+                log.debug("could not keep the order book of %s: %s", surge.exchange_id, exc)
+        if bids is None or asks is None:
+            return None, None, None
+        return float(bids + asks), bids, asks
 
     def _articles(self, surge: Surge, title: str, option: Optional[str], now: float,
                   notes: List[str]) -> Tuple[List[Article], str, List[str]]:
@@ -756,10 +783,11 @@ class Attributor:
         notes: List[str] = []
         title, option = self._market_info(surge)
         flow = self._flow(surge, notes)
-        depth = self._depth(surge, notes)
+        depth, bid_depth, ask_depth = self._depths(surge, notes)
         articles, news_status, news_errors = self._articles(surge, title, option, now, notes)
         result = attribute(surge, flow, articles, depth, title, option, now, news_status=news_status,
                            news_errors=news_errors)
+        result.bid_depth, result.ask_depth = bid_depth, ask_depth
         if notes:
             result.reasons.extend(notes)
         if self.judge is not None:

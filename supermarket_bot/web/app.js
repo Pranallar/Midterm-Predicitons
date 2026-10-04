@@ -103,6 +103,10 @@
     strategyParts: null,
     strategyIdeas: null,
     pendingReturnKey: null,
+    pendingIdea: null, // an idea key to scroll to and focus once the Strategy view has rendered it
+    problemsDismissed: null, // the set of problem sources the user hid the problems banner for
+    problemsOpen: false, // the problems banner's details are expanded
+    announceTimer: null,
     drawer: {
       id: null,
       gen: 0,
@@ -111,7 +115,12 @@
       okAt: null, // server time of the last successful drawer load
       timer: null,
       inflight: false,
+      inflightGen: null, // the drawer generation the request in flight belongs to
+      ctrl: null, // its AbortController
       again: false,
+      seeded: null, // the title came from a row already on the page (true) or started as "Loading…" (false)
+      known: null, // {title, option} of the outcome from the page's own data, until the detail loads
+      staleKind: '',
       pushed: false,
       returnFocus: null,
       returnKey: null,
@@ -264,6 +273,8 @@
   const DT_TIME = new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' });
   const DT_SHORT = new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
   const DT_TIME_SECONDS = new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit', second: '2-digit' });
+  const DT_SHORT_SECONDS = new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', second: '2-digit' });
+  const DT_SHORT_YEAR = new Intl.DateTimeFormat(undefined, { year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
 
   function nowS() {
     return Date.now() / 1000 + S.offset;
@@ -311,6 +322,23 @@
     return sameDay ? DT_TIME_SECONDS.format(d) : DT_SHORT.format(d);
   }
 
+  /** A compact chart readout time: 'Oct 4, 7:25 AM' (the year only when it is not this year; seconds only when asked). */
+  function fmtCompact(ts, seconds) {
+    const d = dateOf(ts);
+    if (!d) return DASH;
+    if (d.getFullYear() !== new Date(nowS() * 1000).getFullYear()) return DT_SHORT_YEAR.format(d);
+    return (seconds ? DT_SHORT_SECONDS : DT_SHORT).format(d);
+  }
+
+  /** A clock time for "the figures are from …": the time today, else the day and time. */
+  function fmtClock(ts) {
+    const d = dateOf(ts);
+    if (!d) return DASH;
+    const today = new Date(nowS() * 1000);
+    const sameDay = d.getFullYear() === today.getFullYear() && d.getMonth() === today.getMonth() && d.getDate() === today.getDate();
+    return sameDay ? DT_TIME.format(d) : DT_SHORT.format(d);
+  }
+
   function fmtSpan(seconds) {
     const a = Math.abs(seconds);
     if (a < 60) return Math.max(1, Math.round(a)) + ' s';
@@ -335,6 +363,7 @@
   function fmtTime(ts, fmt) {
     if (fmt === 'day') return fmtDay(ts);
     if (fmt === 'short') return fmtShort(ts);
+    if (fmt === 'clock') return fmtClock(ts);
     return fmtAgo(ts);
   }
 
@@ -647,6 +676,108 @@
     return (num(t.cycles) || 0) > 0;
   }
 
+  /** Set while the tracker has stopped for good (for example a revoked key): nothing new will arrive. */
+  function trackerStoppedMsg() {
+    const t = obj(S.data.status && S.data.status.tracker);
+    return str(t.fatal_error)
+      ? 'Tracking has stopped (see the red banner above): no new prices, surges or ideas until you restart the dashboard.'
+      : '';
+  }
+
+  // The data a current problem is about: these decide what the empty states and banners say.
+  const PROBLEM_KINDS = {
+    prices: 'prices', snapshot: 'prices', snapshots: 'prices', price_snapshot: 'prices', price_snapshots: 'prices',
+    history: 'history', backfill: 'history', price_history: 'history',
+    markets: 'markets', market_list: 'markets', exchanges: 'markets',
+    storage: 'storage', tracker: 'tracker',
+  };
+
+  function problemKind(p) {
+    return PROBLEM_KINDS[str(p && p.source).trim().toLowerCase().replace(/[\s-]+/g, '_')] || '';
+  }
+
+  function findProblem(kind) {
+    for (const p of currentProblems(S.data.status)) if (problemKind(p) === kind) return p;
+    return null;
+  }
+
+  /** A problem's message without the request line ("(GET /exchanges/…)"), clipped to one short sentence. */
+  function shortProblem(message) {
+    let t = str(message).trim().replace(/\s*\((?:GET|POST|PUT|PATCH|DELETE|HEAD)\s+[^)]*\)\s*\.?\s*$/i, '');
+    if (t.length > 160) t = t.slice(0, 159).replace(/\s+\S*$/, '') + '…';
+    return sentence(t, 'not available.');
+  }
+
+  /** The market-list failure while the list has never loaded (so the views have nothing to show). */
+  function marketListProblem() {
+    const st = S.data.status;
+    if (!st) return null;
+    const p = findProblem('markets');
+    if (!p) return null;
+    const tr = obj(st.tracker);
+    return tr.markets_updated_at == null || !(outcomesWatched() > 0) ? p : null;
+  }
+
+  /** The bulk-price failure while no price snapshot has ever been taken. */
+  function pricesNeverLoaded() {
+    const st = S.data.status;
+    if (!st) return null;
+    const p = findProblem('prices');
+    if (!p) return null;
+    return num(obj(st.tracker).last_snapshot_at) == null || !(outcomesWatched() > 0) ? p : null;
+  }
+
+  /** Why a view has nothing to show although the tournament has markets: the tracker stopped, or
+   *  the market list / prices have never loaded. Empty when none of these applies. */
+  function noDataMsg() {
+    const stopped = trackerStoppedMsg();
+    if (stopped) return stopped;
+    const m = marketListProblem();
+    if (m) return 'Can’t load the market list yet: ' + shortProblem(m.message) + ' The bot keeps retrying.';
+    const p = pricesNeverLoaded();
+    if (p) return 'Can’t load prices yet: ' + shortProblem(p.message) + ' The bot keeps retrying.';
+    return '';
+  }
+
+  /** Surge and high-90s detection run on live prices only (price history unavailable, off or
+   *  still loading): {problem, live, waiting}, or null when history is there. */
+  function historyLimit() {
+    const st = S.data.status;
+    if (!st) return null;
+    const det = obj(st.detection);
+    const p = findProblem('history');
+    const live = num(det.live_only) || 0;
+    const waiting = num(det.waiting_for_history) || 0;
+    if (!p && live <= 0 && waiting <= 0) return null;
+    return { problem: p, live: live, waiting: waiting };
+  }
+
+  /** "price history is unavailable (HTTP 503 …)" / "is still loading" / "is not available". */
+  function historyWhy(lim) {
+    if (lim.problem) return 'price history is unavailable (' + shortProblem(lim.problem.message).replace(/\.$/, '') + ')';
+    if (lim.waiting > 0 && lim.live <= 0) return 'price history is still loading';
+    return 'price history is not available';
+  }
+
+  /** A row's current price for "how many sit at 0.95+ or 0.05-": the mark, else the last trade, else the mid. */
+  function rowPrice(r) {
+    const m = num(r.mark);
+    if (m != null) return m;
+    const l = num(r.last);
+    if (l != null) return l;
+    const b = num(r.bid), a = num(r.ask);
+    return b != null && a != null ? (a + b) / 2 : null;
+  }
+
+  function nearHighCount() {
+    const d = S.data.markets;
+    if (!d) return null;
+    return objs(d.rows).filter(function (r) {
+      const p = rowPrice(r);
+      return p != null && (p >= HIGH_LINE - 1e-9 || p <= LOW_LINE + 1e-9);
+    }).length;
+  }
+
   // ---------------------------------------------------------------- networking
 
   function httpError(message, status, body) {
@@ -656,16 +787,25 @@
     return err;
   }
 
-  async function getJSON(path) {
+  /** GET JSON with a timeout; `signal` (optional) lets the caller abandon the request early. */
+  async function getJSON(path, signal) {
     const ctrl = new AbortController();
     const timer = setTimeout(function () { ctrl.abort(); }, REQUEST_TIMEOUT_MS);
+    const onAbort = function () { ctrl.abort(); };
+    if (signal) {
+      if (signal.aborted) ctrl.abort();
+      else signal.addEventListener('abort', onAbort);
+    }
     let resp;
     try {
       resp = await fetch(path, { headers: { Accept: 'application/json' }, cache: 'no-store', credentials: 'same-origin', signal: ctrl.signal });
     } catch (e) {
       clearTimeout(timer);
+      if (signal) signal.removeEventListener('abort', onAbort);
+      if (signal && signal.aborted) throw httpError('The request was cancelled.', 0);
       throw httpError(e && e.name === 'AbortError' ? 'The request timed out.' : 'The dashboard server did not answer.', 0);
     }
+    if (signal) signal.removeEventListener('abort', onAbort);
     let body = null;
     try {
       body = await resp.json();
@@ -692,9 +832,24 @@
   }
 
   function noteSuccess() {
+    if (S.failures > 0) {
+      // Back from an outage: view errors recorded during it belong to the outage (the Offline banner
+      // said so), not to one view. They stay hidden until that view's next load settles.
+      for (const k of Object.keys(S.viewErrors)) S.viewErrors[k].afterOutage = true;
+    }
     S.failures = 0;
     S.failureText = '';
     S.offlineDismissed = false;
+  }
+
+  /** Any successful answer means the server is back: while offline, re-poll the status at once
+   *  instead of waiting out the backoff (which can reach a minute). */
+  function serverAnswered() {
+    if (!isOffline() || S.polling) return;
+    S.nextRetryAt = 0;
+    clearTimeout(S.pollTimer);
+    S.pollTimer = null;
+    poll();
   }
 
   function schedule(ms) {
@@ -719,7 +874,7 @@
     S.polling = true;
     // The view's own endpoints load alongside, each on its own: a slow or failing one never holds
     // up the status poll, and only a failing /api/status means the dashboard is offline.
-    for (const name of VIEW_DATA[S.view] || []) loadView(name);
+    for (const name of viewNeeds(S.view)) loadView(name);
     let failed = null;
     try {
       const st = await getJSON(ENDPOINTS.status);
@@ -746,21 +901,35 @@
     if (failed) renderOfflineCountdown();
   }
 
+  /** The endpoints a view loads: its own, plus the markets list while the High 90s view has to
+   *  explain an empty list ("N outcomes are at 0.95+ right now"). */
+  function viewNeeds(view) {
+    const base = VIEW_DATA[view] || [];
+    if (view === 'high' && historyLimit() && !(S.data.high && objs(S.data.high.bands).length)) return base.concat(['markets']);
+    return base;
+  }
+
   /** Fetch one view endpoint; on failure keep the last good data and remember the error for that view only. */
   async function loadView(name) {
     if (S.inflight[name] || !ENDPOINTS[name]) return;
     S.inflight[name] = true;
+    let ok = false;
     try {
       S.data[name] = await getJSON(ENDPOINTS[name]);
       S.loadedAt[name] = nowS();
       delete S.viewErrors[name];
+      ok = true;
     } catch (e) {
       const prev = S.viewErrors[name];
-      S.viewErrors[name] = { message: sentence(e && e.message, 'The request failed.'), status: (e && e.status) || 0, since: prev ? prev.since : nowS() };
+      S.viewErrors[name] = { message: sentence(e && e.message, 'The request failed.'), status: (e && e.status) || 0, since: prev && !prev.afterOutage ? prev.since : nowS() };
     } finally {
       S.inflight[name] = false;
     }
-    if ((VIEW_DATA[S.view] || []).indexOf(name) !== -1) {
+    if (ok) serverAnswered();
+    // A failure while the status request is still out waits for it: if the whole server is down,
+    // the Offline banner says so and no per-view error is shown or announced.
+    if (!ok && S.polling) return;
+    if (viewNeeds(S.view).indexOf(name) !== -1) {
       safe('view', function () { renderView(S.view); });
       refreshTimes(document);
     }
@@ -778,10 +947,21 @@
     S.startedAt = started;
   }
 
+  /** Abandon the drawer's request in flight (another outcome was opened, or the drawer closed):
+   *  the new outcome must not wait for the old answer, and that answer is ignored. */
+  function abortDrawerRequest() {
+    const D = S.drawer;
+    if (D.ctrl) D.ctrl.abort();
+    D.ctrl = null;
+    D.inflight = false;
+    D.inflightGen = null;
+    D.again = false;
+  }
+
   async function pollDrawer() {
     const D = S.drawer;
     if (!D.id || document.hidden) return;
-    if (D.inflight) {
+    if (D.inflight && D.inflightGen === D.gen) {
       D.again = true;
       return;
     }
@@ -789,25 +969,38 @@
     D.timer = null;
     const gen = D.gen;
     const id = D.id;
+    const ctrl = new AbortController();
+    const firstLoad = !D.data;
+    D.ctrl = ctrl;
     D.inflight = true;
+    D.inflightGen = gen;
+    let ok = false;
     try {
       if (!EXCHANGE_ID_RE.test(id)) throw httpError('Unknown exchange.', 404);
-      const data = await getJSON('/api/exchange/' + encodeURIComponent(id));
+      const data = await getJSON('/api/exchange/' + encodeURIComponent(id), ctrl.signal);
       if (gen === D.gen) {
         D.data = data;
         D.error = null;
         D.okAt = num(data.now) != null ? data.now : nowS();
+        ok = true;
       }
     } catch (e) {
       if (gen === D.gen) D.error = e;
     } finally {
-      D.inflight = false;
+      if (D.inflightGen === gen) {
+        D.inflight = false;
+        D.inflightGen = null;
+        D.ctrl = null;
+      }
     }
-    if (gen !== D.gen) {
-      if (D.id) pollDrawer();
-      return;
-    }
+    if (gen !== D.gen) return; // an abandoned request: the drawer now open has its own
+    if (ok) serverAnswered();
     safe('drawer', renderDrawer);
+    if (ok && firstLoad && D.seeded === false) {
+      // The dialog opened as "Loading…": say what it shows now that the title is known.
+      const row = drawerRow();
+      announce(outcomeLabel(row.title, str(row.option)));
+    }
     if (D.again) {
       D.again = false;
       pollDrawer();
@@ -825,6 +1018,8 @@
     safe('banners', renderBanners);
     safe('nav', renderNav);
     safe('view', function () { renderView(S.view); });
+    // the drawer's own warning follows the tracker too (stopped / stale), not only its fetches
+    if (S.drawer.id && S.drawer.sections) safe('drawer-stale', function () { renderDrawerStale(S.drawer.error); });
     refreshTimes(document);
   }
 
@@ -837,9 +1032,12 @@
     else if (view === 'strategy') renderStrategy();
   }
 
-  /** The error to show for a view endpoint (none while the whole dashboard is offline: the banner says it). */
+  /** The error to show for a view endpoint (none while the whole dashboard is offline: the banner
+   *  says it; nor one left over from that outage while the view's first reload is still out). */
   function viewError(name) {
-    return isOffline() ? null : S.viewErrors[name] || null;
+    if (isOffline()) return null;
+    const e = S.viewErrors[name];
+    return e && !e.afterOutage ? e : null;
   }
 
   /** The empty-state text while a view endpoint has no data yet: loading, or the reason it failed. */
@@ -886,17 +1084,22 @@
     const interval = num(st.interval) || num(tr.interval) || 30;
     if (tr.fatal_error) return { state: 'stopped', label: 'Stopped', title: 'The tracker stopped: see the message below' };
     const last = num(tr.last_snapshot_at);
-    if (last == null) {
-      if (st.view_error) return { state: 'stale', label: 'Stale', title: 'Live data is temporarily unavailable' };
-      return { state: 'loading', label: 'Starting…', title: 'Waiting for the first price snapshot' };
+    if (st.view_error) {
+      // Snapshots may still be saved, but the views are frozen on the last data they had.
+      return {
+        state: 'stale', label: 'Stale', kind: 'view',
+        title: 'Snapshots are still being saved, but the live view could not be built: showing the last data it had',
+        sentence: 'Prices are stale: the live view could not be built, so the page shows the last data it had.',
+      };
     }
+    if (last == null) return { state: 'loading', label: 'Starting…', title: 'Waiting for the first price snapshot' };
     // The snapshot's age when the status was fetched: between polls the server has newer snapshots
     // we have not seen yet, so ticking this against the browser clock would flicker Live/Stale.
     const age = (num(st.now) != null ? st.now : nowS()) - last;
     if (age < 2 * interval) {
       return { state: 'fresh', label: 'Live', title: 'Prices refresh every ' + fmtSpan(interval) + '; the last snapshot was ' + fmtAgo(last) };
     }
-    return { state: 'stale', label: 'Stale', title: 'No new price snapshot for ' + fmtSpan(age) + ' (expected every ' + fmtSpan(interval) + ')' };
+    return { state: 'stale', label: 'Stale', age: age, title: 'No new price snapshot for ' + fmtSpan(age) + ' (expected every ' + fmtSpan(interval) + ')' };
   }
 
   /** The read-budget meter: usage, or a paused / rate-limited state when the API is throttling us. */
@@ -916,12 +1119,18 @@
     const live = liveState();
     const liveEl = $('live');
     setAttr(liveEl, 'data-state', live.state);
-    setAttr(liveEl, 'title', live.title);
+    // The tooltip sits on the (aria-hidden) dot and label, never on the status region itself: a
+    // region whose name changed on every poll ("… was 9 s ago") would be re-spoken each time.
+    setAttr(liveEl, 'title', null);
+    setAttr($('live-label'), 'title', live.title);
+    setAttr(liveEl.querySelector('.live-dot'), 'title', live.title);
     setText($('live-label'), live.label);
     // The status region speaks only when the state changes (never on a plain poll).
     if (S.liveState !== live.state) {
       const recovered = live.state === 'fresh' && ['stale', 'offline', 'stopped'].indexOf(S.liveState) !== -1;
-      setText($('live-sentence'), recovered ? 'Prices are live again.' : LIVE_SENTENCES[live.state] || live.label);
+      const said = recovered ? 'Prices are live again.' : live.sentence || LIVE_SENTENCES[live.state] || live.label;
+      // (a modal drawer makes this region inert: the drawer's own note says stopped / stale there)
+      setText($('live-sentence'), said);
       S.liveState = live.state;
     }
     renderUpdated();
@@ -979,10 +1188,32 @@
     }
   }
 
+  /** What to do about a fatal tracker error. Account problems (Terms, residence, email, a ban,
+   *  missing scopes) come first: a 403 for those is not the key's fault. */
   function fatalHint(message) {
-    if (/API_KEY|INVALID_API_KEY|REVOKED|UNAUTHORI[SZ]ED|FORBIDDEN|\b401\b|\b403\b|api key|expired/i.test(message)) {
+    const m = str(message);
+    const restart = ' Then restart the dashboard.';
+    if (/TERMS_NOT_ACKNOWLEDGED|terms\s*(?:&|and)\s*conditions|accept the (?:current )?terms/i.test(m)) {
+      return 'Your account has not accepted the current Terms & Conditions. Sign in to the Predictions Cup site and accept them.' + restart;
+    }
+    if (/RESIDENCE_UPDATE_REQUIRED|residen(?:ce|cy)|state\/territory/i.test(m)) {
+      return 'Your account needs its state or territory of residence updated. Sign in to the Predictions Cup site and update it.' + restart;
+    }
+    if (/EMAIL_NOT_(?:CONFIRMED|VERIFIED)|confirm (?:the|your) e-?mail|e-?mail (?:address )?(?:is )?not (?:yet )?(?:confirmed|verified)/i.test(m)) {
+      return 'Your account’s email address is not confirmed yet. Open the confirmation email (or request a new one on the site) and confirm it.' + restart;
+    }
+    if (/ACCOUNT_(?:BANNED|SUSPENDED|DISABLED)|\bbanned\b|suspended/i.test(m)) {
+      return 'The Predictions Cup has suspended or banned this account, so its key cannot read the market. Contact the Cup organisers.';
+    }
+    if (/INSUFFICIENT_SCOPES?|missing scopes?|\bscopes?\b/i.test(m)) {
+      return 'This API key lacks the read permissions (scopes) the dashboard needs. Create a key with read access on the site and put it in SUPERMARKET_API_KEY (in your .env file).' + restart;
+    }
+    if (/API_KEY|INVALID_API_KEY|KEY_REVOKED|REVOKED|UNAUTHORI[SZ]ED|\b401\b|api key|key (?:has )?expired|EXPIRED_KEY|KEY_EXPIRED/i.test(m)) {
       return 'Your API key was rejected: it may have been revoked, expired or mistyped. Put a valid key in SUPERMARKET_API_KEY ' +
         '(in your .env file), then restart the dashboard. To explore without a key, start it with --demo.';
+    }
+    if (/\b403\b|FORBIDDEN/i.test(m)) {
+      return 'The API refused this account access (HTTP 403). The message above says why: fix that on the Predictions Cup site.' + restart;
     }
     return 'Restart the dashboard. If this keeps happening, run it with -v to see more detail in the terminal.';
   }
@@ -1041,13 +1272,40 @@
   }
 
   function problemItem(p) {
-    const li = h('li', { class: 'problem' + (p.severity === 'error' ? ' is-error' : '') },
-      h('strong', null, problemSource(p.source) + ': '), sentence(p.message, 'not available.'));
+    // the short message (no request line); the full text stays available as a tooltip
+    const full = sentence(p.message, 'not available.');
+    const li = h('li', { class: 'problem' + (p.severity === 'error' ? ' is-error' : ''), title: full },
+      h('strong', null, problemSource(p.source) + ': '), shortProblem(p.message));
     const meta = h('span', { class: 'problem-meta' });
     if (p.since != null && dateOf(p.since)) meta.append(' since ', timeEl(p.since, 'short'), ' (', timeEl(p.since, 'ago'), ')');
     if (p.count != null && p.count > 1) meta.append(' · ' + fmtInt(p.count) + ' failed attempts');
     if (meta.childNodes.length) li.appendChild(meta);
     return li;
+  }
+
+  /** The problems banner's first line: what the failures mean for the page. It only says the rest
+   *  is up to date when every failing source is an optional one (history, leaderboard, books …). */
+  function renderProblemsIntro(problems, tr) {
+    const intro = $('problems-intro');
+    const live = liveState();
+    const listMissing = !!marketListProblem();
+    const pricesDown = problems.some(function (p) { return problemKind(p) === 'prices'; }) || live.state === 'stale';
+    const severe = problems.some(function (p) { return p.severity === 'error'; });
+    const historyDown = problems.some(function (p) { return problemKind(p) === 'history'; }) && !obj(tr.backfill).complete;
+    const last = num(tr.last_snapshot_at);
+    const key = sig([listMissing, pricesDown, severe, historyDown, pricesDown ? last : null]);
+    if (intro.dataset.sig === key) return;
+    intro.dataset.sig = key;
+    const parts = [];
+    if (listMissing) parts.push('The market list has not loaded yet, so the views below have nothing to show. ');
+    else if (pricesDown) {
+      if (last != null && dateOf(last)) parts.push('Prices are not updating: the figures below are from ', timeEl(last, 'clock'), ' (', timeEl(last, 'ago'), '). ');
+      else parts.push('No prices have loaded yet. ');
+    } else if (severe) parts.push('Some figures below may be out of date. ');
+    if (historyDown) parts.push('Charts fill in when price history recovers; surge detection uses live prices meanwhile. ');
+    parts.push('The bot is still running and keeps retrying.');
+    if (!listMissing && !pricesDown && !severe) parts.push(' Everything else on the page is up to date.');
+    rebuild(intro, parts.map(function (p) { return p instanceof Node ? p : document.createTextNode(p); }));
   }
 
   /** Show or hide a banner; announce it the first time it appears (its text, once). */
@@ -1088,7 +1346,7 @@
     showBanner('offline-banner', offline);
 
     const viewErr = str(st && st.view_error);
-    if (viewErr) setText($('view-error-message'), 'The tracker could not build its live view: ' + viewErr + ' Showing the last data it had.');
+    if (viewErr) setText($('view-error-message'), 'The tracker could not build its live view: ' + sentence(viewErr) + ' Showing the last data it had.');
     showBanner('view-error-banner', !!viewErr && !fatal && !isOffline(), 'Live data is temporarily unavailable.');
 
     const problems = fatal || isOffline() ? [] : currentProblems(st);
@@ -1100,18 +1358,32 @@
       if (problems.length > 6) items.push(h('li', { class: 'problem' }, 'and ' + (problems.length - 6) + ' more.'));
       rebuild(list, items);
     }
-    showBanner('problems-banner', problems.length > 0,
-      'Some data is unavailable: ' + problems.map(function (p) { return problemSource(p.source); }).filter(function (v, i, a) { return a.indexOf(v) === i; }).join(', ') + '.');
+    // One summary line names the sources; the details (each message, since when, how often) are
+    // folded away, and the banner can be hidden until the set of failing sources changes.
+    const sources = problems.map(function (p) { return problemSource(p.source); }).filter(function (v, i, a) { return a.indexOf(v) === i; });
+    const skey = sig(sources);
+    S.problemsKey = skey;
+    if (!problems.length) S.problemsDismissed = null;
+    setText($('problems-title'), 'Some data is unavailable' + (sources.length ? ': ' + sources.join(', ') : ''));
+    renderProblemsIntro(problems, tr);
+    const details = $('problems-details');
+    setText($('problems-count'), problems.length ? '(' + problems.length + ')' : '');
+    if (details.open !== S.problemsOpen) details.open = S.problemsOpen;
+    showBanner('problems-banner', problems.length > 0 && S.problemsDismissed !== skey,
+      'Some data is unavailable: ' + sources.join(', ') + '.');
 
     let startup = '';
     let progress = null;
-    if (st && !fatal && !viewErr) { // a view error is not a fresh start: its banner explains what is going on
+    // A view error is not a fresh start (its banner explains), and while the market list, the
+    // prices or the price history are failing the problems banner says what is going on.
+    const historyDown = !!findProblem('history');
+    if (st && !fatal && !viewErr && !marketListProblem() && !pricesNeverLoaded()) {
       const bf = obj(tr.backfill);
       const done = num(bf.done);
       const total = num(bf.total);
       if (!trackerStarted()) {
         startup = 'Taking the first price snapshot. Prices and charts appear in a few seconds.';
-      } else if (total && done != null && !bf.complete && done < total) {
+      } else if (total && done != null && !bf.complete && done < total && !historyDown) {
         startup = 'Loading price history: ' + fmtInt(done) + ' of ' + fmtInt(total) + ' series so far. Charts and surge detection fill in as it arrives.';
         progress = clamp(done / total, 0, 1);
       }
@@ -1150,16 +1422,56 @@
 
   // ---------------------------------------------------------------- render: overview
 
+  /** Rough width of a tile value in em of the value's font: digits ~0.6em, separators ~0.3em, the
+   *  unit at its smaller size (0.47em). The value's font then shrinks to fit the tile (styles.css). */
+  function tileEm(value, unit) {
+    let w = 0;
+    for (const ch of String(value)) w += /[0-9]/.test(ch) ? 0.6 : /[,.\s]/.test(ch) ? 0.3 : /[A-Z#]/.test(ch) ? 0.7 : 0.58;
+    if (unit) {
+      w += 0.47 * 0.3;
+      for (const ch of String(unit)) w += 0.47 * (/[A-Z]/.test(ch) ? 0.7 : 0.56);
+    }
+    return Math.max(1, w * 1.08);
+  }
+
   function setTile(id, value, sub, unit) {
     const el = $('tile-' + id);
     const key = sig([value, unit]);
     if (el.dataset.sig !== key) {
       el.dataset.sig = key;
-      // The number never splits; the unit wraps as a whole word after a real space.
-      el.replaceChildren(h('span', { class: 'tile-num' }, value));
-      if (unit) el.append(h('span', { class: 'tile-gap' }, ' '), h('span', { class: 'tile-unit' }, unit)); // a real space, at the unit's size
+      // Number and unit stay on one line (a wrapped unit would push every tile's value down);
+      // a long value gets a smaller font instead, so it never spills out of the tile.
+      const fit = h('span', { class: 'tile-fit' }, h('span', { class: 'tile-num' }, value));
+      if (unit) fit.append(h('span', { class: 'tile-gap' }, ' '), h('span', { class: 'tile-unit' }, unit)); // a real space, at the unit's size
+      el.replaceChildren(fit);
+      el.style.setProperty('--fit', tileEm(value, unit).toFixed(2));
+      el.dataset.measured = '';
+    }
+    if (!el.dataset.measured) {
+      // measured once the tile is on screen: the value's width in em of its own font
+      const fit = el.firstElementChild;
+      const w = fit ? fit.getBoundingClientRect().width : 0;
+      const fs = fit ? parseFloat(getComputedStyle(fit).fontSize) : 0;
+      if (w > 0 && fs > 0) {
+        el.style.setProperty('--fit', (w / fs * 1.03).toFixed(3));
+        el.dataset.measured = '1';
+      }
     }
     setText($('tile-' + id + '-sub'), sub || ' ');
+  }
+
+  /** The participants tile's second line: the fade ideas Strategy actually shows (a surge that has
+   *  partly reverted can have no edge left at its stop, so not every open surge is a fade). */
+  function participantsSub(open, c) {
+    const d = S.data.strategy;
+    let fades = num(c.fade_ideas);
+    if (fades == null && d && d.available !== false) {
+      fades = objs(d.opportunities).filter(function (o) { return str(o.kind) === 'fade'; }).length;
+    }
+    if (!open) return fades ? fades + (fades === 1 ? ' fade idea' : ' fade ideas') + ': see Strategy' : 'none to fade right now';
+    if (fades == null) return 'possible fades: see Strategy';
+    if (fades > 0) return fades + (fades === 1 ? ' fade idea' : ' fade ideas') + ': see Strategy';
+    return 'still open, but no fade has an edge left';
   }
 
   function renderOverview() {
@@ -1167,11 +1479,15 @@
     if (st) {
       const c = obj(st.counts);
       const acct = obj(st.account);
-      setTile('outcomes', fmtInt(c.outcomes), num(c.markets) != null ? 'in ' + fmtInt(c.markets) + ' markets' : '');
+      const missing = marketListProblem() || pricesNeverLoaded();
+      if (missing && !(num(c.outcomes) > 0)) setTile('outcomes', DASH, marketListProblem() ? 'the market list has not loaded yet' : 'no prices loaded yet');
+      else setTile('outcomes', fmtInt(c.outcomes), num(c.markets) != null ? 'in ' + fmtInt(c.markets) + ' markets' : '');
       setTile('surges', fmtInt(c.surges_last_hour), num(c.surges) != null ? fmtInt(c.surges) + ' in the last 2 days' : '');
-      setTile('participants', fmtInt(c.open_participant_surges),
-        num(c.open_participant_surges) ? 'possible fades: see Strategy' : 'none to fade right now');
-      setTile('high', fmtInt(c.high_band), 'favourite side at 0.95 or more');
+      setTile('participants', fmtInt(c.open_participant_surges), participantsSub(num(c.open_participant_surges) || 0, c));
+      const lim = historyLimit();
+      setTile('high', fmtInt(c.high_band), !(num(c.high_band) > 0) && lim
+        ? 'none yet: the check needs 6 h of prices (see High 90s)'
+        : 'favourite side at 0.95 or more');
       const bal = num(acct.balance);
       const parts = [];
       if (num(acct.my_rank) != null) parts.push('Rank #' + fmtInt(acct.my_rank));
@@ -1182,11 +1498,16 @@
       setAttr(tile, 'title', bal == null ? null : fmtMoney(bal) + ' ' + currency());
 
       const end = cupEnd();
-      const days = num(st.days_left);
-      let sub = num(c.outcomes) != null && num(c.markets) != null
-        ? 'Watching ' + fmtInt(c.outcomes) + ' outcomes in ' + fmtInt(c.markets) + ' markets.'
-        : 'What the bot is watching right now.';
-      if (end != null) sub += ' The Cup ends ' + fmtDay(end) + (days != null ? ' (' + fmtSpan(days * 86400) + ' left).' : '.');
+      let sub = trackerStoppedMsg() ? 'Tracking has stopped: the figures below are the last ones it saw.'
+        : marketListProblem() ? 'The market list can’t be loaded yet; the bot keeps retrying.'
+          : num(c.outcomes) != null && num(c.markets) != null
+            ? 'Watching ' + fmtInt(c.outcomes) + ' outcomes in ' + fmtInt(c.markets) + ' markets.'
+            : 'What the bot is watching right now.';
+      if (end != null) {
+        // the time left comes from the end itself (days_left is clamped at 0 once the Cup is over)
+        const left = end - nowS();
+        sub += left > 0 ? ' The Cup ends ' + fmtDay(end) + ' (' + fmtSpan(left) + ' left).' : ' The Cup ended ' + fmtDay(end) + '.';
+      }
       setText($('overview-sub'), sub);
     }
     renderLookIdeas();
@@ -1225,8 +1546,14 @@
     return isSet(o) ? '' : str(o.option);
   }
 
+  /** A single-outcome idea opens its outcome; a set (or an idea without an outcome) opens its own
+   *  card on the Strategy page (#strategy/<idea key>). */
   function ideaHref(o) {
-    return !isSet(o) && hasId(o.exchange_id) ? exchangeHref(o.exchange_id) : '#strategy';
+    return !isSet(o) && hasId(o.exchange_id) ? exchangeHref(o.exchange_id) : '#strategy/' + encodeURIComponent(ideaKey(o));
+  }
+
+  function isStrategyHref(href) {
+    return href.indexOf('#strategy') === 0;
   }
 
   function sizeUnit(o, n) {
@@ -1236,6 +1563,27 @@
   function outcomeLabel(title, option) {
     const t = str(title) || 'Untitled market';
     return option ? t + ' — ' + option : t;
+  }
+
+  /** What an Overview idea item shows: an item is rebuilt only when one of these changes. */
+  function lookIdeaView(o, i) {
+    const href = ideaHref(o);
+    return {
+      href: href, rank: i + 1, label: outcomeLabel(o.title, ideaOption(o)), kind: str(o.kind), action: actionText(o),
+      side: num(o.prob_win) != null ? 'Win ' + fmtPct0(o.prob_win) : 'Return ' + fmtPctOf(o.expected_return),
+      edge: 'Edge ' + fmtSigned(o.edge) + '/' + sizeUnit(o, 1),
+      eid: isStrategyHref(href) ? null : String(o.exchange_id),
+    };
+  }
+
+  function lookIdeaItem(v, key) {
+    return h('li', { class: 'look-item', 'data-key': key },
+      h('a', { href: v.href, 'data-focus-key': 'idea:' + key, 'data-eid': v.eid },
+        h('span', { class: 'look-rank' }, h('span', { class: 'sr-only' }, 'Rank '), String(v.rank)),
+        h('span', { class: 'look-main' },
+          h('span', { class: 'look-title' }, v.label),
+          h('span', { class: 'look-meta' }, kindBadge(v.kind), h('strong', null, v.action))),
+        h('span', { class: 'look-side' }, h('span', null, v.side), h('span', null, v.edge))));
   }
 
   function renderLookIdeas() {
@@ -1248,28 +1596,45 @@
     else if (d.available === false) msg = str(d.error) || 'The strategy report is not available yet.';
     else {
       items = objs(d.opportunities).slice(0, 5);
-      if (!items.length) msg = 'No trade ideas right now. The bot keeps looking every few seconds.';
+      if (!items.length) msg = noDataMsg() || 'No trade ideas right now. The bot keeps looking every few seconds.';
     }
-    const key = sig([msg, items]);
-    if (S.sigs.lookIdeas === key) return;
-    S.sigs.lookIdeas = key;
     show(empty, !!msg);
     setText(empty, msg);
-    rebuild(list, (items || []).map(function (o, i) {
-      const href = ideaHref(o);
-      const eid = href !== '#strategy' ? String(o.exchange_id) : null;
-      return h('li', { class: 'look-item' },
-        h('a', { href: href, 'data-focus-key': 'idea:' + ideaKey(o), 'data-eid': eid },
-          h('span', { class: 'look-rank' }, h('span', { class: 'sr-only' }, 'Rank '), String(i + 1)),
-          h('span', { class: 'look-main' },
-            h('span', { class: 'look-title' }, outcomeLabel(o.title, ideaOption(o))),
-            h('span', { class: 'look-meta' }, kindBadge(o.kind), h('strong', null, actionText(o)))),
-          h('span', { class: 'look-side' },
-            num(o.prob_win) != null
-              ? h('span', null, 'Win ' + fmtPct0(o.prob_win))
-              : h('span', null, 'Return ' + fmtPctOf(o.expected_return)),
-            h('span', null, 'Edge ' + fmtSigned(o.edge) + '/' + sizeUnit(o, 1)))));
-    }));
+    // Keyed by idea, signed by what each item shows: the 30 s strategy refresh changes scores and
+    // prices behind the scenes, and an unchanged item keeps its DOM (and any text selection in it).
+    const existing = new Map();
+    for (const el of list.children) existing.set(el.dataset.key, el);
+    const seen = {};
+    const wanted = (items || []).map(function (o, i) {
+      let k = ideaKey(o);
+      seen[k] = (seen[k] || 0) + 1;
+      if (seen[k] > 1) k += '#' + seen[k];
+      const v = lookIdeaView(o, i);
+      const vkey = sig(v);
+      let el = existing.get(k);
+      if (!el || (CARD_SIGS.get(el) !== vkey && !selectionInside(el))) {
+        const fresh = lookIdeaItem(v, k);
+        CARD_SIGS.set(fresh, vkey);
+        if (el) swapCard(el, fresh);
+        el = fresh;
+      }
+      return el;
+    });
+    placeChildren(list, wanted);
+  }
+
+  /** Make a container's children exactly `wanted`, in order, moving as few nodes as possible and
+   *  keeping keyboard focus where it was. */
+  function placeChildren(box, wanted) {
+    const keep = new Set(wanted);
+    for (const el of Array.prototype.slice.call(box.children)) if (!keep.has(el)) el.remove();
+    let same = box.children.length === wanted.length;
+    for (let i = 0; same && i < wanted.length; i++) same = box.children[i] === wanted[i];
+    if (!same) {
+      const active = document.activeElement;
+      for (const el of wanted) box.appendChild(el);
+      if (active && active.isConnected && document.activeElement !== active) active.focus({ preventScroll: true });
+    }
   }
 
   function renderLookSurges() {
@@ -1284,23 +1649,31 @@
       if (!items.length) msg = noSurgesMsg();
     }
     const key = sig([msg, items && items.map(function (s) {
-      return [s.id, moveOf(s), s.window, s.status, s.attribution && s.attribution.verdict, s.attribution && s.attribution.confidence, s.title, s.option];
+      const rf = num(s.reverted_fraction);
+      return [s.id, moveOf(s), s.window, s.status, rf != null && s.status !== 'open' ? Math.round(rf * 100) : null,
+        s.attribution && s.attribution.verdict, s.attribution && s.attribution.confidence, s.title, s.option];
     })]);
-    if (S.sigs.lookSurges !== key) {
+    if (S.sigs.lookSurges !== key && !selectionInside(list)) {
       S.sigs.lookSurges = key;
       show(empty, !!msg);
       setText(empty, msg);
       rebuild(list, (items || []).map(function (s) {
-        return h('li', { class: 'look-item' },
+        // A surge that reverted, held or closed is history, not a live move: its status says so
+        // (as on the Surges cards) and its verdict badge is toned down.
+        const past = !!s.status && s.status !== 'open';
+        return h('li', { class: 'look-item' + (past ? ' is-past' : '') },
           h('a', { href: hasId(s.exchange_id) ? exchangeHref(s.exchange_id) : '#surges', 'data-focus-key': 'surge:' + surgeKey(s),
             'data-eid': hasId(s.exchange_id) ? String(s.exchange_id) : null },
             h('span', { class: 'look-rank', 'aria-hidden': 'true' }, icon('bolt')),
             h('span', { class: 'look-main' },
               h('span', { class: 'look-title' }, outcomeLabel(s.title, s.option)),
               h('span', { class: 'look-meta' }, deltaEl(moveOf(s)), h('span', null, 'over ' + str(s.window || '?')),
-                timeEl(s.detected_at, 'ago'), s.status === 'closed' ? h('span', null, 'market closed') : null)),
+                timeEl(s.detected_at, 'ago'), past ? statusBadge(s) : null)),
             h('span', { class: 'look-side' }, verdictBadge(s.attribution))));
       }));
+    } else if (S.sigs.lookSurges !== key) {
+      show(empty, !!msg);
+      setText(empty, msg);
     }
   }
 
@@ -1362,13 +1735,17 @@
       return td;
     }
     const link = h('a', { class: 'row-link', href: exchangeHref(eid), 'data-focus-key': 'row:' + eid, 'data-eid': eid });
-    const linkText = h('span');
-    const linkOption = h('span', { class: 'sr-only' }); // the outcome is part of the link's name: several rows share a title
-    link.append(linkText, linkOption);
+    const linkText = h('span', { class: 'title-text' });
+    // The outcome is part of the link's name (several rows share a title). On narrow screens, where
+    // the table scrolls under the pinned Market column, it also shows as the pinned cell's second line.
+    const linkSep = h('span', { class: 'sr-only' });
+    const linkOption = h('span', { class: 'title-option' });
+    link.append(linkText, linkSep, linkOption);
     cell('title', 'cell-title').appendChild(link);
     cells.link = link;
     cells.linkText = linkText;
     cells.linkOption = linkOption;
+    cells.linkSep = linkSep;
     cell('option', 'cell-option');
     ['last', 'bid', 'ask', 'spread', 'change_5m', 'change_1h', 'change_24h'].forEach(function (n) { cell(n, 'num'); });
     cell('spark', 'spark-cell');
@@ -1400,7 +1777,8 @@
     const rec = ROWS.get(tr);
     const c = rec.cells;
     setText(c.linkText, str(r.title) || 'Untitled market');
-    setText(c.linkOption, str(r.option) ? ' — ' + str(r.option) : '');
+    setText(c.linkSep, str(r.option) ? ' — ' : '');
+    setText(c.linkOption, str(r.option));
     setCell(rec, 'option', [r.option], function () { return document.createTextNode(str(r.option) || DASH); });
     setCell(rec, 'last', [r.last], function () { return lastTradeEl(r.last); });
     setCell(rec, 'bid', [r.bid], function () { return priceEl(r.bid); });
@@ -1499,7 +1877,7 @@
     if (!d) msg = loadingMsg('markets', 'Loading markets…');
     else if (!rows.length) {
       msg = viewUnavailable() ? 'Live data is temporarily unavailable; the markets appear again when the tracker recovers.'
-        : trackerStarted() ? 'No open markets were found in this tournament.' : 'Waiting for the first price snapshot…';
+        : noDataMsg() || (trackerStarted() ? 'No open markets were found in this tournament.' : 'Waiting for the first price snapshot…');
     }
     else if (!shown.length) {
       const what = S.filter === 'surging' ? ' surging' : S.filter === 'high' ? ' high-90s' : '';
@@ -1510,10 +1888,21 @@
     show(empty, !!msg);
     if (msg && empty.dataset.msg !== msg) {
       empty.dataset.msg = msg;
-      rebuild(empty, [document.createTextNode(msg), action]);
+      rebuild(empty, [h('span', { class: 'empty-text' }, msg), action]);
     }
-    setText($('markets-count'), d ? 'Showing ' + fmtInt(shown.length) + ' of ' + fmtInt(rows.length) + ' outcomes' : '');
+    const count = d ? 'Showing ' + fmtInt(shown.length) + ' of ' + fmtInt(rows.length) + ' outcomes' : '';
+    setText($('markets-count'), count);
+    // What a screen reader hears after the user searches or filters (debounced: once typing pauses).
+    S.marketsSay = d && rows.length && !shown.length ? msg : count;
     updateScrollCue($('markets-frame'), wrap);
+  }
+
+  /** Announce the search / filter result once the user pauses (not on every keystroke, and once). */
+  function announceMarketsSoon() {
+    clearTimeout(S.announceTimer);
+    S.announceTimer = setTimeout(function () {
+      if (S.view === 'markets' && S.marketsSay) announce(S.marketsSay);
+    }, 650);
   }
 
   /** Edge shadows on a horizontally scrolling table: they show which side has more columns. */
@@ -1541,6 +1930,7 @@
     S.filter = f;
     for (const b of document.querySelectorAll('.chip[data-filter]')) setAttr(b, 'aria-pressed', b.dataset.filter === f ? 'true' : 'false');
     safe('markets', renderMarkets);
+    announceMarketsSoon();
   }
 
   // ---------------------------------------------------------------- render: surges
@@ -1601,6 +1991,8 @@
 
   function noSurgesMsg() {
     if (viewUnavailable()) return 'Live data is temporarily unavailable; surges appear again when the tracker recovers.';
+    const why = noDataMsg();
+    if (why) return why;
     const det = obj(S.data.status && S.data.status.detection);
     const reason = str(det.reason).trim();
     const n = outcomesWatched();
@@ -1728,6 +2120,8 @@
     const card = h(compact ? 'div' : 'article', { class: 'card surge-card', 'data-key': key });
 
     const titles = h('div', { class: 'card-titles' });
+    // In the drawer the card sits under the h3 "Latest surge": its title is h4, its sections h5.
+    const sub = compact ? 'h5' : 'h4';
     if (compact) {
       titles.appendChild(h('h4', { class: 'card-title' }, str(s.window || '?') + ' surge, detected ', timeEl(s.detected_at, 'ago')));
     } else {
@@ -1750,16 +2144,16 @@
     } else {
       if (att.summary) card.appendChild(h('p', { class: 'card-summary' }, str(att.summary)));
       const left = h('div', null,
-        h('h4', { class: 'card-section-title' }, 'Why the bot thinks so'),
+        h(sub, { class: 'card-section-title' }, 'Why the bot thinks so'),
         h('ul', { class: 'reasons' }, texts(att.reasons).map(function (r) { return h('li', null, r); })));
       const right = h('div', null,
         factList([
           ['Reversion odds', fmtPct0(att.reversion_odds), 'Estimated chance the move gives back at least half'],
           ['Confidence', fmtPct0(att.confidence)],
         ]),
-        h('h4', { class: 'card-section-title' }, 'Trade flow'),
+        h(sub, { class: 'card-section-title' }, 'Trade flow'),
         flowFacts(att.flow, num(att.book_depth)),
-        h('h4', { class: 'card-section-title' }, 'Headlines'),
+        h(sub, { class: 'card-section-title' }, 'Headlines'),
         objs(att.articles).length ? headlineList(att.articles, key) : headlinesNote(att));
       card.appendChild(h('div', { class: 'card-grid' }, left, right));
     }
@@ -1898,55 +2292,97 @@
 
   // ---------------------------------------------------------------- render: high 90s
 
+  /** Why the High 90s list is empty, or a note above a short list: the check needs 6 h of prices,
+   *  and without price history outcomes only join it after 6 h of live prices. */
+  function highHistoryText(empty) {
+    const lim = historyLimit();
+    if (!lim) return '';
+    const n = nearHighCount();
+    const now = n == null ? '' : ' ' + fmtInt(n) + (n === 1 ? ' outcome is' : ' outcomes are') + ' at 0.95 or more (or 0.05 or less) right now.';
+    const join = lim.waiting > 0 && lim.live <= 0 && !lim.problem
+      ? 'outcomes join this list once it has loaded.'
+      : 'outcomes join this list after 6 h of live prices.';
+    const head = empty ? 'Nothing in the high 90s yet: the check needs 6 h of prices, and ' : 'The high-90s check needs 6 h of prices, and ';
+    return head + historyWhy(lim) + ', so ' + join + (empty ? now : '');
+  }
+
+  /** What a High 90s row shows, rounded as displayed: a row is rebuilt only when one of these changes
+   *  (the band's mean and hours-to-settlement tick on every poll but are not shown). */
+  function highRowView(b) {
+    const settleTs = num(b.settlement_ts) != null ? b.settlement_ts : toTs(b.settlement_date);
+    return [str(b.exchange_id), str(b.title), str(b.option), str(b.side).toUpperCase(), fmtPrice(b.favorite_price), fmtPrice(b.entry_price),
+      !!b.entry_is_estimate, fmtPct0(b.time_in_band), num(b.lookback_s), !!b.stable, fmtPrice(b.low), fmtPrice(b.high), settleTs,
+      b.settles_before_cup_end, fmtSigned(b.payout_per_share), num(b.return_pct) == null ? null : nf(1, 2).format(b.return_pct), cupEnd()];
+  }
+
+  function highRow(b) {
+    const eid = str(b.exchange_id);
+    const side = str(b.side).toUpperCase() || 'YES';
+    const lookH = num(b.lookback_s) != null && b.lookback_s > 0 ? fmtSpan(b.lookback_s) : '6 h';
+    const settleTs = num(b.settlement_ts) != null ? b.settlement_ts : toTs(b.settlement_date);
+    const entry = num(b.entry_price);
+    return h('tr', { class: 'clickable', 'data-eid': eid },
+      h('td', { class: 'cell-title' }, h('a', { class: 'row-link', href: exchangeHref(eid), 'data-focus-key': 'high:' + eid, 'data-eid': eid },
+        h('span', { class: 'title-text' }, str(b.title) || 'Untitled market'),
+        str(b.option) ? [h('span', { class: 'sr-only' }, ' — '), h('span', { class: 'title-option' }, str(b.option))] : null)),
+      h('td', { class: 'cell-option' }, str(b.option) || DASH),
+      h('td', null, h('span', { class: 'side-pill', title: side === 'NO' ? 'NO is the favourite: YES trades at 0.05 or less' : 'YES is the favourite' }, side)),
+      h('td', { class: 'num' }, priceEl(b.favorite_price),
+        h('span', { class: 'cell-sub' }, entry == null ? 'no quote' : 'buy at ' + fmtPrice(entry) + (b.entry_is_estimate ? ' (est.)' : ''))),
+      h('td', { class: 'num' }, fmtPct0(b.time_in_band), h('span', { class: 'cell-sub' }, 'of the last ' + lookH)),
+      h('td', null, b.stable
+        ? h('span', { class: 'yes-no is-yes' }, icon('check'), 'Stable')
+        : h('span', { class: 'yes-no is-unknown' }, icon('pulse'), 'Moving'),
+      h('span', { class: 'cell-sub' }, fmtPrice(b.low) + '–' + fmtPrice(b.high))),
+      h('td', null, settleTs == null ? DASH : timeEl(settleTs, 'day'),
+        settleTs == null ? null : h('span', { class: 'cell-sub' }, timeEl(settleTs, 'ago'))),
+      h('td', { class: 'cell-cupend' }, yesNo(b.settles_before_cup_end, 'Yes, pays out', 'No — valued at market price', 'Unknown date')),
+      h('td', { class: 'num' }, num(b.payout_per_share) == null ? DASH : fmtSigned(b.payout_per_share) + '/share',
+        h('span', { class: 'cell-sub' }, num(b.return_pct) == null ? '' : nf(1, 2).format(b.return_pct) + '% return')));
+  }
+
   function renderHigh() {
     const d = S.data.high;
     const tbody = $('high-body');
     const empty = $('high-empty');
-    const bands = d ? objs(d.bands).filter(function (b) { return hasId(b.exchange_id); }) : [];
+    const seen = new Set();
+    const bands = d ? objs(d.bands).filter(function (b) {
+      if (!hasId(b.exchange_id) || seen.has(String(b.exchange_id))) return false;
+      seen.add(String(b.exchange_id));
+      return true;
+    }) : [];
     let msg = '';
     if (!d) msg = loadingMsg('high', 'Loading…');
     else if (!bands.length) {
       const n = outcomesWatched();
       msg = viewUnavailable() ? 'Live data is temporarily unavailable; the high-90s list appears again when the tracker recovers.'
-        : trackerStarted() || n
+        : noDataMsg() || highHistoryText(true) || (trackerStarted() || n
           ? 'Nothing is hovering in the high 90s right now — watching ' + fmtInt(n) + ' outcomes.'
-          : 'Waiting for the first price snapshot…';
+          : 'Waiting for the first price snapshot…');
     }
     show(empty, !!msg);
     setText(empty, msg);
+    const note = bands.length ? highHistoryText(false) : '';
+    show($('high-note'), !!note);
+    setText($('high-note'), note);
     show($('high-frame'), bands.length > 0);
-    const key = sig([bands, cupEnd()]);
-    if (S.sigs.high === key) {
-      updateScrollCue($('high-frame'), $('high-wrap'));
-      return;
-    }
-    if (selectionInside(tbody)) return; // keep the user's text selection; rebuild on a later poll
-    S.sigs.high = key;
-    rebuild(tbody, bands.map(function (b) {
-      b = obj(b);
+    // Rows are keyed by outcome and signed by what they show, so a poll that changes nothing visible
+    // leaves the table alone (focus, a screen reader's table position and selections survive).
+    const existing = new Map();
+    for (const tr of tbody.children) existing.set(tr.dataset.eid, tr);
+    const wanted = bands.map(function (b) {
       const eid = str(b.exchange_id);
-      const side = str(b.side).toUpperCase() || 'YES';
-      const lookH = num(b.lookback_s) != null ? fmtSpan(b.lookback_s) : '6 h';
-      const settleTs = num(b.settlement_ts) != null ? b.settlement_ts : toTs(b.settlement_date);
-      const entry = num(b.entry_price);
-      return h('tr', { class: 'clickable', 'data-eid': eid },
-        h('td', { class: 'cell-title' }, h('a', { class: 'row-link', href: exchangeHref(eid), 'data-focus-key': 'high:' + eid, 'data-eid': eid }, str(b.title) || 'Untitled market',
-          str(b.option) ? h('span', { class: 'sr-only' }, ' — ' + str(b.option)) : null)),
-        h('td', { class: 'cell-option' }, str(b.option) || DASH),
-        h('td', null, h('span', { class: 'side-pill', title: side === 'NO' ? 'NO is the favourite: YES trades at 0.05 or less' : 'YES is the favourite' }, side)),
-        h('td', { class: 'num' }, priceEl(b.favorite_price),
-          h('span', { class: 'cell-sub' }, entry == null ? 'no quote' : 'buy at ' + fmtPrice(entry) + (b.entry_is_estimate ? ' (est.)' : ''))),
-        h('td', { class: 'num' }, fmtPct0(b.time_in_band), h('span', { class: 'cell-sub' }, 'of the last ' + lookH)),
-        h('td', null, b.stable
-          ? h('span', { class: 'yes-no is-yes' }, icon('check'), 'Stable')
-          : h('span', { class: 'yes-no is-unknown' }, icon('pulse'), 'Moving'),
-        h('span', { class: 'cell-sub' }, fmtPrice(b.low) + '–' + fmtPrice(b.high))),
-        h('td', null, settleTs == null ? DASH : timeEl(settleTs, 'day'),
-          settleTs == null ? null : h('span', { class: 'cell-sub' }, timeEl(settleTs, 'ago'))),
-        h('td', { class: 'cell-cupend' }, yesNo(b.settles_before_cup_end, 'Yes, pays out', 'No — valued at market price', 'Unknown date')),
-        h('td', { class: 'num' }, num(b.payout_per_share) == null ? DASH : fmtSigned(b.payout_per_share) + '/share',
-          h('span', { class: 'cell-sub' }, num(b.return_pct) == null ? '' : nf(1, 2).format(b.return_pct) + '% return')));
-    }));
+      const vkey = sig(highRowView(b));
+      let tr = existing.get(eid);
+      if (!tr || (CARD_SIGS.get(tr) !== vkey && !selectionInside(tr))) {
+        const fresh = highRow(b);
+        CARD_SIGS.set(fresh, vkey);
+        if (tr) swapCard(tr, fresh);
+        tr = fresh;
+      }
+      return tr;
+    });
+    placeChildren(tbody, wanted);
     updateScrollCue($('high-frame'), $('high-wrap'));
   }
 
@@ -1988,7 +2424,7 @@
     const titleText = str(o.title) || 'Untitled market';
     const option = ideaOption(o);
     const href = ideaHref(o);
-    const titleNode = href !== '#strategy'
+    const titleNode = !isStrategyHref(href)
       ? h('a', { href: href, 'data-focus-key': 'st:' + key + ':title', 'data-eid': String(o.exchange_id) }, titleText,
         option ? h('span', { class: 'sr-only' }, ' — ' + option) : null)
       : document.createTextNode(titleText);
@@ -2011,7 +2447,8 @@
       ['Settles before Cup end', o.settles_before_cup_end === true ? 'Yes' : o.settles_before_cup_end === false ? 'No' : 'Unknown'],
     ]);
     const details = h('details', { 'data-idea': key },
-      h('summary', { 'data-focus-key': 'st:' + key + ':why' }, icon('chevron', 'chev'), 'Why this idea, and the risks'),
+      h('summary', { 'data-focus-key': 'st:' + key + ':why' }, icon('chevron', 'chev'), 'Why this idea, and the risks',
+        h('span', { class: 'sr-only' }, ' — ' + outcomeLabel(titleText, option))), // every disclosure names its idea
       h('h5', null, 'Rationale'),
       texts(o.rationale).length
         ? h('ul', { class: 'reasons' }, texts(o.rationale).map(function (r) { return h('li', null, r); }))
@@ -2029,7 +2466,9 @@
       h('span', { class: 'idea-rank' }, h('span', { class: 'sr-only' }, 'Rank '), String(i + 1)),
       h('div', { class: 'idea-main' },
         h('div', { class: 'idea-head' }, kindBadge(o.kind),
-          h('h4', { class: 'idea-title' }, titleNode, option ? h('span', { class: 'card-sub', 'aria-hidden': href !== '#strategy' ? 'true' : null }, ' — ' + option) : null)),
+          // tabindex -1: a link from the Overview (#strategy/<key>) moves focus to this heading
+          h('h4', { class: 'idea-title', tabindex: '-1' }, titleNode,
+            option ? h('span', { class: 'card-sub', 'aria-hidden': !isStrategyHref(href) ? 'true' : null }, ' — ' + option) : null)),
         action, legList(o), facts, details));
   }
 
@@ -2079,20 +2518,54 @@
     return el;
   }
 
+  /** The risk banner's explanation. The fixed copy claims a position (top 3, far behind), so when
+   *  the rank or the leader is unknown it says what the mode is based on instead. A server-sent
+   *  mode_reason wins. */
+  function modeText(d) {
+    const reason = str(d.mode_reason).trim();
+    if (reason) return sentence(reason);
+    const key = MODES[str(d.risk_mode)] ? str(d.risk_mode) : 'balanced';
+    const rank = num(d.my_rank), leader = num(d.leader_value), bal = num(d.balance), days = num(d.days_left);
+    if (key === 'aggressive') {
+      const behind = leader != null && leader > 0 && bal != null && bal < 0.9 * leader;
+      if (!behind && rank == null) {
+        return 'Rank unknown (no leaderboard data): treated as outside the top 10' + (days != null ? ' with ' + nf(0, 0).format(days) + ' days left' : '') +
+          '. Only the top 3 win prizes, so variance helps you: fades and arbitrage get a boost and slow carry trades are dampened.';
+      }
+      if (!behind && rank != null) {
+        return 'You are ranked #' + fmtInt(rank) + ', outside the top 10' + (days != null ? ', with ' + nf(0, 0).format(days) + ' days left' : '') +
+          '. Only the top 3 win prizes, so variance helps you: fades and arbitrage get a boost and slow carry trades are dampened.';
+      }
+      return MODES.aggressive.text;
+    }
+    if (key === 'balanced' && (rank == null || leader == null)) {
+      const what = rank == null && leader == null ? 'Rank and the leader’s value unknown' : rank == null ? 'Rank unknown' : 'Leader’s value unknown';
+      return what + ' (no leaderboard data): defaulting to balanced. Ideas are ranked by expected return × confidence, with no extra tilt toward risk.';
+    }
+    return MODES[key].text;
+  }
+
+  /** Days left in the Cup, or "Ended" once it is over. */
+  function daysLeftText(d) {
+    const end = cupEnd();
+    if (end != null && end <= nowS()) return 'Ended';
+    return num(d.days_left) == null ? DASH : nf(0, 1).format(d.days_left);
+  }
+
   function riskPanel(d) {
     const mode = MODES[str(d.risk_mode)] || MODES.balanced;
     const factsItems = [
       ['Balance', num(d.balance) == null ? DASH : fmtMoney(d.balance) + ' ' + currency()],
-      ['Rank', num(d.my_rank) == null ? DASH : '#' + fmtInt(d.my_rank)],
+      ['Rank', num(d.my_rank) == null ? DASH : '#' + fmtInt(d.my_rank), num(d.my_rank) == null ? 'Unknown: no leaderboard data' : null],
       ['Leader (est.)', num(d.leader_value) == null ? DASH : fmtInt(d.leader_value) + ' ' + currency(), 'Starting balance plus the leader’s reported profit'],
-      ['Days left', num(d.days_left) == null ? DASH : nf(0, 1).format(d.days_left)],
+      ['Days left', daysLeftText(d)],
     ];
     const assumptions = texts(d.assumptions);
     return h('section', { class: 'risk-banner', 'data-mode': str(d.risk_mode) || 'balanced', 'aria-labelledby': 'h-risk' },
       icon(mode.icon),
       h('div', { class: 'banner-body' },
         h('h3', { class: 'risk-mode', id: 'h-risk' }, mode.label),
-        h('p', { class: 'risk-explain' }, mode.text),
+        h('p', { class: 'risk-explain' }, modeText(d)),
         factList(factsItems, 'risk-facts'),
         assumptions.length
           ? h('div', { class: 'assumptions' }, h('p', { class: 'assumptions-title' }, icon('info'), 'Based on assumptions:'),
@@ -2137,7 +2610,10 @@
     const root = $('strategy-body');
     if (!d || d.available === false) {
       const key = sig(['empty', d && d.error, !d && viewError('strategy') ? 'err' : '']);
-      if (S.sigs.strategy === key) return;
+      if (S.sigs.strategy === key) {
+        focusPendingIdea();
+        return;
+      }
       S.sigs.strategy = key;
       S.strategyParts = {};
       S.strategyIdeas = null;
@@ -2147,13 +2623,14 @@
           h('div', { class: 'banner-body' }, h('h3', { class: 'banner-title' }, 'The strategy report is not available'),
             h('p', null, str(d.error) || 'Try again in a few seconds.')))]);
       }
+      focusPendingIdea();
       return;
     }
     S.sigs.strategy = 'report';
     if (!S.strategyParts) S.strategyParts = {};
     // Volatile fields (now, generated_at) are left out of every key: an unchanged report keeps its DOM.
     const cur = currency();
-    const risk = strategyPart('risk', sig([d.risk_mode, d.balance, d.my_rank, d.leader_value, d.days_left != null ? Number(num(d.days_left) || 0).toFixed(1) : null, d.assumptions, cur]),
+    const risk = strategyPart('risk', sig([d.risk_mode, d.mode_reason, d.balance, d.my_rank, d.leader_value, daysLeftText(d), d.assumptions, cur]),
       function () { return riskPanel(d); });
     const principles = strategyPart('principles', sig([d.headline, d.principles]), function () {
       return h('section', { class: 'panel', 'aria-labelledby': 'h-principles' },
@@ -2170,8 +2647,10 @@
     if (opps.length) {
       const list = ideasList(opps);
       if (list.parentNode !== ideasPanel) ideasPanel.appendChild(list);
-    } else if (!ideasPanel.querySelector('.empty')) {
-      ideasPanel.appendChild(emptyNote('No trade ideas right now. Ideas appear when the bot sees a participant-driven surge, a stable high-90s favourite or prices that do not add up.'));
+    } else {
+      let note = ideasPanel.querySelector('.empty');
+      if (!note) note = ideasPanel.appendChild(emptyNote(''));
+      setText(note, noDataMsg() || 'No trade ideas right now. Ideas appear when the bot sees a participant-driven surge, a stable high-90s favourite or prices that do not add up.');
     }
     const backtest = strategyPart('backtest', sig([d.backtest_status, d.backtest_error, d.backtest]), function () { return backtestPanel(d); });
     const disclaimer = strategyPart('disclaimer', sig([d.disclaimer]), function () {
@@ -2180,30 +2659,68 @@
     const wanted = [risk, principles, ideasPanel, backtest, disclaimer];
     if (root.children.length !== wanted.length || !root.querySelector(':scope > .risk-banner')) {
       rebuild(root, wanted);
-      return;
+    } else {
+      // swap only the parts that changed: moving an unchanged part would drop a text selection inside it
+      wanted.forEach(function (el, i) {
+        const curEl = root.children[i];
+        if (curEl === el) return;
+        const active = document.activeElement;
+        const fkey = active && curEl.contains(active) ? active.getAttribute('data-focus-key') : null;
+        curEl.replaceWith(el);
+        if (fkey) {
+          const t = el.querySelector('[data-focus-key="' + CSS.escape(fkey) + '"]');
+          if (t) t.focus({ preventScroll: true });
+        }
+      });
     }
-    // swap only the parts that changed: moving an unchanged part would drop a text selection inside it
-    wanted.forEach(function (el, i) {
-      const curEl = root.children[i];
-      if (curEl === el) return;
-      const active = document.activeElement;
-      const fkey = active && curEl.contains(active) ? active.getAttribute('data-focus-key') : null;
-      curEl.replaceWith(el);
-      if (fkey) {
-        const t = el.querySelector('[data-focus-key="' + CSS.escape(fkey) + '"]');
-        if (t) t.focus({ preventScroll: true });
+    focusPendingIdea();
+  }
+
+  /** A link to one idea (#strategy/<key>, for example an arbitrage set on the Overview) lands on
+   *  that idea's card, scrolled into view with focus on its heading; an unknown key stays at the top. */
+  function focusPendingIdea() {
+    const key = S.pendingIdea;
+    if (!key || S.view !== 'strategy' || !S.data.strategy) return; // wait for the report
+    S.pendingIdea = null;
+    let card = null;
+    for (const el of document.querySelectorAll('#strategy-body .idea[data-key]')) {
+      if (el.dataset.key === key) {
+        card = el;
+        break;
       }
-    });
+    }
+    if (!card) return; // an idea that is gone: the view's heading has focus, at the top
+    const head = card.querySelector('.idea-title') || card;
+    card.scrollIntoView({ block: 'start' });
+    head.focus({ preventScroll: true });
+    card.classList.add('is-target');
+    setTimeout(function () { card.classList.remove('is-target'); }, 2500);
   }
 
   // ---------------------------------------------------------------- drawer
 
   const drawerEl = function () { return $('drawer'); };
 
+  /** The title and outcome of an exchange from data the page already has (the row, band, surge or
+   *  idea the user activated), so the dialog can be named before its detail loads. */
+  function knownOutcome(id) {
+    const sid = String(id);
+    const pick = function (title, option) { return str(title) ? { title: str(title), option: str(option) } : null; };
+    for (const r of objs(S.data.markets && S.data.markets.rows)) if (String(r.exchange_id) === sid) return pick(r.title, r.option);
+    for (const b of objs(S.data.high && S.data.high.bands)) if (String(b.exchange_id) === sid) return pick(b.title, b.option);
+    for (const s of objs(S.data.surges && S.data.surges.surges)) if (String(s.exchange_id) === sid) return pick(s.title, s.option);
+    for (const o of objs(S.data.strategy && S.data.strategy.opportunities)) {
+      if (!isSet(o) && String(o.exchange_id) === sid) return pick(o.title, o.option);
+      for (const l of objs(o.legs)) if (String(l.exchange_id) === sid) return pick(l.title || o.title, l.option);
+    }
+    return null;
+  }
+
   function openDrawer(id, pushed) {
     const D = S.drawer;
     const dlg = drawerEl();
     if (D.id !== id) {
+      abortDrawerRequest(); // the previous outcome's answer must not hold this one up
       D.id = id;
       D.gen += 1;
       D.data = null;
@@ -2211,6 +2728,9 @@
       D.hoverTs = null;
       D.sections = null;
       D.sigs = {};
+      D.staleKind = '';
+      D.known = knownOutcome(id);
+      D.seeded = !!D.known;
       clearTimeout(D.timer);
       safe('drawer', renderDrawer);
     }
@@ -2258,6 +2778,7 @@
     const update = function () {
       const sticky = head && getComputedStyle(head).position === 'sticky';
       inner.style.setProperty('--drawer-head-h', (sticky ? Math.ceil(head.getBoundingClientRect().height) : 0) + 'px');
+      safe('drawer-question', renderDrawerQuestion); // the clamp may cut the title at a new width
     };
     update();
     if (D.headRo || typeof ResizeObserver !== 'function' || !head) return;
@@ -2284,11 +2805,13 @@
     const D = S.drawer;
     D.closing = false;
     if (!D.id) return;
+    abortDrawerRequest();
     D.id = null;
     D.gen += 1;
     clearTimeout(D.timer);
     D.timer = null;
     D.sections = null;
+    D.known = null;
     if (D.ro) D.ro.disconnect();
     D.ro = null;
     D.chartWidth = 0;
@@ -2331,6 +2854,11 @@
     return obj(d && d.exchange);
   }
 
+  /** The drawer's outcome is in a market that closed or settled (the server says market_open false). */
+  function drawerClosed(d) {
+    return !!(d && d.market_open === false);
+  }
+
   function renderDrawer() {
     const D = S.drawer;
     if (!D.id) return;
@@ -2338,22 +2866,27 @@
     const err = D.error;
     const body = $('drawer-body');
     const row = drawerRow();
+    let title = '';
     if (d) {
-      setText($('drawer-title'), str(row.title) || 'Untitled market');
-      setAttr($('drawer-title'), 'title', str(row.title) || null); // the visible title is clamped to two lines
+      title = str(row.title) || 'Untitled market';
       const bits = ['Outcome: ' + (str(row.option) || DASH)];
       if (row.exchange_id != null) bits.push('exchange ' + str(row.exchange_id));
       if (row.market_id != null) bits.push('market ' + str(row.market_id));
       setText($('drawer-sub'), bits.join(' · '));
     } else if (err) {
-      setText($('drawer-title'), err.status === 404 ? 'Outcome not found' : 'Could not load this outcome');
-      setAttr($('drawer-title'), 'title', null);
-      setText($('drawer-sub'), 'Exchange ' + D.id);
+      title = err.status === 404 ? 'Outcome not found' : D.known ? D.known.title : 'Could not load this outcome';
+      setText($('drawer-sub'), (D.known ? 'Outcome: ' + (D.known.option || DASH) + ' · exchange ' : 'Exchange ') + D.id);
+    } else if (D.known) {
+      // named from the row the user activated, so the dialog is not announced as "Loading…"
+      title = D.known.title;
+      setText($('drawer-sub'), 'Outcome: ' + (D.known.option || DASH) + ' · exchange ' + D.id);
     } else {
-      setText($('drawer-title'), 'Loading…');
-      setAttr($('drawer-title'), 'title', null);
+      title = 'Loading…';
       setText($('drawer-sub'), 'Exchange ' + D.id);
     }
+    setText($('drawer-title'), title);
+    setAttr($('drawer-title'), 'title', d || D.known ? title : null); // the visible title is clamped to two lines
+    setText($('drawer-kicker'), drawerClosed(d) ? 'Market detail · closed' : 'Market detail');
 
     if (!d) {
       const msg = err
@@ -2371,6 +2904,8 @@
     D.sigs.placeholder = null;
     if (!D.sections) {
       D.sections = {
+        question: h('p', { class: 'drawer-question', 'aria-hidden': 'true', hidden: true }),
+        closed: h('div', { class: 'drawer-closed', hidden: true }),
         stale: h('div', { class: 'drawer-stale', hidden: true }),
         facts: h('section', { class: 'panel', 'aria-label': 'Prices' }),
         chart: buildChartSection(),
@@ -2379,8 +2914,11 @@
         surge: h('section', { class: 'panel', 'aria-labelledby': 'h-dsurge' }),
       };
       D.sigs = {};
-      rebuild(body, [D.sections.stale, D.sections.facts, D.sections.chart.root, D.sections.surge, D.sections.book, D.sections.trades]);
+      rebuild(body, [D.sections.question, D.sections.closed, D.sections.stale, D.sections.facts, D.sections.chart.root,
+        D.sections.surge, D.sections.book, D.sections.trades]);
     }
+    renderDrawerQuestion();
+    renderDrawerClosed(d);
     renderDrawerStale(err);
     renderDrawerFacts(d);
     renderChartSection(d);
@@ -2390,49 +2928,119 @@
     refreshTimes(body);
   }
 
-  /** The drawer still shows its last good data while refreshes fail: say so, with the data's age. */
+  /** The title is clamped to two lines in the sticky header; when that cuts it short, the full
+   *  question is repeated at the top of the drawer (a tooltip is no help on touch screens). It is
+   *  hidden from screen readers, which read the whole heading anyway. */
+  function renderDrawerQuestion() {
+    const sec = S.drawer.sections;
+    if (!sec || !sec.question) return;
+    const t = $('drawer-title');
+    const cut = !!S.drawer.data && t.scrollHeight > t.clientHeight + 1;
+    show(sec.question, cut);
+    if (cut) setText(sec.question, t.textContent);
+  }
+
+  function renderDrawerClosed(d) {
+    const box = S.drawer.sections.closed;
+    const closed = drawerClosed(d);
+    if (closed === !box.hidden && box.childNodes.length) return;
+    show(box, closed);
+    box.replaceChildren();
+    if (closed) {
+      box.append(icon('closed'), h('p', null, h('strong', null, 'This market has closed or settled. '),
+        'The prices below are the last ones recorded, and it can no longer be traded.'));
+    }
+  }
+
+  /** The drawer keeps its last good data on screen: say when that data is not live, either because
+   *  its own refresh failed or because the tracker has stopped or gone stale (the header and its
+   *  banners are hidden behind the modal, and inert to screen readers). */
   function renderDrawerStale(err) {
     const D = S.drawer;
-    const box = D.sections.stale;
-    const failing = !!err || isOffline();
-    const reason = isOffline() ? S.failureText : err ? sentence(err.message, 'The request failed.') : '';
-    const key = sig([failing, reason, D.okAt]);
+    const box = D.sections && D.sections.stale;
+    if (!box) return;
+    const live = liveState();
+    const tr = obj(S.data.status && S.data.status.tracker);
+    let kind = '';
+    let parts = null;
+    if (err) {
+      // only this drawer's own failed request claims the bot is unreachable (a refresh that just
+      // worked never does, even while the header still says Offline)
+      const unreachable = !err.status && isOffline();
+      kind = 'fetch';
+      parts = [h('strong', null, unreachable ? 'Can’t reach the bot: ' : 'Could not refresh these details: '),
+        unreachable ? S.failureText || sentence(err.message) : sentence(err.message, 'The request failed.'),
+        D.okAt != null ? [' Showing data from ', timeEl(D.okAt, 'ago'), '.'] : null, ' Retrying automatically.'];
+    } else if (live.state === 'stopped') {
+      kind = 'stopped';
+      parts = [h('strong', null, 'The tracker has stopped: '), 'prices here are no longer updating. ', sentence(str(tr.fatal_error))];
+    } else if (live.state === 'stale') {
+      kind = 'stale';
+      const last = num(tr.last_snapshot_at);
+      parts = live.kind === 'view'
+        ? [h('strong', null, 'Live data is temporarily unavailable: '), 'these details show the last data the tracker had.']
+        : [h('strong', null, 'Prices are stale: '), last != null && dateOf(last)
+          ? ['no new price snapshot since ', timeEl(last, 'clock'), ' (', timeEl(last, 'ago'), ').']
+          : 'no new price snapshot recently.'];
+    }
+    const key = sig([kind, kind === 'fetch' ? [err.status, err.message, isOffline(), S.failureText, D.okAt] : null,
+      kind === 'stopped' ? tr.fatal_error : null, kind === 'stale' ? [live.kind, tr.last_snapshot_at] : null]);
     if (D.sigs.stale === key) return;
-    const was = !box.hidden;
+    const was = D.staleKind;
     D.sigs.stale = key;
-    show(box, failing);
-    if (!failing) {
+    D.staleKind = kind;
+    show(box, !!kind);
+    if (!kind) {
       box.replaceChildren();
       if (was) announce('The details are updating again.');
       return;
     }
-    box.replaceChildren(icon('warn'), h('p', null,
-      h('strong', null, isOffline() ? 'Can’t reach the bot: ' : 'Could not refresh these details: '), reason,
-      D.okAt != null ? [' Showing data from ', timeEl(D.okAt, 'ago'), '.'] : null, ' Retrying automatically.'));
-    if (!was) announce('These details are not updating: showing older data.');
+    box.replaceChildren(icon('warn'), h('p', null, parts));
+    if (was !== kind) {
+      announce(kind === 'fetch' ? 'These details are not updating: showing older data.'
+        : kind === 'stopped' ? LIVE_SENTENCES.stopped
+          : live.sentence || LIVE_SENTENCES.stale);
+    }
   }
 
   function renderDrawerFacts(d) {
     const row = obj(d.exchange);
     const band = d.high_band ? obj(d.high_band) : null;
-    const key = sig([row.last, row.mark, row.bid, row.ask, row.spread, row.change_5m, row.change_1h, row.change_24h, row.settlement_date, band, cupEnd()]);
+    const closed = drawerClosed(d);
+    // a closed market has no live quote: show the last recorded mark and trade instead of "No price yet"
+    const pts = closed ? seriesPoints(d) : [];
+    const lastPt = pts.length ? pts[pts.length - 1] : null;
+    const lastTrade = objs(d.trades)[0] || null;
+    const lastPx = num(row.last) != null ? row.last : closed && lastTrade ? num(lastTrade.price) : null;
+    const key = sig([row.last, row.mark, row.bid, row.ask, row.spread, row.change_5m, row.change_1h, row.change_24h, row.settlement_date, band, cupEnd(),
+      closed, lastPt && [lastPt.ts, lastPt.price], lastPx]);
     if (S.drawer.sigs.facts !== key && selectionInside(S.drawer.sections.facts)) return;
     if (S.drawer.sigs.facts === key) return;
     S.drawer.sigs.facts = key;
     const settle = toTs(row.settlement_date);
     const end = cupEnd();
-    const items = [
-      ['Last trade', lastTradeEl(row.last), 'The last tournament trade'],
-      ['Mark', priceEl(row.mark), 'The price the chart plots: the bid/ask mid when the spread is tight, else the last trade'],
-      ['Bid', priceEl(row.bid)],
-      ['Ask', priceEl(row.ask)],
+    const closedPrice = function (v) { return num(v) != null ? priceEl(v) : priceEl(null, 'Market closed: no live quote'); };
+    const items = closed
+      ? [
+        ['Last trade', num(lastPx) != null ? priceEl(lastPx) : priceEl(null, 'No trades recorded'), 'The last trade recorded before the market closed'],
+        ['Last known mark', num(row.mark) != null ? priceEl(row.mark) : lastPt ? priceEl(lastPt.price) : priceEl(null, 'No price recorded'),
+          lastPt ? 'The last price recorded, ' + fmtAbs(lastPt.ts) : 'The last price recorded'],
+        ['Bid', closedPrice(row.bid)],
+        ['Ask', closedPrice(row.ask)],
+      ]
+      : [
+        ['Last trade', lastTradeEl(row.last), 'The last tournament trade'],
+        ['Mark', priceEl(row.mark), 'The price the chart plots: the bid/ask mid when the spread is tight, else the last trade'],
+        ['Bid', priceEl(row.bid)],
+        ['Ask', priceEl(row.ask)],
+      ];
+    items.push(
       ['Spread', num(row.spread) == null ? DASH : fmtPrice(row.spread)],
       ['Change 5m', deltaEl(row.change_5m)],
       ['Change 1h', deltaEl(row.change_1h)],
       ['Change 24h', deltaEl(row.change_24h)],
       ['Settles', settle == null ? DASH : h('span', null, timeEl(settle, 'day'), end != null && settle > end ? ' (after Cup end)' : ''), null,
-        end != null && settle != null && settle > end ? 'wide' : null],
-    ];
+        end != null && settle != null && settle > end ? 'wide' : null]);
     if (band && num(band.favorite_price) != null) {
       const share = num(band.time_in_band) != null ? ', ' + fmtPct0(band.time_in_band) + ' of the last ' + fmtSpan(num(band.lookback_s) || 21600) : '';
       items.push(['High 90s', (str(band.side).toUpperCase() || 'Favourite') + ' at ' + fmtPrice(band.favorite_price) + share,
@@ -2556,30 +3164,83 @@
     return Math.max(2, parts[1] ? parts[1].length : 0);
   }
 
-  function timeTicks(t0, t1, width) {
+  const TICK_STEPS = [900, 1800, 3600, 7200, 10800, 14400, 21600, 43200, 86400, 172800];
+  const TICK_EDGE = 18; // px: a centred label this close to the plot's edge would spill past it
+  const TICK_GAP = 56; // px: the least room between two labels when the plot is narrow
+
+  function tickLabel(t, step) {
+    const dt = new Date(t * 1000);
+    const midnight = dt.getHours() === 0 && dt.getMinutes() === 0;
+    return step >= 86400 || midnight ? DT_DAY.format(dt) : DT_TIME.format(dt);
+  }
+
+  /** Time labels for the x axis, already clear of the plot's edges. A label is about 96 px apart
+   *  when there is room; on a narrow plot, where that leaves one label (or none), a smaller step is
+   *  tried, thinned to every k-th tick (at least TICK_GAP apart) and phased to keep the most, so
+   *  the axis always has a scale (2+ labels) where any fit. */
+  function timeTicks(t0, t1, X, left, right) {
     const span = t1 - t0;
+    if (!(span > 0)) return [];
+    const width = right - left;
+    const tz = -new Date(t0 * 1000).getTimezoneOffset() * 60;
+    const inside = function (t) { const x = X(t); return x >= left + TICK_EDGE && x <= right - TICK_EDGE; };
+    const grid = function (step) {
+      const out = [];
+      for (let t = Math.ceil((t0 + tz) / step) * step - tz; t <= t1 && out.length < 400; t += step) out.push(t);
+      return out;
+    };
     const maxTicks = Math.max(2, Math.floor(width / 96));
-    const steps = [900, 1800, 3600, 7200, 10800, 14400, 21600, 43200, 86400, 172800];
-    let step = steps[steps.length - 1];
-    for (const s of steps) {
+    let step = TICK_STEPS[TICK_STEPS.length - 1];
+    for (const s of TICK_STEPS) {
       if (span / s <= maxTicks) {
         step = s;
         break;
       }
     }
-    const out = [];
-    const tz = -new Date(t0 * 1000).getTimezoneOffset() * 60;
-    for (let t = Math.ceil((t0 + tz) / step) * step - tz; t <= t1 && out.length < 40; t += step) {
-      const dt = new Date(t * 1000);
-      const midnight = dt.getHours() === 0 && dt.getMinutes() === 0;
-      out.push({ t: t, label: step >= 86400 || midnight ? DT_DAY.format(dt) : DT_TIME.format(dt) });
+    let best = grid(step).filter(inside).map(function (t) { return { t: t, label: tickLabel(t, step) }; });
+    if (best.length >= 2) return best.slice(0, 40);
+    for (let i = TICK_STEPS.indexOf(step) - 1; i >= 0; i--) {
+      const s = TICK_STEPS[i];
+      const pxPerStep = (s / span) * width;
+      const k = Math.max(1, Math.ceil(TICK_GAP / pxPerStep));
+      if (k > 48) break;
+      const all = grid(s);
+      for (let ph = 0; ph < k; ph++) {
+        const pick = all.filter(function (t, j) { return j % k === ph; }).filter(inside);
+        if (pick.length > best.length) best = pick.map(function (t) { return { t: t, label: tickLabel(t, s * k) }; });
+      }
+      if (best.length >= 2) break;
     }
-    return out;
+    return best.slice(0, 40);
   }
 
   function surgeAt(ts, surges) {
     for (const s of surges) if (ts >= s.start_ts && ts <= s.end_ts) return s;
     return null;
+  }
+
+  /** The chart's empty state: suggest a longer range only when one exists and has enough points
+   *  (as a button), else say how much history there is. */
+  function chartEmpty(d, R) {
+    const order = Object.keys(RANGES);
+    const now = num(d.now) != null ? d.now : nowS();
+    const longer = order.slice(order.indexOf(S.drawer.range) + 1).filter(function (r) {
+      const t0 = now - RANGES[r];
+      return R.all.filter(function (p) { return p.ts >= t0; }).length >= 2;
+    })[0];
+    const box = h('div', { class: 'chart-empty' });
+    if (longer) {
+      box.append(h('p', null, 'Not enough price history in the last ' + RANGE_LABELS[S.drawer.range] + ' to draw a line.'),
+        h('button', { type: 'button', class: 'btn', onclick: function () { setRange(longer); } }, 'Show the last ' + RANGE_LABELS[longer]));
+    } else if (!R.all.length) {
+      box.append(h('p', null, 'No price history for this outcome yet. The chart appears after the next snapshots.'));
+    } else if (R.all.length === 1) {
+      const p = R.all[0];
+      box.append(h('p', null, 'Only 1 price point so far (' + fmtPrice(p.price) + ' at ' + fmtClock(p.ts) + '). The chart needs at least 2; the next snapshot adds one.'));
+    } else {
+      box.append(h('p', null, 'Not enough price history in the last ' + RANGE_LABELS[S.drawer.range] + ' to draw a line. Table view lists the points there are.'));
+    }
+    return box;
   }
 
   function drawChart() {
@@ -2596,13 +3257,14 @@
 
     if (pts.length < 2) {
       sec.chart = null;
-      rebuild(host, [h('div', { class: 'chart-empty' }, 'Not enough price history in the last ' + RANGE_LABELS[S.drawer.range] + ' yet. Try a longer range.')]);
+      rebuild(host, [chartEmpty(d, R)]);
       rebuild(sec.legend, []);
       setText(sec.summary, '');
       return;
     }
 
-    const W = Math.max(280, Math.floor(host.clientWidth || 640));
+    // The SVG is drawn 1:1 with its box (no minimum width), so viewBox units are CSS pixels.
+    const W = Math.max(160, Math.floor(host.clientWidth || 640));
     const H = 290;
     const M = { l: 48, r: 58, t: 14, b: 30 };
     const plotW = W - M.l - M.r;
@@ -2611,7 +3273,9 @@
     for (const p of pts) { lo = Math.min(lo, p.price); hi = Math.max(hi, p.price); }
     const first = pts[0].price;
     const lastP = pts[pts.length - 1];
-    const minV = lo, maxV = hi;
+    let minV = lo, maxV = hi;
+    // the line starts at the point just before the range: keep it inside the y axis too
+    if (R.startPoint) { lo = Math.min(lo, R.startPoint.price); hi = Math.max(hi, R.startPoint.price); }
     const pad = Math.max(0.01, (hi - lo) * 0.12);
     lo -= pad; hi += pad;
     if (hi - lo < 0.1) { const m = (hi + lo) / 2; lo = m - 0.05; hi = m + 0.05; }
@@ -2663,10 +3327,8 @@
 
     // x axis labels
     const xl = svgEl('g');
-    for (const tk of timeTicks(R.t0, R.t1, plotW)) {
-      const x = X(tk.t);
-      if (x < M.l + 18 || x > M.l + plotW - 18) continue;
-      xl.appendChild(svgEl('text', { class: 'tick', x: x, y: H - 8, 'text-anchor': 'middle' }, tk.label));
+    for (const tk of timeTicks(R.t0, R.t1, X, M.l, M.l + plotW)) {
+      xl.appendChild(svgEl('text', { class: 'tick', x: X(tk.t), y: H - 8, 'text-anchor': 'middle' }, tk.label));
     }
     svg.appendChild(xl);
 
@@ -2760,6 +3422,9 @@
     const ch24 = S.drawer.range === '24h' ? num(row.change_24h) : null;
     const start = ch24 != null ? lastP.price - ch24 : R.startPoint ? R.startPoint.price : first;
     const change = ch24 != null ? ch24 : lastP.price - start;
+    // low and high describe the same span as the start: low <= start <= high, always
+    minV = Math.min(minV, start);
+    maxV = Math.max(maxV, start);
     setText(sec.summary, 'Last ' + RANGE_LABELS[S.drawer.range] + ': ' + fmtPrice(start) + ' ' + ARROW + ' ' + fmtPrice(lastP.price) +
       ' (' + fmtSigned(change) + '), low ' + fmtPrice(minV) + ', high ' + fmtPrice(maxV) + '. The line is the mark price.');
     setAttr(host, 'aria-label', 'Price chart, last ' + RANGE_LABELS[S.drawer.range] + ': ' + fmtPrice(start) + ' to ' + fmtPrice(lastP.price));
@@ -2778,23 +3443,47 @@
     chart.cross.setAttribute('visibility', 'visible');
     const s = surgeAt(p.ts, chart.surges);
     const tip = chart.tip;
+    // a compact time (no year, seconds or zone) unless a neighbouring point shares the minute
+    const minute = function (q) { return q ? Math.floor(q.ts / 60) : null; };
+    const seconds = minute(chart.pts[i - 1]) === minute(p) || minute(chart.pts[i + 1]) === minute(p);
     const lines = [
       h('div', { class: 'tooltip-value' }, h('span', { class: 'tooltip-key' + (s ? ' surge' : ''), 'aria-hidden': 'true' }), fmtPrice(p.price),
         h('span', { class: 'tooltip-sub' }, fmtPctOf(p.price))),
-      h('div', { class: 'tooltip-sub' }, fmtAbs(p.ts)),
+      h('div', { class: 'tooltip-sub', title: fmtAbs(p.ts) }, fmtCompact(p.ts, seconds)),
     ];
     if (s) lines.push(h('div', { class: 'tooltip-sub' }, 'During a ' + str(s.window) + ' surge (' + fmtSigned(s.change) + ')'));
     tip.replaceChildren.apply(tip, lines);
     tip.hidden = false;
-    const tw = tip.offsetWidth || 160;
-    const th = tip.offsetHeight || 60;
-    let left = x + 14;
-    if (left + tw > chart.W - 4) left = x - tw - 14;
-    left = Math.max(4, left);
-    let top = y - th - 12;
-    if (top < 0) top = Math.min(chart.H - th - 4, y + 14);
-    tip.style.left = left.toFixed(0) + 'px';
-    tip.style.top = top.toFixed(0) + 'px';
+    placeTooltip(chart, tip, x, y);
+  }
+
+  /** Put the readout beside the crosshair (right, else left) without covering the y-axis labels;
+   *  when neither side has room (a narrow phone chart), pin it to the top or bottom of the plot,
+   *  away from the point, so the point being read stays visible. Positions are CSS pixels. */
+  function placeTooltip(chart, tip, x, y) {
+    const host = tip.parentNode;
+    const scale = host && host.clientWidth && chart.W ? host.clientWidth / chart.W : 1;
+    const px = x * scale, py = y * scale;
+    const boxW = chart.W * scale, boxH = chart.H * scale;
+    const tw = tip.offsetWidth || 150;
+    const th = tip.offsetHeight || 56;
+    const minLeft = chart.M.l * scale + 2;
+    const maxRight = boxW - 4;
+    let left, top;
+    if (px + 14 + tw <= maxRight) left = px + 14;
+    else if (px - 14 - tw >= minLeft) left = px - 14 - tw;
+    if (left != null) {
+      top = py - th - 12;
+      if (top < 0) top = Math.min(boxH - th - 4, py + 14);
+    } else {
+      // no room on either side: centre it over the crosshair, above or below the point
+      left = clamp(px - tw / 2, 4, Math.max(4, boxW - tw - 4));
+      const plotTop = chart.M.t * scale, plotBottom = (chart.H - chart.M.b) * scale;
+      top = py - plotTop > th + 16 ? plotTop : Math.max(py + 16, Math.min(plotBottom - th, boxH - th - 4));
+      if (top < py && top + th > py - 10) top = Math.max(0, py - th - 14);
+    }
+    tip.style.left = Math.round(left) + 'px';
+    tip.style.top = Math.round(top) + 'px';
   }
 
   function hidePoint(chart) {
@@ -2879,14 +3568,21 @@
     if (S.drawer.sigs.book === key) return;
     if (S.drawer.sigs.book != null && selectionInside(sec)) return;
     S.drawer.sigs.book = key;
+    // "Fetched …" only labels a book that loaded; a failed read says when it was last tried.
+    const tried = num(d.book_fetched_at) != null;
+    const failed = !book && !d.book_pending && !!str(d.book_error) && tried;
     const head = h('div', { class: 'section-head' }, h('h3', { id: 'h-book' }, 'Order book (YES)'),
-      num(d.book_fetched_at) != null ? h('span', { class: 'view-sub' }, 'Fetched ', timeEl(d.book_fetched_at, 'ago')) : null);
+      tried && (book || failed) ? h('span', { class: 'view-sub' }, failed ? 'Last tried ' : 'Fetched ', timeEl(d.book_fetched_at, 'ago')) : null);
     if (!book && d.book_pending) {
       rebuild(sec, [head, h('p', { class: 'pending-note' }, h('span', { class: 'spinner', 'aria-hidden': 'true' }), 'Loading the order book…')]);
       return;
     }
     if (!book) {
-      rebuild(sec, [head, h('p', { class: 'muted-note' }, str(d.book_error) || 'No live order book is available for this outcome.')]);
+      const msg = failed
+        ? h('p', { class: 'muted-note book-error' }, icon('warn'), ' ', h('strong', null, 'Could not load the order book: '), shortProblem(d.book_error), ' Trying again shortly.')
+        : h('p', { class: 'muted-note' }, str(d.book_error) || 'No live order book is available for this outcome.');
+      if (failed) msg.title = sentence(d.book_error);
+      rebuild(sec, [head, msg]);
       return;
     }
     const bids = objs(book.bids).slice(0, 10);
@@ -2907,11 +3603,14 @@
     function qtyCell(lv, side) {
       const q = num(lv && lv.quantity);
       if (q == null) return h('td', { class: 'qty' });
-      const bar = h('span', { class: 'bar', 'aria-hidden': 'true' });
-      const frac = maxQ ? q / maxQ : 0;
-      bar.style.width = 'calc(' + frac.toFixed(4) + ' * (100% - 4.5em))';
+      // The bar fills a share of its own track (whatever room the cell has), so its length stays
+      // proportional to the quantity at every width; the track grows from the price column out.
+      const frac = maxQ ? clamp(q / maxQ, 0, 1) : 0;
+      const bar = h('span', { class: 'bar' + (frac > 0 ? ' has-qty' : ''), 'aria-hidden': 'true' });
+      bar.style.width = (frac * 100).toFixed(2) + '%';
+      const track = h('span', { class: 'bar-track', 'aria-hidden': 'true' }, bar);
       const n = h('span', { class: 'qty-num' }, fmtInt(q));
-      return h('td', { class: 'qty' }, h('div', { class: 'qty-cell ' + side }, side === 'bid' ? [n, bar] : [bar, n]));
+      return h('td', { class: 'qty' }, h('div', { class: 'qty-cell ' + side }, side === 'bid' ? [n, track] : [track, n]));
     }
     const rows = [];
     for (let i = 0; i < levels; i++) {
@@ -2991,23 +3690,40 @@
       const id = raw.slice('exchange/'.length).trim();
       if (id) return { exchange: id };
     }
+    if (raw.indexOf('strategy/') === 0) {
+      // one idea on the Strategy page (#strategy/<idea key>)
+      return { view: 'strategy', idea: raw.slice('strategy/'.length) || null };
+    }
     return { view: VIEWS.indexOf(raw) !== -1 ? raw : S.view };
   }
 
-  function showView(view) {
+  function showView(view, idea) {
     const changed = view !== S.view || !S.viewShown;
     const wasShown = S.viewShown;
+    // Was keyboard focus on something this switch hides (a link inside the old view), or nowhere?
+    const active = document.activeElement;
+    const oldSection = $('view-' + S.view);
+    const focusLost = !active || active === document.body || (changed && oldSection && oldSection.contains(active));
     S.view = view;
     S.viewShown = true;
     for (const sec of document.querySelectorAll('main > .view')) show(sec, sec.dataset.view === view);
     safe('nav', renderNav);
     const name = str(S.data.status && S.data.status.tournament && S.data.status.tournament.name) || 'Super Market dashboard';
     document.title = VIEW_TITLES[view] + ' · ' + name;
+    if (idea) S.pendingIdea = idea;
     if (changed) {
       if (wasShown) window.scrollTo(0, 0);
+      // land on the new view's heading, so screen readers say where the user is (a link that
+      // switched views would otherwise leave focus on <body>)
+      if (wasShown && focusLost) {
+        const head = $('h-' + view);
+        if (head) head.focus({ preventScroll: true });
+      }
       safe('view', function () { renderView(view); });
       refreshTimes(document);
       poll();
+    } else if (idea) {
+      safe('view', function () { renderView(view); });
     }
   }
 
@@ -3018,7 +3734,7 @@
       openDrawer(r.exchange, !!fromHashChange && S.viewShown);
     } else {
       closeDrawerUI();
-      showView(r.view);
+      showView(r.view, r.idea);
     }
   }
 
@@ -3045,6 +3761,22 @@
     return v === 'light' || v === 'dark' ? v : 'system';
   }
 
+  /** A focused control in a sideways-scrolling table must not sit under the pinned first column
+   *  (WCAG 2.4.11): scroll it out to the right of that column (or back into view on the right). */
+  function keepClearOfPinned(wrap, el) {
+    if (!el || el === wrap || wrap.scrollWidth <= wrap.clientWidth + 1) return;
+    const cell = el.closest('th, td');
+    if (!cell || cell.cellIndex === 0) return;
+    const row = cell.parentNode;
+    const pinned = row && row.cells && row.cells[0];
+    if (!pinned || getComputedStyle(pinned).position !== 'sticky') return;
+    const r = el.getBoundingClientRect();
+    const left = pinned.getBoundingClientRect().right + 8;
+    const right = wrap.getBoundingClientRect().right - 8;
+    if (r.left < left) wrap.scrollLeft -= left - r.left;
+    else if (r.right > right) wrap.scrollLeft += Math.min(r.right - right, r.left - left);
+  }
+
   function init() {
     for (const b of document.querySelectorAll('[data-theme-choice]')) {
       b.addEventListener('click', function () { setTheme(b.dataset.themeChoice); });
@@ -3062,6 +3794,7 @@
     search.addEventListener('input', function () {
       S.query = search.value;
       safe('markets', renderMarkets);
+      announceMarketsSoon();
     });
     for (const b of document.querySelectorAll('.chip[data-filter]')) b.addEventListener('click', function () { setFilter(b.dataset.filter); });
     for (const th of document.querySelectorAll('#markets-table th[data-sort]')) {
@@ -3083,12 +3816,24 @@
     $('markets-body').addEventListener('click', rowClick);
     $('high-body').addEventListener('click', rowClick);
 
-    // scroll cues on the wide tables
+    // scroll cues on the wide tables, and focus that never hides under the pinned first column
     [['markets-frame', 'markets-wrap'], ['high-frame', 'high-wrap']].forEach(function (pair) {
       const frame = $(pair[0]);
       const wrap = $(pair[1]);
       wrap.addEventListener('scroll', function () { updateScrollCue(frame, wrap); }, { passive: true });
       if (typeof ResizeObserver === 'function') new ResizeObserver(function () { updateScrollCue(frame, wrap); }).observe(wrap);
+      wrap.addEventListener('focusin', function (ev) {
+        keepClearOfPinned(wrap, ev.target);
+        requestAnimationFrame(function () { if (document.activeElement === ev.target) keepClearOfPinned(wrap, ev.target); });
+      });
+    });
+
+    // problems banner: details fold, and a dismiss that lasts until the failing sources change
+    $('problems-details').addEventListener('toggle', function () { S.problemsOpen = $('problems-details').open; });
+    $('problems-dismiss').addEventListener('click', function () {
+      S.problemsDismissed = S.problemsKey || null;
+      showBanner('problems-banner', false);
+      $('main').focus({ preventScroll: true });
     });
 
     // surge re-analysis (delegated: cards are rebuilt on every poll)

@@ -58,7 +58,7 @@ CTX = Context(TOURNAMENT_ID, SLUG, "SIG Predictions Cup", "SIG Coins", "active")
 VIEW_KEYS = {"exchanges", "surges", "high_band", "context", "status"}
 ROW_KEYS = {
     "exchange_id", "market_id", "title", "option", "settlement_date", "mark", "last", "bid", "ask", "spread",
-    "change_5m", "change_1h", "change_24h", "sparkline", "high_band", "surge_id", "updated_at",
+    "change_5m", "change_1h", "change_24h", "sparkline", "high_band", "surge_id", "updated_at", "stale",
 }
 
 TOURNAMENT_INFO = {**tournament(), "initialBalance": 100000, "myBalance": 101250.5, "endDate": "2026-11-04T17:00:00.000Z"}
@@ -71,6 +71,9 @@ LEADERBOARD = {
     "total": 120, "period": "all", "limit": 3, "offset": 0, "sort": "pnl", "myRank": 17,
     "season": None, "boundGroups": [], "activeGroupId": None,
 }
+PNL = {"period": "all", "periodStart": None, "periodEnd": "2026-10-03T12:00:00.000Z", "periodPnl": None,
+       "unrealizedPnl": 30.0, "totalAccountValue": 103_750.5, "totalHoldingsValue": 2_500.0, "totalCostBasis": 2_470.0,
+       "roi": 3.75, "sharpe": None}
 CONSTRAINTS = {
     "data": [
         {
@@ -222,6 +225,16 @@ class World:
              book_exchange("e3c", [(0.24, 100)], [(0.26, 100)], option="Carol")],
             overround=1.04, arb=True,
         ))
+        fake.add("GET", f"/tournaments/{SLUG}/portfolio/pnl", PNL)
+        for eid in ("e1", "e2", "e3a", "e3b", "e3c"):
+            fake.add("GET", f"/exchanges/{eid}/orderbook", self._book)
+
+    def _book(self, request: httpx.Request) -> httpx.Response:
+        eid = request.url.path.split("/")[-2]
+        last, bid, ask = self.quotes.get(eid) or [None, None, None]
+        book = book_exchange(eid, [(bid, 150), (round(bid - 0.01, 6), 300)] if bid is not None else [],
+                             [(ask, 120), (round(ask + 0.01, 6), 250)] if ask is not None else [])
+        return httpx.Response(200, json={**book, "marketId": self.market_of(eid)})
 
     def market_of(self, eid: str) -> str:
         for m in self.markets:
@@ -454,7 +467,8 @@ def test_redetections_merge_into_one_surge(make_tracker: Any, world: World, data
     again = step(tracker, data_clock)  # still 0.60: re-detected through the window
     assert again["surges"] == [sid] and again["new_surges"] == [] and again["queued"] == []
     merged = tracker.store.get_surge(sid)
-    assert merged.start_ts == T0 + 60 and merged.end_ts == T0 + 420 and merged.detected_at == T0 + 360
+    # the same move seen again: the frame stays at the spike (r2-fixcheck-3)
+    assert merged.start_ts == T0 + 60 and merged.end_ts == T0 + 360 and merged.detected_at == T0 + 360
     assert len(tracker.store.surges()) == 1
     assert tracker.status()["queues"]["analysis"] == 1  # no duplicate queue entry
 
@@ -705,12 +719,14 @@ def test_context_refresh(make_tracker: Any, fake: Any) -> None:
     ]
     assert ctx["constraints"]["violationsCount"] == 1 and ctx["constraints"]["data"][0]["relationshipId"] == "r1"
     assert ctx["overround"] == [
-        {"market_id": "m3", "title": "Who will win the Arizona Governor race?", "overround": 1.04, "arbitrage": True, "outcomes": 3}
+        {"market_id": "m3", "title": "Who will win the Arizona Governor race?", "overround": 1.04, "arbitrage": True,
+         "outcomes": 3, "at": T0}
     ]
+    assert (ctx["account_value"], ctx["positions_value"]) == (103_750.5, 2_500.0)  # cash 101,250.5 + positions
     assert ctx["updated_at"] == T0
     assert fake.calls_to("/relationships/constraints")[0].params == {"violationsOnly": "true", "tournamentId": TOURNAMENT_ID}
     assert fake.calls_to(f"/tournaments/{SLUG}/leaderboard")[0].params["limit"] == "3"
-    assert fake.calls_to("/markets/m3/orderbook")[0].params == {"tournamentId": TOURNAMENT_ID, "depth": "1"}
+    assert fake.calls_to("/markets/m3/orderbook")[0].params == {"tournamentId": TOURNAMENT_ID, "depth": "20"}
     assert len(fake.calls_to("/markets/m1/orderbook")) == 0  # binary markets are not read
 
 
@@ -748,10 +764,12 @@ def test_overround_rotates_through_multi_outcome_markets(make_tracker: Any, worl
     tracker = make_tracker(max_overround_markets=2)
     tracker.run_once()
     assert [r["market_id"] for r in tracker.view()["context"]["overround"]] == ["m3", "m4"]
+    # m3 is flagged for arbitrage: it is re-read at every refresh, the others take turns
+    step(tracker, data_clock, 300)
+    assert [r["market_id"] for r in tracker.view()["context"]["overround"]] == ["m3", "m4", "m5"]
     step(tracker, data_clock, 300)
     assert [r["market_id"] for r in tracker.view()["context"]["overround"]] == ["m3", "m4", "m5", "m6"]
-    step(tracker, data_clock, 300)
-    assert len(fake.calls_to("/markets/m3/orderbook")) == 2
+    assert len(fake.calls_to("/markets/m3/orderbook")) == 3
     assert tracker.view()["context"]["overround"][3]["overround"] == 1.06
 
 
@@ -963,7 +981,7 @@ class TestRealAnalytics:
             "pagination": {"limit": 200, "hasMore": False, "nextCursor": None},
             "coverage": {"complete": True, "projectedThroughSequence": 1},
         })
-        fake.add("GET", "/exchanges/e1/orderbook", book_exchange("e1", [(0.59, 50)], [(0.61, 60)]))
+        replace_route(fake, "/exchanges/e1/orderbook", book_exchange("e1", [(0.59, 50)], [(0.61, 60)]))
 
         tracker.run_once()
         for _ in range(9):
@@ -1038,7 +1056,7 @@ def test_live_api_1_other_optional_403s_are_problems_not_stops(make_tracker: Any
     tracker.run_once()
     assert tracker.status()["fatal_error"] is None
     assert {"constraints", "balance", "order books"} <= set(problems(tracker))
-    assert "1 of 1 market order book read(s) failed" in problems(tracker)["order books"]["message"]
+    assert "order book read(s) failed: HTTP 403 FORBIDDEN" in problems(tracker)["order books"]["message"]
 
 
 def test_live_api_1_threaded_tracker_keeps_running_after_a_leaderboard_403(make_tracker: Any, fake: Any) -> None:
@@ -1313,3 +1331,291 @@ class TestRound1RealAnalytics:
         step(tracker, data_clock, 60)
         e1 = row(tracker.view(), "e1")
         assert e1["change_1h"] == pytest.approx(0.15) and e1["change_5m"] == pytest.approx(0.15)
+
+
+# --------------------------------------------------------------------------- round 2 regressions
+
+
+def mk(eid: str, window: str, start_ts: float, end_ts: float, start: float, end: float, direction: str,
+       peak: Optional[float] = None, z: Optional[float] = None) -> Surge:
+    """A detection as analytics.detect_surges returns it (current price = its end)."""
+    seconds = {"5m": 300.0, "1h": 3600.0, "6h": 21600.0, "24h": 86400.0}[window]
+    return Surge(eid, "m1", window, seconds, start_ts, end_ts, start, end, round(end - start, 6), direction,
+                 end if peak is None else peak, end_ts, zscore=z, current_price=end)
+
+
+def test_r2_fixcheck_3_a_plateau_seen_through_the_24h_window_stays_one_surge(make_tracker: Any) -> None:
+    """With the frame anchored at the spike, a 24h re-detection hours later is merged into the
+    spike's surge (not stored as a second surge), and the frame does not move."""
+    tracker = make_tracker()
+    spike = mk("e1", "1h", T0, T0 + 3600, 0.40, 0.60, "up", z=6.0)
+    stored, created = tracker._record_surge(spike)  # type: ignore[misc]
+    assert created
+    later = T0 + 3600 + 8 * 3600
+    plateau = mk("e1", "24h", later - 86400, later, 0.40, 0.60, "up", z=3.2)
+    again, created = tracker._record_surge(plateau)  # type: ignore[misc]
+    assert not created and again.id == stored.id
+    assert (again.window, again.start_ts, again.end_ts, again.change, again.zscore) == ("1h", T0, T0 + 3600, 0.2, 6.0)
+    assert len(tracker.store.surges()) == 1
+
+
+def test_r2_fixcheck_5_the_reversion_of_a_spike_is_not_a_new_surge(make_tracker: Any) -> None:
+    tracker = make_tracker()
+    spike = mk("e1", "1h", T0, T0 + 1800, 0.385, 0.595, "up", z=7.9)
+    tracker._record_surge(spike)
+    # the fall back (0.595 -> 0.47) stays inside the spike's 0.385 -> 0.595 range: its reversion
+    back = mk("e1", "1h", T0 + 1800, T0 + 5400, 0.595, 0.47, "down", z=-3.1)
+    assert tracker._record_surge(back) is None
+    assert [s.direction for s in tracker.store.surges()] == ["up"]
+    # a drop below where the spike started is a move of its own
+    deeper = mk("e1", "1h", T0 + 1800, T0 + 5400, 0.595, 0.30, "down", z=-6.0)
+    stored, created = tracker._record_surge(deeper)  # type: ignore[misc]
+    assert created and stored.direction == "down"
+    # so is an opposite move long after the spike (window + 6 h)
+    tracker2 = make_tracker()
+    tracker2._record_surge(spike)
+    much_later = T0 + 1800 + 3600 + 6 * 3600 + 3600 + 600  # starts 10 min past the spike's end + window + 6 h
+    late = mk("e1", "1h", much_later - 3600, much_later, 0.595, 0.47, "down", z=-3.5)
+    assert tracker2._record_surge(late) is not None
+
+
+def test_r2_fixcheck_14_reverted_surges_follow_the_live_price(make_tracker: Any, world: World, data_clock: FakeClock) -> None:
+    from supermarket_bot.models import SURGE_CLOSED
+
+    tracker = make_tracker()
+    [sid] = jump_scenario(tracker, world, data_clock)["new_surges"]  # 0.40 -> 0.60
+    world.set("e1", 0.48)
+    step(tracker, data_clock)
+    surge = tracker.store.get_surge(sid)
+    assert surge.status == SURGE_REVERTED and surge.current_price == 0.48
+    world.set("e1", 0.45)
+    step(tracker, data_clock)
+    surge = tracker.store.get_surge(sid)
+    assert surge.status == SURGE_REVERTED  # final
+    assert surge.current_price == 0.45 and surge.reverted_fraction == pytest.approx(0.75)  # "Now" is now
+    card = next(r for r in tracker.view()["surges"] if r["id"] == sid)
+    assert card["current_price"] == 0.45 and card["reverted_fraction"] == pytest.approx(0.75)
+    world.set("e1", 0.58)
+    step(tracker, data_clock)
+    surge = tracker.store.get_surge(sid)
+    assert surge.status == SURGE_REVERTED and surge.reverted_fraction == pytest.approx(0.1)
+    # the market settles: the reverted surge reads "Market closed" with its last price
+    world.markets = [m for m in world.markets if m["id"] != "m1"]
+    step(tracker, data_clock, 300)
+    surge = tracker.store.get_surge(sid)
+    assert surge.status == SURGE_CLOSED and surge.current_price == 0.58
+
+
+def test_r2_live_api_1_a_missing_quote_records_no_tick_and_closes_the_surge(make_tracker: Any, world: World,
+                                                                         fake: Any, data_clock: FakeClock) -> None:
+    from supermarket_bot.models import SURGE_CLOSED
+
+    tracker = make_tracker()
+    [sid] = jump_scenario(tracker, world, data_clock)["new_surges"]  # 0.40 -> 0.60; the market list says 0.40
+    lists = len(fake.calls_to(f"/tournaments/{SLUG}/markets"))
+    world.quotes.pop("e1")  # m1 settles: the bulk read lists e1 in missingIds
+    summary = step(tracker, data_clock, 5)
+    assert summary["ticks"] == 4  # nothing stored for e1 (no stale 0.40 from the market list)
+    assert [p.price for p in tracker.store.series("e1", T0)][-1] == 0.60
+    surge = tracker.store.get_surge(sid)
+    assert surge.status == SURGE_CLOSED and surge.current_price == 0.60 and surge.reverted_fraction == 0.0
+    e1 = row(tracker.view(), "e1")
+    assert (e1["last"], e1["mark"], e1["surge_id"], e1["high_band"]) == (0.60, 0.60, None, None)
+    assert tracker._bot is not None and summary["markets_refreshed"] is False
+    # the next cycle re-reads the market list early (the outcome may have settled)
+    world.markets = [m for m in world.markets if m["id"] != "m1"]
+    summary = step(tracker, data_clock, 40)
+    assert summary["markets_refreshed"] and len(fake.calls_to(f"/tournaments/{SLUG}/markets")) == lists + 1
+    assert all(r["exchange_id"] != "e1" for r in tracker.view()["exchanges"])
+    assert tracker.store.get_surge(sid).status == SURGE_CLOSED
+    # a persistently missing outcome does not re-read the list every cycle
+    world.quotes.pop("e2")
+    step(tracker, data_clock, 40)
+    step(tracker, data_clock, 40)
+    step(tracker, data_clock, 40)
+    assert len(fake.calls_to(f"/tournaments/{SLUG}/markets")) == lists + 2
+
+
+def test_r2_live_api_9_news_is_rechecked_until_it_works_again(make_tracker: Any, world: World, data_clock: FakeClock) -> None:
+    class OutageAttributor(FakeAttributor):
+        status = "unavailable"
+
+        def analyze(self, surge: Surge) -> Attribution:
+            out = super().analyze(surge)
+            out.news_status = self.status
+            if self.status == "unavailable":
+                out.reasons.append("News search failed (gdelt: HTTP 503): missing headlines are not evidence")
+            return out
+
+    attributor = OutageAttributor()
+    tracker = make_tracker(attributor=attributor)
+    tracker.run_once()
+    for _ in range(5):
+        step(tracker, data_clock)
+    world.set("e1", 0.60)
+    world.set("e3a", 0.70)
+    first = sorted(step(tracker, data_clock)["new_surges"])
+    assert len(first) == 2 and tracker.analyze_pending(5) == 2
+    p = problems(tracker)["news"]
+    assert p["count"] == 2
+    step(tracker, data_clock, 60)
+    assert tracker.status()["analysis"]["queued_ids"] == []  # not due yet
+    step(tracker, data_clock, 300)  # 5 min later: one surge is re-analysed to re-check news search
+    [probe] = tracker.status()["analysis"]["queued_ids"]
+    assert tracker.analyze_pending(5) == 1
+    p = problems(tracker)["news"]
+    assert p["count"] == 3 and p["last"] == data_clock.now  # the retry failed: its time is shown
+    step(tracker, data_clock, 300)
+    assert tracker.status()["analysis"]["queued_ids"] == []  # the next re-check waits 10 min
+    attributor.status = "ok"
+    step(tracker, data_clock, 300)
+    assert tracker.status()["analysis"]["queued_ids"] == [probe]
+    assert tracker.analyze_pending(1) == 1
+    assert "news" not in problems(tracker)
+    # the other surge analysed without headlines is re-analysed too
+    assert tracker.status()["analysis"]["queued_ids"] == [i for i in first if i != probe]
+    assert tracker.analyze_pending(5) == 1
+    assert all(s.attribution.news_status == "ok" for s in tracker.store.surges())
+
+
+def test_r2_live_api_9_stale_news_problem_without_candidates_clears(make_tracker: Any, data_clock: FakeClock) -> None:
+    tracker = make_tracker(attributor=FakeAttributor())
+    tracker.run_once()
+    tracker._problem("news", "News search failed (gdelt: HTTP 503)")
+    tracker._news_recheck_at = data_clock.now + 300
+    step(tracker, data_clock, 301)
+    assert "news" not in problems(tracker)
+
+
+def test_r2_live_api_10_no_live_history_problem_after_the_backfill_gave_up(make_client: Any, make_tracker: Any,
+                                                                        world: World, fake: Any,
+                                                                        data_clock: FakeClock) -> None:
+    world.add_history(data_clock, ["e1", "e3a", "e3b", "e3c"])
+    fake.add("GET", "/exchanges/e2/price-history", (503, error_body("SERVICE_UNAVAILABLE", "busy")))
+    tracker = make_tracker(client=make_client(max_retries=0), backfill=True, backfill_reads_per_min=1000)
+    tracker.run_once()
+    assert tracker.backfill_step(2) == 2  # e1 1h loads, e2 1h fails (queued again)
+    p = problems(tracker)["price history"]
+    assert p["count"] == 1 and "503" in p["message"]
+    assert tracker.backfill_step(3) == 3  # e3a, e3b, e3c load: the e2 problem stays
+    assert problems(tracker)["price history"]["count"] == 1
+    assert tracker.backfill_step(1) == 1  # e2 fails again
+    assert problems(tracker)["price history"]["count"] == 2  # every failed read is counted
+    tracker.backfill_step(100)  # e2 1h gives up; the 5m pass does the same
+    assert tracker.backfill_step(100) == 0
+    status = tracker.status()
+    assert status["backfill"]["pending"] == 0 and status["backfill"]["failed"] == 2
+    assert "price history" not in problems(tracker)  # nothing is retrying any more
+    step(tracker, data_clock)
+    reason = tracker.status()["detection"]["reason"]
+    assert "price history could not be loaded (HTTP 503" in reason and "1 of 5" in reason
+
+
+def test_r2_robustness_1_storage_failures_are_a_problem(make_tracker: Any, world: World, data_clock: FakeClock,
+                                                       monkeypatch: Any) -> None:
+    import sqlite3
+
+    tracker = make_tracker()
+    tracker.run_once()
+    original = tracker.store.add_ticks
+
+    def full(ts: float, rows: Any) -> int:
+        raise sqlite3.OperationalError("database or disk is full")
+
+    monkeypatch.setattr(tracker.store, "add_ticks", full)
+    world.set("e1", 0.45)
+    summary = step(tracker, data_clock)
+    p = problems(tracker)["storage"]
+    assert p["severity"] == "error" and "database or disk is full" in p["message"]
+    assert p["message"].startswith("Saving price snapshot failed: database or disk is full")
+    # the cycle went on: live prices and the view are current, the snapshot time too
+    assert summary["ticks"] == 0 and row(tracker.view(), "e1")["last"] == 0.45
+    assert tracker.status()["last_snapshot_at"] == data_clock.now and tracker.status()["cycles"] == 2
+    monkeypatch.setattr(tracker.store, "add_ticks", original)
+    step(tracker, data_clock)
+    assert "storage" not in problems(tracker)
+
+
+def test_r2_robustness_1_a_crashing_cycle_is_a_problem(make_tracker: Any, monkeypatch: Any) -> None:
+    tracker = make_tracker(interval=0.02)
+
+    def broken(now: float, results: Any) -> None:
+        raise RuntimeError("view exploded")
+
+    monkeypatch.setattr(tracker, "_build_view", broken)
+    tracker.start()
+    assert wait_for(lambda: "tracker" in problems(tracker))
+    tracker.stop(timeout=2)
+    p = problems(tracker)["tracker"]
+    assert p["severity"] == "error" and "view exploded" in p["message"] and "retried automatically" in p["message"]
+
+
+def test_r2_robustness_8_problem_messages_never_carry_part_of_the_key(make_tracker: Any) -> None:
+    from conftest import API_KEY
+
+    tracker = make_tracker()
+    for pad in (0, 260, 275, 280, 290):
+        exc = ApiError(503, "SERVICE_UNAVAILABLE", "x" * pad + f" Request with credentials {API_KEY} could not be served")
+        tracker._problem("leaderboard", exc)
+        message = problems(tracker)["leaderboard"]["message"]
+        assert len(message) <= tracker_mod.PROBLEM_MESSAGE_MAX
+        assert not any(API_KEY[i:i + 8] in message for i in range(len(API_KEY) - 7)), (pad, message)
+    tracker._problem("order books", f"1 of 2 read(s) failed: Bearer {API_KEY}")
+    assert API_KEY[:8] not in problems(tracker)["order books"]["message"]
+
+
+def test_r2_functional_1_idea_books_are_read_and_stored(make_tracker: Any, world: World, fake: Any,
+                                                       data_clock: FakeClock) -> None:
+    tracker = make_tracker()
+    tracker.run_once()
+    # the multi-outcome market's book (20 levels) keeps every outcome's book
+    assert fake.calls_to("/markets/m3/orderbook")[0].params["depth"] == "20"
+    assert tracker.store.latest("e3a").book["asks"] == [[0.51, 100.0]]
+    step(tracker, data_clock, 300)  # the next refresh reads the carry candidate's own book (e2, a stable band)
+    call = fake.calls_to("/exchanges/e2/orderbook")[0]
+    assert call.params == {"depth": "20", "tournamentId": TOURNAMENT_ID}
+    book = tracker.store.latest("e2").book
+    assert book["at"] == data_clock.now and book["asks"] == [[0.98, 120.0], [0.99, 250.0]]
+    assert book["bids"] == [[0.96, 150.0], [0.95, 300.0]]
+    step(tracker, data_clock, 300)  # read again at each refresh while it is a candidate
+    assert len(fake.calls_to("/exchanges/e2/orderbook")) == 2
+
+
+def test_r2_functional_3_account_value_is_cash_plus_positions(make_tracker: Any, fake: Any) -> None:
+    tracker = make_tracker()
+    tracker.run_once()
+    ctx = tracker.view()["context"]
+    assert ctx["balance"] == 101250.5  # cash
+    assert ctx["account_value"] == 103_750.5 and ctx["positions_value"] == 2_500.0
+    # the P&L read answers 409 (a holding without a valuation price): unknown, not a banner problem
+    other = make_tracker()
+    replace_route(fake, f"/tournaments/{SLUG}/portfolio/pnl", (409, error_body("CONFLICT", "no valuation price")))
+    other.run_once()
+    assert other.view()["context"]["account_value"] is None
+    assert not any(p["source"] in ("balance", "account value") for p in other.status()["problems"])
+
+
+class TestRound2RealAnalytics:
+    real_analytics = True
+
+    def test_r2_live_api_4_old_prices_after_a_restart_are_not_a_high_band(self, make_client: Any, make_tracker: Any,
+                                                                          world: World, fake: Any,
+                                                                          data_clock: FakeClock) -> None:
+        store = TrackerStore()
+        for k in range(60):  # an earlier run: e2 at 0.975 for an hour, ending 8 h ago
+            store.add_ticks(T0 - 9 * 3600 + 60 * k, [{"exchange_id": "e2", "latest_price": 0.975, "best_bid": 0.965,
+                                                      "best_ask": 0.985}])
+        replace_route(fake, "/exchanges/prices", (503, error_body("SERVICE_UNAVAILABLE", "down")))
+        tracker = make_tracker(store=store, client=make_client(max_retries=0))
+        tracker.run_once()
+        view = tracker.view()
+        e2 = row(view, "e2")
+        assert e2["last"] == 0.975 and e2["stale"] is True and e2["updated_at"] == T0 - 9 * 3600 + 59 * 60
+        assert view["high_band"] == [] and e2["high_band"] is None
+        # prices work again: a few live ticks are not "100% of the last 6 h"
+        replace_route(fake, "/exchanges/prices", world._prices)
+        world.set("e2", 0.975)
+        for _ in range(5):
+            step(tracker, data_clock, 5)
+        view = tracker.view()
+        assert view["high_band"] == [] and row(view, "e2")["stale"] is False

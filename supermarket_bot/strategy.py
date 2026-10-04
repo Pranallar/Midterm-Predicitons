@@ -55,6 +55,9 @@ THIN_BOOK_SHARES = 500.0
 TOP_N = 50
 CONSTRAINT_CONFIDENCE = 0.7  # engine-reported relationship violation
 BOOK_ARB_CONFIDENCE = 0.6  # "potential, not guaranteed" multi-outcome book flag
+BOOK_MAX_AGE_S = 900.0  # an order-book read older than this does not size an idea
+BOOK_TICK = 0.005  # the price grid: a book whose best level sits more than a tick off the live quote is outdated
+REVERSION_LINK_S = 6 * 3600.0  # an opposite move this soon after a surge's window may be its reversion
 
 MODE_PROTECT = "protect"
 MODE_BALANCED = "balanced"
@@ -186,10 +189,17 @@ def _bracket_shares(p: float, gain: float, loss: float, entry: float, balance: O
 
 
 def risk_mode(balance: Optional[float], initial: Optional[float], leader_value: Optional[float],
-              my_rank: Optional[int], days_left: Optional[float]) -> str:
+              my_rank: Optional[int], days_left: Optional[float], account_value: Optional[float] = None) -> str:
     """``protect`` (top 3, a week or less left), ``aggressive`` (10%+ behind the leader, or
-    10 days or less left outside the top 10), else ``balanced``."""
-    bal, leader, days = _num(balance), _num(leader_value), _num(days_left)
+    10 days or less left outside the top 10), else ``balanced``.
+
+    "Behind" compares like with like: the leader's value (initial balance + P&L, positions
+    included) with your ``account_value`` (cash + positions). Only when that is unknown does
+    it fall back to ``balance`` (cash), which understates a player holding positions.
+    """
+    value = _num(account_value)
+    bal = value if value is not None else _num(balance)
+    leader, days = _num(leader_value), _num(days_left)
     rank = my_rank if isinstance(my_rank, int) and not isinstance(my_rank, bool) else None
     if rank is not None and rank <= 3 and days is not None and days <= 7:
         return MODE_PROTECT
@@ -208,6 +218,107 @@ def _settles_before(info_date: Optional[str], cup_end: Optional[float]) -> Tuple
 
 
 # --------------------------------------------------------------------------- opportunities
+
+
+# --------------------------------------------------------------------------- order-book depth
+
+Levels = List[Tuple[float, float]]  # (cost of the contract, shares), cheapest first
+
+
+def _book_levels(contract: str, point: Optional[PricePoint], now: float,
+                 live_cost: Optional[float] = None) -> Tuple[Optional[Levels], Optional[float]]:
+    """The levels a buy of ``contract`` fills against, from the point's stored order book.
+
+    YES buys take the YES asks (cost = price); NO buys take the YES bids (cost = 1 - price).
+    Returns ``(levels, book time)``, levels None when no usable book is known: none stored,
+    older than ``BOOK_MAX_AGE_S``, or out of line with the live quote (levels cheaper than the
+    live cost were taken since the read and are dropped; if what is left starts more than a
+    tick above the live cost, the read is outdated).
+    """
+    book = getattr(point, "book", None) if point is not None else None
+    if not isinstance(book, Mapping):
+        return None, None
+    at = _num(book.get("at"))
+    if at is None or now - at > BOOK_MAX_AGE_S:
+        return None, at
+    yes = contract == "yes"
+    levels: Levels = []
+    for raw in (book.get("asks") if yes else book.get("bids")) or []:
+        if not isinstance(raw, (list, tuple)) or len(raw) < 2:
+            continue
+        price, qty = _num(raw[0]), _num(raw[1])
+        if price is None or qty is None or qty <= 0 or not 0.0 < price < 1.0:
+            continue
+        levels.append((round(price if yes else 1.0 - price, 6), qty))
+    levels.sort(key=lambda lv: lv[0])
+    live = _num(live_cost)
+    if live is not None:
+        levels = [lv for lv in levels if lv[0] >= live - _EPS]
+        if levels and levels[0][0] > live + BOOK_TICK + _EPS:
+            return None, at
+    return (levels or None), at
+
+
+def _depth_limit(value: float, entry: float) -> float:
+    """The highest cost a further share (or set) may fill at: it must keep at least half of the
+    edge quoted at the entry (``value - entry``), so the average fill stays near the quote."""
+    return entry + 0.5 * max(0.0, value - entry)
+
+
+def _walk(levels: Levels, limit: float) -> Tuple[float, Levels]:
+    """Shares on offer at a cost up to ``limit`` (see :func:`_depth_limit`), and those levels."""
+    taken: Levels = []
+    total = 0.0
+    for cost, qty in levels:
+        if cost > limit + _EPS:
+            break
+        taken.append((cost, qty))
+        total += qty
+    return total, taken
+
+
+def _avg_cost(levels: Levels, qty: float) -> Optional[float]:
+    """Average cost of filling ``qty`` shares from ``levels`` (None for nothing to fill)."""
+    if qty <= _EPS:
+        return None
+    left, spent = qty, 0.0
+    for cost, size in levels:
+        take = min(size, left)
+        spent += take * cost
+        left -= take
+        if left <= _EPS:
+            break
+    filled = qty - max(0.0, left)
+    return spent / filled if filled > _EPS else None
+
+
+def _walk_set(legs: Sequence[Levels], limit: float) -> float:
+    """Full sets (one share of every leg) on offer while the next set costs at most ``limit``
+    (see :func:`_depth_limit`): each step takes the cheapest remaining level of every leg."""
+    if not legs or any(not levels for levels in legs):
+        return 0.0
+    idx = [0] * len(legs)
+    left = [levels[0][1] for levels in legs]
+    sets = 0.0
+    while all(i < len(levels) for i, levels in zip(idx, legs)):
+        marginal = sum(levels[i][0] for i, levels in zip(idx, legs))
+        if marginal > limit + _EPS:
+            break
+        step = min(left)
+        sets += step
+        for k, levels in enumerate(legs):
+            left[k] -= step
+            if left[k] <= _EPS:
+                idx[k] += 1
+                left[k] = levels[idx[k]][1] if idx[k] < len(levels) else 0.0
+    return sets
+
+
+def _ago(now: float, at: Optional[float]) -> str:
+    if at is None:
+        return "at an unknown time"
+    secs = max(0.0, now - at)
+    return f"{secs / 60:.0f} min ago" if secs >= 90 else f"{secs:.0f} s ago"
 
 
 def _surge_levels(surge: Surge) -> Optional[Tuple[bool, float, float, float]]:
@@ -277,10 +388,26 @@ def fade_opportunity(surge: Surge, current: Optional[PricePoint], info: Optional
     if edge <= _EPS:
         return None
     er = edge / entry
-    depth = _num(att.book_depth)
-    shares = _bracket_shares(p, gain, loss, entry, balance, kelly_mult, max_position_pct, depth)
-    depth_capped = depth is not None and shares < _bracket_shares(p, gain, loss, entry, balance, kelly_mult,
-                                                                  max_position_pct, None)
+    kelly_shares = _bracket_shares(p, gain, loss, entry, balance, kelly_mult, max_position_pct, None)
+    # What one share is worth by these odds (target or stop): a fill above it has no edge left.
+    value = p * target + (1.0 - p) * stop
+    levels, book_at = _book_levels(side, current, now, None if no_book else entry)
+    side_depth = _num(att.bid_depth if up else att.ask_depth)  # within 5c of the mid, when analysed
+    depth = side_depth if side_depth is not None else _num(att.book_depth)
+    fill: Optional[float] = None
+    offered = 0.0
+    limit = _depth_limit(value, entry)
+    if levels is not None:
+        offered, taken = _walk(levels, limit)
+        shares = min(kelly_shares, int(math.floor(offered + 1e-9)))
+        fill = _avg_cost(taken, shares)
+        depth_capped = shares < kelly_shares
+    else:
+        # No recent book: the depth near the mid when the surge was analysed is only a loose cap.
+        shares = kelly_shares if depth is None else min(kelly_shares, int(math.floor(max(0.0, depth) + 1e-9)))
+        depth_capped = shares < kelly_shares
+    if shares <= 0:
+        return None  # the book has no shares at a price that keeps an edge
     cost = round(shares * entry, 2)
     confidence = _clamp01(att.confidence)
     title, option = _title(info, surge.market_id)
@@ -310,6 +437,12 @@ def fade_opportunity(surge: Surge, current: Optional[PricePoint], info: Optional
         f"= {cost:,.0f} SUSQies ({_kelly_label(kelly_mult)} on the target/stop bracket, capped at "
         f"{max_position_pct:.0%} of balance{' and by book depth' if depth_capped else ''})"
     )
+    if levels is not None and fill is not None:
+        rationale.append(
+            f"Book ({_ago(now, book_at)}): {offered:,.0f} {side.upper()} shares on offer up to {_px(round(limit, 4))}, "
+            f"where each keeps at least half the edge; {shares:,} fill at an average of {_px(round(fill, 4))} "
+            f"({_signed(value - fill)}/share there)"
+        )
     if att.reasons:
         rationale.append(f"Evidence: {att.reasons[0]}")
 
@@ -320,8 +453,12 @@ def fade_opportunity(surge: Surge, current: Optional[PricePoint], info: Optional
     ]
     if no_book:
         risks.append(f"No live book: the entry uses the mark {_px(mark)}; real fills will be worse by at least the spread")
+    if levels is None:
+        risks.append(f"Size not checked against a recent order book on the {side.upper()} side: check the depth "
+                     "before buying, a large order moves the price")
     if depth is not None and depth < THIN_BOOK_SHARES:
-        risks.append(f"Thin book: about {depth:,.0f} shares rest within 5c of the mid, so a large order moves the price")
+        where = f"on the side a {side.upper()} buy takes " if side_depth is not None else ""
+        risks.append(f"Thin book: about {depth:,.0f} shares rest {where}within 5c of the mid, so a large order moves the price")
     risks.append(f"Exit within {FADE_HORIZON_H:g} h at the target or the stop: a reversion trade, not a hold-to-settlement bet")
 
     return Opportunity(
@@ -346,6 +483,8 @@ def fade_opportunity(surge: Surge, current: Optional[PricePoint], info: Optional
         risks=risks,
         settles_before_cup_end=before,
         surge_id=surge.id,
+        depth_checked=levels is not None,
+        fill_price=round(fill, 6) if fill is not None else None,
     )
 
 
@@ -398,7 +537,20 @@ def carry_opportunity(band: HighBand, current: Optional[PricePoint], info: Optio
         horizon = max(0.0, (cup_end - now) / 3600.0)
     else:
         horizon = None
-    shares = size_position(p_true, entry, balance, kelly_mult, max_position_pct)
+    kelly_shares = size_position(p_true, entry, balance, kelly_mult, max_position_pct)
+    contract = "yes" if yes else "no"
+    levels, book_at = _book_levels(contract, current, now, None if no_book else entry)
+    fill: Optional[float] = None
+    offered = 0.0
+    shares = kelly_shares
+    if levels is not None:
+        # Only shares that keep at least half of the edge count: a carry's edge is a fraction of
+        # a cent, so the next level up usually has none.
+        offered, taken = _walk(levels, _depth_limit(p_true, entry))
+        shares = min(kelly_shares, int(math.floor(offered + 1e-9)))
+        fill = _avg_cost(taken, shares)
+        if shares <= 0:
+            return None
     cost = round(shares * entry, 2)
     confidence = round(min(0.9, 0.4 + 0.5 * _clamp01(band.time_in_band)), 4)
     score = er * confidence * (0.5 if before is False else 1.0)
@@ -411,8 +563,14 @@ def carry_opportunity(band: HighBand, current: Optional[PricePoint], info: Optio
         f"Fair value {p_true:.3f} = mid {fav_mid:.3f} + min(0.01, 0.2 x {1.0 - fav_mid:.3f}): a small "
         "favourite-longshot adjustment, since heavy favourites tend to be slightly underpriced",
         f"Edge {_signed(edge)}/share ({er:.2%} of cost), slow but steady; {shares:,} shares = {cost:,.0f} SUSQies "
-        f"({_kelly_label(kelly_mult)}, capped at {max_position_pct:.0%} of balance)",
+        f"({_kelly_label(kelly_mult)}, capped at {max_position_pct:.0%} of balance"
+        f"{' and by book depth' if shares < kelly_shares else ''})",
     ]
+    if levels is not None and fill is not None:
+        rationale.append(
+            f"Book ({_ago(now, book_at)}): {offered:,.0f} {name} shares on offer at prices that keep at least half "
+            f"the edge; {shares:,} fill at an average of {_px(round(fill, 4))} ({_signed(p_true - fill)}/share there)"
+        )
     if before is True:
         rationale.append(f"Settles {_when(settle_ts)} (in {horizon:.0f} h), before the Cup ends: paid out at 1.00 if it wins")
     elif before is False:
@@ -429,6 +587,9 @@ def carry_opportunity(band: HighBand, current: Optional[PricePoint], info: Optio
         risks.append("Settlement date unknown: it may not pay out before the Cup ends")
     if no_book:
         risks.append(f"No live book: the entry uses the mark; check the {name} ask before buying")
+    if levels is None:
+        risks.append(f"Size not checked against a recent order book on the {name} side: at the next price level "
+                     "up the edge may be gone, so check the depth before buying")
     risks.append("The favourite-longshot adjustment is a rule of thumb, not a measured edge")
 
     return Opportunity(
@@ -452,6 +613,8 @@ def carry_opportunity(band: HighBand, current: Optional[PricePoint], info: Optio
         rationale=rationale,
         risks=risks,
         settles_before_cup_end=before,
+        depth_checked=levels is not None,
+        fill_price=round(fill, 6) if fill is not None else None,
     )
 
 
@@ -598,11 +761,53 @@ def _legs_text(legs: Sequence[Mapping[str, Any]]) -> str:
     return " + ".join(parts)
 
 
+def _sizing_text(shares: int, cap: int, unit: str, max_position_pct: float, offered: Optional[float],
+                 fill: Optional[float], limit: Optional[float], book_at: Optional[float], now: Optional[float]) -> str:
+    """How a set/arbitrage size was chosen: the balance cap, and what the books can fill at a
+    cost up to ``limit`` (where a further one still keeps half the edge)."""
+    if offered is None:
+        return f"{shares:,} {unit} at the {max_position_pct:.0%}-of-balance cap"
+    when = f" ({_ago(now, book_at)})" if now is not None else ""
+    one = unit[:-1] if unit.endswith("s") else unit
+    if shares <= 0:
+        return f"but the order books{when} hold no full {one} at up to {_px(round(limit or 0.0, 4))}: nothing to size"
+    capped = "the books' depth" if shares < cap else f"the {max_position_pct:.0%}-of-balance cap"
+    avg = f", at an average of {_px(round(fill, 4))} each" if fill is not None else ""
+    return (f"{shares:,} {unit} ({capped}; the books{when} offer {offered:,.0f} at up to {_px(round(limit or 0.0, 4))} "
+            f"per {one}, where each keeps at least half the edge{avg})")
+
+
+def _set_depth(legs: Sequence[Mapping[str, Any]], latest: Mapping[str, PricePoint], now: Optional[float],
+               limit: Optional[float]) -> Tuple[Optional[float], Optional[List[Levels]], Optional[float]]:
+    """(full sets on offer at a set cost up to ``limit``, each leg's levels, the oldest book
+    time), or ``(None, None, None)`` when a leg has no usable recent book (sizes are then not
+    depth-checked)."""
+    if now is None or limit is None or not legs:
+        return None, None, None
+    books: List[Levels] = []
+    oldest: Optional[float] = None
+    for leg in legs:
+        eid = leg.get("exchange_id")
+        levels, at = _book_levels(str(leg.get("side") or "yes"), latest.get(str(eid)) if eid is not None else None,
+                                  now, _num(leg.get("price")))
+        if levels is None:
+            return None, None, None
+        books.append(levels)
+        oldest = at if oldest is None or (at is not None and at < oldest) else oldest
+    return _walk_set(books, limit), books, oldest
+
+
+def _set_fill(books: Sequence[Levels], sets: float) -> Optional[float]:
+    """Average cost of ``sets`` full sets: the sum of each leg's average fill."""
+    costs = [_avg_cost(levels, sets) for levels in books]
+    return round(sum(costs), 6) if costs and all(c is not None for c in costs) else None  # type: ignore[misc]
+
+
 def arbitrage_opportunities(constraints: Optional[Mapping[str, Any]], overround_rows: Sequence[Mapping[str, Any]],
                             balance: float, *, max_position_pct: float = MAX_POSITION_PCT,
                             latest: Optional[Mapping[str, PricePoint]] = None,
                             infos: Optional[Mapping[str, ExchangeInfo]] = None,
-                            cup_end: Optional[float] = None) -> List[Opportunity]:
+                            cup_end: Optional[float] = None, now: Optional[float] = None) -> List[Opportunity]:
     """One idea per engine-reported constraint violation and per multi-outcome book flagged
     ``hasArbitrageOpportunity``. Sized at the per-idea cap (a true arbitrage has no Kelly limit).
 
@@ -618,6 +823,16 @@ def arbitrage_opportunities(constraints: Optional[Mapping[str, Any]], overround_
     is known (NO on every member of a mutually exclusive group, YES on every member of a
     complementary one) the edge is ``payoff - cost``; otherwise it is the engine's violation
     amount. ``settles_before_cup_end`` is set when every leg's settlement date is in ``infos``.
+
+    A flagged multi-outcome book is priced from the live YES asks of its outcomes when every
+    one is quoted (set price = their sum, edge = 1 - sum), so the card's set price is the sum
+    of the legs it lists; the idea is dropped once that sum reaches 1.00. Without a quote on
+    every outcome it falls back to the engine's overround from the last book read, and says so.
+
+    Sizes count only what the order books can fill (``now`` and books on the ``latest``
+    points, see ``TrackerStore.latest``): sets are capped where the next full set would cost
+    as much as it pays, across every leg's levels. Without a recent book on every leg the
+    size is the per-idea cap and the idea is marked ``depth_checked=False``.
     """
     b = _num(balance) or 0.0
     latest = latest or {}
@@ -669,7 +884,16 @@ def arbitrage_opportunities(constraints: Optional[Mapping[str, Any]], overround_
             edge = round(amount, 6)
         er = edge / entry if entry and edge is not None else None
         tradable = entry is not None and edge is not None and edge > _EPS
-        shares = int(math.floor(max_position_pct * b / entry + 1e-9)) if tradable and b > 0 else 0  # type: ignore[operator]
+        cap_shares = int(math.floor(max_position_pct * b / entry + 1e-9)) if tradable and b > 0 else 0  # type: ignore[operator]
+        shares = cap_shares
+        # What one set is worth: its settlement payoff, else its cost plus the engine's gap.
+        worth = payoff if payoff is not None else ((entry + amount) if entry is not None else None)
+        limit = _depth_limit(worth, entry) if worth is not None and entry is not None else None
+        offered, books, book_at = _set_depth(legs, latest, now, limit) if tradable and live else (None, None, None)
+        fill: Optional[float] = None
+        if offered is not None and books is not None:
+            shares = min(cap_shares, int(math.floor(offered + 1e-9)))
+            fill = _set_fill(books, shares)
         unit = "sets" if multi else "shares"
         before, settle = _legs_settle_before([leg["exchange_id"] for leg in legs], infos, cup_end)
         rationale = [f"Engine-reported {kind} violation of {_px(amount)}: {v.get('reason') or 'prices break the relationship'}"]
@@ -682,23 +906,28 @@ def arbitrage_opportunities(constraints: Optional[Mapping[str, Any]], overround_
                 f"{' - ' + str(t.get('outcome')) if t.get('outcome') else ''} (exch {t.get('exchangeId')}, buy {leg['side'].upper()} "
                 f"at {_px(leg['price'])}): {t.get('rationale') or ''}".rstrip(": ")
             )
+        sizing = _sizing_text(shares, cap_shares, unit, max_position_pct, offered, fill, limit, book_at, now)
         if entry is not None and payoff is not None:
             pays = f"{'at least ' if at_least else ''}{payoff:.2f}"
             if tradable:
                 rationale.append(f"One set ({_legs_text(legs)}) costs {_px(entry)} and pays {pays} at settlement: "
-                                 f"{_signed(edge)} per set ({er:.1%}); {shares:,} sets at the {max_position_pct:.0%}-of-balance cap")  # type: ignore[arg-type]
+                                 f"{_signed(edge)} per set ({er:.1%}); {sizing}")  # type: ignore[arg-type]
             else:
                 rationale.append(f"At these prices one set ({_legs_text(legs)}) costs {_px(entry)}, no less than the {pays} "
                                  "it pays: the gap is gone after the spread, so there is nothing to size")
         elif entry is not None:
             what = f"The {len(legs)} legs ({_legs_text(legs)}) cost {_px(entry)} per set" if multi else \
                 f"The trade costs {_px(entry)} per share"
-            rationale.append(f"{what} and gain about {_px(amount)} as prices correct ({er:.1%}); "
-                             f"{shares:,} {unit} at the {max_position_pct:.0%}-of-balance cap")
-        prices_risk = ("Leg prices are the live asks (NO = 1 - YES bid): fills can still move them, check the depth on every leg"
+            rationale.append(f"{what} and gain about {_px(amount)} as prices correct ({er:.1%}); {sizing}")
+        if tradable and offered is not None and shares <= 0:
+            tradable = False  # the books hold nothing at a price that keeps the gap
+        prices_risk = ("Leg prices are the live asks (NO = 1 - YES bid): fills can still move them"
                        if live else
                        "Prices are last/valuation prices, not executable quotes: check the asks on every leg, the spread can eat the gap")
         risks = [prices_risk]
+        if tradable and offered is None:
+            risks.append("Size not checked against recent order books on every leg: check the depth on each one, "
+                         "walking a thin book can cost more than the set pays")
         if multi:
             risks.append("Legs fill separately: a partial fill leaves a one-sided position")
         risks.append("The gap can persist until settlement, tying up capital")
@@ -719,8 +948,8 @@ def arbitrage_opportunities(constraints: Optional[Mapping[str, Any]], overround_
             edge=edge,
             expected_return=round(er, 6) if er is not None else None,
             horizon_hours=None,
-            suggested_shares=shares,
-            suggested_cost=round(shares * entry, 2) if entry and shares else 0.0,
+            suggested_shares=shares if tradable else 0,
+            suggested_cost=round(shares * entry, 2) if entry and shares and tradable else 0.0,
             score=round((er or 0.0) * CONSTRAINT_CONFIDENCE, 6) if tradable else 0.0,
             confidence=CONSTRAINT_CONFIDENCE,
             rationale=rationale,
@@ -728,6 +957,8 @@ def arbitrage_opportunities(constraints: Optional[Mapping[str, Any]], overround_
             settles_before_cup_end=before,
             legs=legs if multi else [],
             unit=unit,
+            depth_checked=(offered is not None) if tradable else None,
+            fill_price=fill if tradable else None,
         ))
     by_market: Dict[str, List[ExchangeInfo]] = {}
     for info in infos.values():
@@ -739,25 +970,52 @@ def arbitrage_opportunities(constraints: Optional[Mapping[str, Any]], overround_
         market_id = str(row.get("market_id") or row.get("marketId") or row.get("id") or "")
         title = str(row.get("market_title") or row.get("marketTitle") or row.get("title") or f"Market {market_id}")
         n_out = row.get("outcomes")
-        entry = over if over is not None and over > 0 else None
-        edge = round(1.0 - over, 6) if over is not None and over < 1.0 - _EPS else None
-        er = edge / entry if edge is not None and entry else None
-        shares = int(math.floor(max_position_pct * b / entry + 1e-9)) if entry and edge is not None and b > 0 else 0
         members = by_market.get(market_id) or []
         before, settle = _legs_settle_before([m.exchange_id for m in members], infos, cup_end)
-        legs = []
+        legs: List[Dict[str, Any]] = []
         if members and (not isinstance(n_out, int) or n_out == len(members)):
             legs = [{"exchange_id": m.exchange_id, "market_id": market_id, "title": title, "option": m.option,
                      "side": "yes", "price": _quote_cost("yes", latest.get(m.exchange_id))} for m in members]
             if any(leg["price"] is None for leg in legs):
                 legs = []  # without every ask the per-leg list would not add up to the set price
-        rationale = [f"The engine flags a potential arbitrage: the best prices across "
-                     f"{str(n_out) + ' ' if n_out else 'its '}outcomes sum to {_px(over)}, below 1.00"]
-        if edge is not None and entry:
-            rationale.append(f"Buying one YES share of every outcome costs {_px(entry)} and pays 1.00 if exactly one wins "
-                             f"({_signed(edge)} per set, {er:.1%}); {shares:,} sets at the {max_position_pct:.0%}-of-balance cap")
+        rationale: List[str] = []
         if legs:
-            rationale.append(f"Current asks: {_legs_text(legs)}")
+            # Price the set from the live asks it lists, so the set price is the sum of its legs.
+            entry = round(sum(leg["price"] for leg in legs), 6)
+            if entry >= 1.0 - _EPS:
+                continue  # the asks no longer leave a gap: the flag is from an older book read
+            edge: Optional[float] = round(1.0 - entry, 6)
+            rationale.append(f"The engine flags a potential arbitrage, and the live asks of all {len(legs)} outcomes "
+                             f"({_legs_text(legs)}) sum to {_px(entry)}, below 1.00")
+        else:
+            entry = over if over is not None and over > 0 else None
+            edge = round(1.0 - over, 6) if over is not None and over < 1.0 - _EPS else None
+            when = f" ({_ago(now, _num(row.get('at')))})" if now is not None and _num(row.get("at")) is not None else ""
+            rationale.append(f"The engine flags a potential arbitrage: the best prices across "
+                             f"{str(n_out) + ' ' if n_out else 'its '}outcomes sum to {_px(over)}, below 1.00, at the last "
+                             f"order-book read{when}; not every outcome has a live ask, so the set price is not re-checked")
+        er = edge / entry if edge is not None and entry else None
+        cap_shares = int(math.floor(max_position_pct * b / entry + 1e-9)) if entry and edge is not None and b > 0 else 0
+        shares = cap_shares
+        limit = _depth_limit(1.0, entry) if entry is not None else None
+        offered, books, book_at = _set_depth(legs, latest, now, limit) if legs and edge is not None else (None, None, None)
+        fill: Optional[float] = None
+        if offered is not None and books is not None:
+            shares = min(cap_shares, int(math.floor(offered + 1e-9)))
+            fill = _set_fill(books, shares)
+        tradable = edge is not None and entry is not None and shares > 0
+        if edge is not None and entry:
+            sizing = _sizing_text(shares, cap_shares, "sets", max_position_pct, offered, fill, limit, book_at, now)
+            rationale.append(f"Buying one YES share of every outcome costs {_px(entry)} and pays 1.00 if exactly one wins "
+                             f"({_signed(edge)} per set, {er:.1%}); {sizing}")
+        risks = [
+            "Only a potential arbitrage: it pays only if the listed outcomes are exhaustive and mutually exclusive",
+            "Every leg must fill at its best ask: a partial fill leaves a one-sided position",
+        ]
+        if tradable and offered is None:
+            risks.append("Size not checked against recent order books on every outcome: check the depth on each one, "
+                         "walking a thin book can cost more than the set pays")
+        risks.append(_settlement_risk(before, settle, cup_end))
         out.append(Opportunity(
             kind="arbitrage",
             exchange_id=None,
@@ -772,19 +1030,17 @@ def arbitrage_opportunities(constraints: Optional[Mapping[str, Any]], overround_
             edge=edge,
             expected_return=round(er, 6) if er is not None else None,
             horizon_hours=None,
-            suggested_shares=shares,
-            suggested_cost=round(shares * entry, 2) if entry and shares else 0.0,
-            score=round((er or 0.0) * BOOK_ARB_CONFIDENCE, 6),
+            suggested_shares=shares if tradable else 0,
+            suggested_cost=round(shares * entry, 2) if tradable and entry else 0.0,
+            score=round((er or 0.0) * BOOK_ARB_CONFIDENCE, 6) if tradable or offered is None else 0.0,
             confidence=BOOK_ARB_CONFIDENCE,
             rationale=rationale,
-            risks=[
-                "Only a potential arbitrage: it pays only if the listed outcomes are exhaustive and mutually exclusive",
-                "Every leg must fill at its best ask: check the depth on each outcome",
-                _settlement_risk(before, settle, cup_end),
-            ],
+            risks=risks,
             settles_before_cup_end=before,
             legs=legs,
             unit="sets",
+            depth_checked=(offered is not None) if edge is not None else None,
+            fill_price=fill if tradable else None,
         ))
     return out
 
@@ -910,11 +1166,14 @@ def _unknown_inputs(balance: Optional[float], leader: Optional[float], rank: Opt
 
 
 def _assumptions(mode: str, balance: Optional[float], sizing: float, leader: Optional[float], rank: Optional[int],
-                 days_left: float) -> List[str]:
+                 days_left: float, account_value: Optional[float] = None) -> List[str]:
     """What the report assumed for unknown inputs (failed or missing balance / leaderboard reads)."""
     out: List[str] = []
     if balance is None:
         out.append(f"Balance unknown: sized on the {sizing:,.0f} starting balance")
+    elif account_value is None and leader is not None:
+        out.append("Account value unknown: risk mode compares your cash (open positions not counted) with the "
+                   "leader's account value, so it may overstate how far behind you are")
     if rank is None and leader is None:
         text = f"Leaderboard unavailable: risk mode assumes {mode}"
         if mode == MODE_AGGRESSIVE:
@@ -931,7 +1190,7 @@ def _assumptions(mode: str, balance: Optional[float], sizing: float, leader: Opt
 
 
 def _principles(mode: str, balance: Optional[float], leader: Optional[float], rank: Optional[int],
-                days_left: float, cup_end: float) -> List[str]:
+                days_left: float, cup_end: float, account_value: Optional[float] = None) -> List[str]:
     out = [
         "Prizes go to the top 3 of many players, so the payoff is convex: 4th place pays the same as last. "
         "When you are behind, variance is your friend: take more, bigger, independent bets. When you are in "
@@ -949,8 +1208,10 @@ def _principles(mode: str, balance: Optional[float], leader: Optional[float], ra
         out.append(f"Mode: protect. You are ranked {rank} with {days_left:.0f} days left, so favour carry "
                    "(score x1.3), damp fades (x0.6) and keep positions small.")
     elif mode == MODE_AGGRESSIVE:
-        if leader and balance is not None and balance < 0.9 * leader:
-            why = f"your balance {balance:,.0f} is more than 10% behind the leader's {leader:,.0f}"
+        mine = account_value if account_value is not None else balance
+        if leader and mine is not None and mine < 0.9 * leader:
+            what = "your account value" if account_value is not None else "your cash (positions not counted)"
+            why = f"{what} {mine:,.0f} is more than 10% behind the leader's {leader:,.0f}"
         else:
             where = "unranked (or your rank is unknown)" if rank is None else f"ranked {rank}"
             why = f"only {days_left:.0f} days left and you are {where}, outside the top 10"
@@ -992,13 +1253,70 @@ def _headline(mode: str, days_left: float, opps: Sequence[Opportunity]) -> str:
     return text
 
 
+def _is_reversion(surge: Surge, other: Surge) -> bool:
+    """``surge`` is ``other`` giving its move back: the opposite direction, starting after
+    ``other`` started (within its window + 6 h of its end) and ending inside its start -> peak
+    range. Fading it would bet that the debunked move comes back."""
+    if other is surge or other.exchange_id != surge.exchange_id or other.direction == surge.direction:
+        return False
+    if surge.start_ts < other.start_ts - 1e-6:
+        return False
+    if surge.start_ts > other.end_ts + max(_num(other.window_s) or 0.0, 0.0) + REVERSION_LINK_S:
+        return False
+    if other.direction == "down":
+        return other.peak_price - _EPS <= surge.end_price <= other.start_price + _EPS
+    return other.start_price - _EPS <= surge.end_price <= other.peak_price + _EPS
+
+
+def _resolve_conflicts(opps: List[Opportunity], infos: Mapping[str, ExchangeInfo],
+                       latest: Mapping[str, PricePoint]) -> List[Opportunity]:
+    """Ideas must not contradict each other.
+
+    * A tradable arbitrage buys one side of each leg; a carry on the other side of the same
+      outcome is dropped (holding both pays exactly 1.00 for more than 1.00), and a fade or
+      watch on it is flagged.
+    * A carry buying NO on one outcome of a multi-outcome market is flagged when buying YES on
+      every other outcome costs less (it pays the same: 1.00 unless this outcome wins).
+    """
+    legs: Dict[str, str] = {}
+    for opp in opps:
+        if opp.kind != "arbitrage" or opp.suggested_shares <= 0:
+            continue
+        for leg in opp.legs or ([{"exchange_id": opp.exchange_id, "side": opp.side}] if opp.exchange_id else []):
+            if leg.get("exchange_id") is not None:
+                legs.setdefault(str(leg["exchange_id"]), str(leg.get("side") or ""))
+    by_market: Dict[str, List[str]] = {}
+    for info in infos.values():
+        by_market.setdefault(str(info.market_id), []).append(str(info.exchange_id))
+    out: List[Opportunity] = []
+    for opp in opps:
+        eid = str(opp.exchange_id) if opp.exchange_id is not None else None
+        arb_side = legs.get(eid) if eid is not None and opp.kind in ("carry", "fade", "watch") else None
+        if arb_side and arb_side != opp.side:
+            if opp.kind == "carry":
+                continue
+            opp.risks.insert(0, f"Conflicts with the arbitrage idea, which buys {arb_side.upper()} on this outcome: "
+                                f"holding both {arb_side.upper()} and {opp.side.upper()} pays exactly 1.00 for more than 1.00")
+        if opp.kind == "carry" and opp.side == "no" and eid is not None and opp.entry_price is not None:
+            others = [x for x in by_market.get(str(opp.market_id), []) if x != eid]
+            asks = [_quote_cost("yes", latest.get(x)) for x in others]
+            if others and all(a is not None for a in asks):
+                cheaper = round(sum(asks), 6)  # type: ignore[arg-type]
+                if cheaper < opp.entry_price - _EPS:
+                    opp.risks.insert(0, f"Cheaper for the same payoff: YES on every other outcome of this market costs "
+                                        f"{_px(cheaper)} in total (vs NO at {_px(opp.entry_price)}), and also pays 1.00 "
+                                        "unless this outcome wins")
+        out.append(opp)
+    return out
+
+
 def build_report(*, now: float, surges: Sequence[Surge], bands: Sequence[HighBand],
                  latest: Mapping[str, PricePoint], infos: Mapping[str, ExchangeInfo],
                  balance: Optional[float], initial_balance: Optional[float], leader_value: Optional[float],
                  my_rank: Optional[int], cup_end: float, constraints: Optional[Mapping[str, Any]] = None,
                  overround_rows: Sequence[Mapping[str, Any]] = (), backtest: Optional[BacktestResult] = None,
                  kelly_mult: float = KELLY_MULT, max_position_pct: float = MAX_POSITION_PCT,
-                 top_n: int = TOP_N) -> StrategyReport:
+                 top_n: int = TOP_N, account_value: Optional[float] = None) -> StrategyReport:
     """Ranked, sized, read-only ideas plus the tournament posture.
 
     Uses the newest open surge per exchange (participants -> fade, unclear -> watch), every
@@ -1008,7 +1326,13 @@ def build_report(*, now: float, surges: Sequence[Surge], bands: Sequence[HighBan
     for unknown inputs (balance, rank, leader value), and sized ideas say so too.
 
     Surges whose status is not ``open`` (reverted, held, or ``closed`` because their market
-    left the open list) never produce fade or watch ideas.
+    left the open list) never produce fade or watch ideas, and neither does a surge that is
+    the reversion of a recent opposite surge on the same outcome. Ideas that contradict a
+    tradable arbitrage are dropped or flagged (see :func:`_resolve_conflicts`).
+
+    ``balance`` is cash (it sizes the ideas); ``account_value`` (cash + open positions) is what
+    the risk mode compares with the leader's value, falling back to cash when unknown. Sizes
+    are capped by the order-book depth on the ``latest`` points when known.
     """
     latest = latest or {}
     infos = infos or {}
@@ -1020,12 +1344,16 @@ def build_report(*, now: float, surges: Sequence[Surge], bands: Sequence[HighBan
     days_left = max(0.0, (cup_end - now) / 86400.0)
     rank = my_rank if isinstance(my_rank, int) and not isinstance(my_rank, bool) else None
     leader = _num(leader_value)
-    mode = risk_mode(bal, initial, leader, rank, days_left)
+    value = _num(account_value)
+    mode = risk_mode(bal, initial, leader, rank, days_left, value)
 
+    every = list(surges or ())
     newest: Dict[str, Surge] = {}
-    for s in surges or ():
+    for s in every:
         if s.status != SURGE_OPEN:
             continue
+        if any(_is_reversion(s, other) for other in every):
+            continue  # the move giving back an earlier surge: not a new surge to fade
         prev = newest.get(s.exchange_id)
         if prev is None or (s.detected_at, s.end_ts) > (prev.detected_at, prev.end_ts):
             newest[s.exchange_id] = s
@@ -1047,7 +1375,8 @@ def build_report(*, now: float, surges: Sequence[Surge], bands: Sequence[HighBan
         if opp is not None:
             opps.append(opp)
     opps.extend(arbitrage_opportunities(constraints, overround_rows, sizing, max_position_pct=max_position_pct,
-                                        latest=latest, infos=infos, cup_end=cup_end))
+                                        latest=latest, infos=infos, cup_end=cup_end, now=now))
+    opps = _resolve_conflicts(opps, infos, latest)
     if bal is None:
         for opp in opps:
             if opp.suggested_shares > 0:
@@ -1065,12 +1394,13 @@ def build_report(*, now: float, surges: Sequence[Surge], bands: Sequence[HighBan
         headline=_headline(mode, days_left, opps),
         balance=bal,
         initial_balance=initial,
+        account_value=value,
         cup_end=cup_end,
         days_left=round(days_left, 2),
         leader_value=leader,
         my_rank=rank,
-        principles=_principles(mode, bal, leader, rank, days_left, cup_end),
+        principles=_principles(mode, bal, leader, rank, days_left, cup_end, value),
         opportunities=opps,
         backtest=backtest,
-        assumptions=_assumptions(mode, bal, sizing, leader, rank, days_left),
+        assumptions=_assumptions(mode, bal, sizing, leader, rank, days_left, value),
     )

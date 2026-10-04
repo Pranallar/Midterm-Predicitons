@@ -37,6 +37,7 @@ log = logging.getLogger("supermarket_bot")
 
 SCHEMA_VERSION = 1
 TICK_RETENTION_S = 10 * 86400.0  # ticks older than this (relative to the newest insert) are pruned
+TICK_GAP_S = 900.0  # a pause between ticks longer than this is a tracking gap: candles fill it
 PRUNE_EVERY = 500  # tick inserts between prunes
 NEWS_RETENTION_S = 7 * 86400.0
 RESOLUTION_SECONDS: Dict[str, float] = {"1m": 60.0, "5m": 300.0, "1h": 3600.0, "1d": 86400.0, "1w": 604800.0}
@@ -256,62 +257,116 @@ def _surge_values(surge: Surge) -> List[Any]:
     return [getattr(surge, name) for name, _ in _SURGE_COLUMNS]
 
 
+_BOOK_KEY = "book:"
+
+
+def _book_levels(levels: Sequence[Any], descending: bool) -> List[List[float]]:
+    """``[[price, quantity], ...]`` from pairs, dicts or Level objects; positive sizes, best first."""
+    out: List[List[float]] = []
+    for level in levels or []:
+        if isinstance(level, Mapping):
+            price, qty = level.get("price"), level.get("quantity", level.get("qty"))
+        elif isinstance(level, (list, tuple)) and len(level) >= 2:
+            price, qty = level[0], level[1]
+        else:
+            price, qty = getattr(level, "price", None), getattr(level, "quantity", None)
+        p, q = _num(price), _num(qty)
+        if p is None or q is None or q <= 0 or not 0.0 <= p <= 1.0:
+            continue
+        out.append([p, q])
+    out.sort(key=lambda lv: lv[0], reverse=descending)
+    return out
+
+
 REFRAME_SHARE = 0.5  # same rule analytics uses to pick the shortest window holding most of a move
 EXTEND_MIN = 0.03  # a longer window takes over only when the move went this far past the old peak
+SPAN_SHARE = 1.25  # a frame spans at most its window plus the start-point tolerance
+
+
+def _beyond(up: bool, a: float, b: float) -> bool:
+    """``a`` lies further than ``b`` in the move's direction (higher for an up-move)."""
+    return a > b + 1e-9 if up else a < b - 1e-9
 
 
 def _merge_surges(old: Surge, new: Surge) -> Surge:
     """Merge a fresh detection into the stored open surge for the same exchange and direction.
 
-    One *frame* describes the move: ``start_ts``, ``start_price``, ``window``, ``window_s`` and
-    ``zscore`` always come from the same detection, and ``change`` is always
-    ``end_price - start_price``, so the numbers a card prints add up.
+    One *frame* describes the move: ``start_ts``, ``start_price``, ``window``, ``window_s``,
+    ``end_ts``, ``end_price`` and ``zscore`` always describe the same move, and ``change`` is
+    always ``end_price - start_price``, so the numbers a card prints add up and match the
+    attribution that analysed them.
 
-    * The end (``end_ts`` / ``end_price``) follows the latest detection.
-    * The stored frame is kept, re-measured to the new end (z scaled with the change), unless
-      the new detection describes the move better: a *shorter* window starting later that
-      still holds at least half of the move (the first sighting used partial history), or a
-      *longer* window because the move kept going well past the old peak. A longer window
-      that merely re-detects a move which already happened (a 1h spike still visible through
-      the 24h window a day later) never drags the start back by a day.
-    * The peak is the extreme of both; ``detected_at`` (the first detection) and the
-      attribution are kept.
+    * The frame stays at the spike. The end (``end_ts`` / ``end_price``) only advances when a
+      detection takes the move further (a new high for an up-move) within the frame's own
+      window (``start_ts + 1.25 x window_s``): re-detections while the price falls back, or
+      the same spike seen again through a longer window, change nothing but the peak and the
+      live price. The z-score is re-measured with the change.
+    * A detection replaces the frame when it describes the move better: a *shorter* window
+      starting later that still holds at least half of the move (the first sighting used
+      partial history), the *same* window starting later that holds all of the move up to a
+      new high (a move that keeps going), or a *longer* window because the move kept going
+      well past the old peak. A longer window that merely re-detects a move which already happened never drags
+      the start back by a day. The adopted frame keeps the stored end when that end lies
+      further in the move's direction and inside the new window (z re-measured to it).
+    * The peak is the extreme of both; ``detected_at`` (the first detection), the attribution
+      and the status (the tracker re-evaluates it) are kept; ``current_price`` comes from the
+      newest detection and ``reverted_fraction`` is re-measured on the merged frame.
     """
     merged = dataclasses.replace(old)
     up = old.direction != "down"
     later = new.end_ts >= old.end_ts
-    if later:
-        merged.end_ts, merged.end_price = new.end_ts, new.end_price
-    old_move = round(merged.end_price - old.start_price, 6)  # the stored frame, measured to the latest end
+    furthest_end = new.end_price if _beyond(up, new.end_price, old.end_price) else old.end_price
     adopt = False
     if later:
+        move = round(furthest_end - old.start_price, 6)  # the stored frame, to the furthest end seen
         shorter = (
             new.window_s < old.window_s
             and new.start_ts > old.start_ts
-            and abs(new.change) + 1e-9 >= REFRAME_SHARE * abs(old_move)
+            and abs(new.change) + 1e-9 >= REFRAME_SHARE * abs(move)
+        )
+        # The same window sliding along a move that keeps going: it starts later but still holds
+        # all of the move up to the new high, so it describes the move at least as well.
+        slides = (
+            abs(new.window_s - old.window_s) < 1e-6
+            and new.start_ts > old.start_ts
+            and _beyond(up, new.end_price, old.end_price)
+            and abs(new.change) + 1e-9 >= abs(move)
         )
         beyond = (new.peak_price - old.peak_price) if up else (old.peak_price - new.peak_price)
         extends = (
             new.window_s > old.window_s
             and beyond + 1e-9 >= EXTEND_MIN
-            and abs(new.change) > abs(old_move) + 1e-9
+            and abs(new.change) + 1e-9 >= abs(move)
         )
-        adopt = shorter or extends
+        adopt = shorter or slides or extends
     if adopt:
         merged.start_ts, merged.start_price = new.start_ts, new.start_price
         merged.window, merged.window_s, merged.zscore = new.window, new.window_s, new.zscore
-    else:
+        merged.end_ts, merged.end_price = new.end_ts, new.end_price
+        keep_old_end = _beyond(up, old.end_price, new.end_price) and old.end_ts >= new.start_ts
+        if keep_old_end:
+            merged.end_ts, merged.end_price = old.end_ts, old.end_price
+            if new.zscore is not None and abs(new.change) > 1e-9:
+                merged.zscore = round(new.zscore * (old.end_price - new.start_price) / new.change, 4)
+    elif later and _beyond(up, new.end_price, old.end_price) and \
+            new.end_ts - old.start_ts <= SPAN_SHARE * old.window_s + 1e-6:
+        merged.end_ts, merged.end_price = new.end_ts, new.end_price
         if old.zscore is not None and abs(old.change) > 1e-9:
             # Same frame, same volatility: z scales with the move.
-            merged.zscore = round(old.zscore * old_move / old.change, 4)
+            merged.zscore = round(old.zscore * (new.end_price - old.start_price) / old.change, 4)
     merged.change = round(merged.end_price - merged.start_price, 6)
-    if old.direction == "down":
-        merged.peak_price = min(old.peak_price, new.peak_price)
+    if up:
+        merged.peak_price = max(old.peak_price, new.peak_price, merged.end_price)
     else:
-        merged.peak_price = max(old.peak_price, new.peak_price)
-    if new.current_price is not None:
+        merged.peak_price = min(old.peak_price, new.peak_price, merged.end_price)
+    if new.current_price is not None and later:
         merged.current_price = new.current_price
-    if new.reverted_fraction is not None:
+    current = _num(merged.current_price)
+    den = (merged.peak_price - merged.start_price) if up else (merged.start_price - merged.peak_price)
+    if current is not None and den > 1e-9:
+        given_back = (merged.peak_price - current) if up else (current - merged.peak_price)
+        merged.reverted_fraction = round(max(-1.0, min(2.0, given_back / den)), 6)
+    elif new.reverted_fraction is not None and later:
         merged.reverted_fraction = new.reverted_fraction
     merged.detected_at = min(old.detected_at, new.detected_at)
     merged.status = SURGE_OPEN
@@ -552,13 +607,15 @@ class TrackerStore:
         return bool(rows)
 
     def series(self, exchange_id: str, since: float, until: Optional[float] = None, *, include_candles: bool = True) -> List[PricePoint]:
-        """Merged, time-ordered points: candle closes (``source="candle"``, at candle end time)
-        for the period before the first tick, then ticks. Marks via ``analytics.mark_price``.
+        """Merged, time-ordered points: ticks, with candle closes (``source="candle"``, at
+        candle end time) wherever there are no ticks. Marks via ``analytics.mark_price``.
 
-        "The first tick" is the first tick inside ``[since, until]``, so candles also fill a
-        window that starts before tracking did. Where 5m and 1h candles overlap, the finer
-        5m candles win (generally: a finer resolution hides coarser closes inside its span).
-        Candles with a null close are skipped. ``include_candles=False`` returns ticks only.
+        Candles fill the period before the first tick inside ``[since, until]`` (a window that
+        starts before tracking did) and every pause of more than ``TICK_GAP_S`` between two
+        ticks (the dashboard was stopped, or snapshots failed, while price history covers the
+        gap). Where 5m and 1h candles overlap, the finer 5m candles win (generally: a finer
+        resolution hides coarser closes inside its span). Candles with a null close are
+        skipped. ``include_candles=False`` returns ticks only.
         """
         eid = str(exchange_id)
         mark = _mark_function()
@@ -574,18 +631,31 @@ class TrackerStore:
                     (eid, since, until),
                 ).fetchall()
             boundary = tick_rows[0]["ts"] if tick_rows else float("inf")
+            # Open intervals without ticks that candles may fill (besides the lead-in before the first tick).
+            gaps: List[Tuple[float, float]] = []
+            if tick_rows:
+                prev = tick_rows[0]["ts"]
+                for row in tick_rows[1:]:
+                    if row["ts"] - prev > TICK_GAP_S:
+                        gaps.append((prev, row["ts"]))
+                    prev = row["ts"]
             candle_rows: List[sqlite3.Row] = []
-            if include_candles and boundary > since:
+            if include_candles and (boundary > since or gaps):
                 # close time = start + length: bound it in SQL so only usable rows come back
                 params: List[Any] = [eid, since - _MAX_RESOLUTION_S, since]
                 sql = (
                     "SELECT resolution, ts, close FROM candles WHERE exchange_id = ? AND ts >= ? "
                     f"AND ts + {_LENGTH_SQL} >= ?"
                 )
-                if math.isfinite(boundary):
-                    sql += " AND ts < ?"
-                    params.append(boundary)
+                if math.isfinite(upper):
+                    sql += " AND ts <= ?"
+                    params.append(upper)
                 candle_rows = self._conn.execute(sql + " ORDER BY ts", params).fetchall()
+
+        def fills(close_ts: float) -> bool:
+            if close_ts < boundary:
+                return True
+            return any(lo < close_ts < hi for lo, hi in gaps)
 
         by_res: Dict[str, List[Tuple[float, Optional[float]]]] = {}
         for row in candle_rows:
@@ -593,7 +663,7 @@ class TrackerStore:
             if length is None:
                 continue
             close_ts = row["ts"] + length
-            if close_ts < since or close_ts >= boundary or close_ts > upper:
+            if close_ts < since or close_ts > upper or not fills(close_ts):
                 continue
             by_res.setdefault(row["resolution"], []).append((close_ts, row["close"]))
 
@@ -606,16 +676,27 @@ class TrackerStore:
                     continue
                 candle_points.append(PricePoint(ts=close_ts, price=mark(close, None, None), last=close, source="candle"))
             covered.append((entries[0][0] - RESOLUTION_SECONDS[res], entries[-1][0]))
-        candle_points.sort(key=lambda p: p.ts)
-
         ticks = [
             PricePoint(ts=r["ts"], price=mark(r["last"], r["bid"], r["ask"]), last=r["last"], bid=r["bid"], ask=r["ask"], source="tick")
             for r in tick_rows
         ]
-        return candle_points + ticks
+        if not candle_points:
+            return ticks
+        merged = candle_points + ticks
+        merged.sort(key=lambda p: p.ts)  # stable: a candle closing at a tick's time stays first
+        return merged
 
     def latest(self, exchange_id: str) -> Optional[PricePoint]:
-        """The newest tick, else the candle with the latest close time (None when nothing is stored)."""
+        """The newest tick, else the candle with the latest close time (None when nothing is stored).
+
+        ``book`` carries the newest stored order-book read (see :meth:`put_book`), if any.
+        """
+        point = self._latest_point(exchange_id)
+        if point is not None:
+            point.book = self.book(exchange_id)
+        return point
+
+    def _latest_point(self, exchange_id: str) -> Optional[PricePoint]:
         eid = str(exchange_id)
         mark = _mark_function()
         with self._lock:
@@ -640,6 +721,32 @@ class TrackerStore:
             return None
         close_ts, _, close = max(candidates)
         return PricePoint(ts=close_ts, price=mark(close, None, None), last=close, source="candle")
+
+    # order books ---------------------------------------------------------------
+    def put_book(self, exchange_id: str, at: float, bids: Sequence[Any], asks: Sequence[Any]) -> None:
+        """Keep the newest order-book read of an exchange (YES prices; replaces the previous one).
+
+        ``bids`` / ``asks`` are levels as ``(price, quantity)`` pairs, ``{"price", "quantity"}``
+        dicts or objects with those attributes; they are stored best first. The strategy sizes
+        ideas by this depth (see :meth:`latest`).
+        """
+        record = {
+            "at": float(at),
+            "bids": _book_levels(bids, descending=True),
+            "asks": _book_levels(asks, descending=False),
+        }
+        self.set_state(_BOOK_KEY + str(exchange_id), record)
+
+    def book(self, exchange_id: str) -> Optional[Dict[str, Any]]:
+        """The stored ``{"at", "bids", "asks"}`` order book of an exchange, or None."""
+        raw = self.get_state(_BOOK_KEY + str(exchange_id))
+        if not isinstance(raw, Mapping) or _num(raw.get("at")) is None:
+            return None
+        return {
+            "at": float(raw["at"]),
+            "bids": _book_levels(raw.get("bids") or [], descending=True),
+            "asks": _book_levels(raw.get("asks") or [], descending=False),
+        }
 
     def tick_count(self) -> int:
         return int(self._query("SELECT COUNT(*) FROM ticks")[0][0])
@@ -684,22 +791,32 @@ class TrackerStore:
         ]
 
     # surges -----------------------------------------------------------------
-    def record_surge(self, surge: Surge, merge_window_s: float = 6 * 3600) -> Surge:
+    def record_surge(self, surge: Surge, merge_window_s: float = 6 * 3600, *, into: Optional[int] = None) -> Surge:
         """Insert, or merge into the open surge for the same exchange+direction detected within
-        ``merge_window_s`` (see :func:`_merge_surges`: one consistent frame, the latest end,
-        ``change == end_price - start_price``). Returns the stored surge with id.
+        ``merge_window_s`` (see :func:`_merge_surges`: one consistent frame anchored at the
+        spike, ``change == end_price - start_price``). Returns the stored surge with id.
 
-        "Detected within" counts from the stored surge's first detection or its latest end,
-        whichever is newer, so a move that keeps being re-detected stays one surge. The stored
-        attribution is kept; the caller's ``surge`` object is not modified.
+        "Detected within" counts from the stored surge's first detection or its frame's end,
+        whichever is newer. ``into`` names the open surge to merge into whatever its age (the
+        tracker passes it when a detection re-sees that surge's move, e.g. a plateau seen
+        through the 24h window hours later); when it is not an open surge of the same exchange
+        and direction the usual rule applies. The stored attribution is kept; the caller's
+        ``surge`` object is not modified.
         """
         cutoff = surge.detected_at - merge_window_s
         with self._write() as conn:
-            row = conn.execute(
-                "SELECT * FROM surges WHERE exchange_id = ? AND direction = ? AND status = ? "
-                "AND (detected_at >= ? OR end_ts >= ?) ORDER BY detected_at DESC, id DESC LIMIT 1",
-                (surge.exchange_id, surge.direction, SURGE_OPEN, cutoff, cutoff),
-            ).fetchone()
+            row = None
+            if into is not None:
+                row = conn.execute(
+                    "SELECT * FROM surges WHERE id = ? AND exchange_id = ? AND direction = ? AND status = ?",
+                    (int(into), surge.exchange_id, surge.direction, SURGE_OPEN),
+                ).fetchone()
+            if row is None:
+                row = conn.execute(
+                    "SELECT * FROM surges WHERE exchange_id = ? AND direction = ? AND status = ? "
+                    "AND (detected_at >= ? OR end_ts >= ?) ORDER BY detected_at DESC, id DESC LIMIT 1",
+                    (surge.exchange_id, surge.direction, SURGE_OPEN, cutoff, cutoff),
+                ).fetchone()
             if row is None:
                 stored = dataclasses.replace(surge, id=None)
                 cols = ", ".join(col for _, col in _SURGE_COLUMNS) + ", attribution"

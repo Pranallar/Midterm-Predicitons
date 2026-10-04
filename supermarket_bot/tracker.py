@@ -26,17 +26,29 @@ from __future__ import annotations
 
 import copy
 import logging
+import sqlite3
 import threading
 import time
 from collections import deque
-from typing import Any, Callable, Deque, Dict, List, Mapping, Optional, Set, Tuple
+from typing import Any, Callable, Deque, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 from . import analytics
 from .books import books_from_market_orderbook
 from .bot import Context, MarketDataBot, is_fatal
 from .client import SuperMarketClient
-from .errors import ApiError, NetworkError, RequestCancelled, SuperMarketError
-from .models import NEWS_OK, NEWS_UNAVAILABLE, SURGE_CLOSED, SURGE_OPEN, ExchangeInfo, PricePoint, Surge
+from .errors import ApiError, NetworkError, RequestCancelled, SuperMarketError, redact
+from .models import (
+    NEWS_OK,
+    NEWS_UNAVAILABLE,
+    SURGE_CLOSED,
+    SURGE_HELD,
+    SURGE_OPEN,
+    SURGE_REVERTED,
+    VERDICT_PARTICIPANTS,
+    ExchangeInfo,
+    PricePoint,
+    Surge,
+)
 from .ratelimit import SlidingWindowLimiter
 from .store import TrackerStore
 
@@ -63,11 +75,20 @@ BACKFILL_FAIL_STREAK = 3  # transient failures on this many different series in 
 BACKFILL_BACKOFF_S = 60.0  # then pause the whole backfill queue (doubling, up to the max)
 BACKFILL_BACKOFF_MAX_S = 600.0
 PROBLEM_MESSAGE_MAX = 300
+BAND_MAX_STALENESS_S = 600.0  # a high band needs a current mark at most this old
+REVERSION_LINK_S = 6 * 3600.0  # an opposite move this soon after a surge's window may be its reversion
+NEWS_RECHECK_S = 300.0  # while news search is failing, re-try it this often (doubling) ...
+NEWS_RECHECK_MAX_S = 1800.0  # ... up to this
+MISSING_REFRESH_MIN_S = 30.0  # outcomes missing from the bulk prices: re-read the market list at most this often
+IDEA_BOOK_DEPTH = 20  # order-book levels read to size trade ideas
+IDEA_BOOKS_PER_REFRESH = 12  # single-exchange order books read per context refresh for trade ideas
+IDEA_BOOK_MAX_AGE_S = 900.0  # a stored idea book younger than this is not re-read for another candidate
 # status()["problems"] sources and how bad a current failure of each is
 PROBLEM_SEVERITY: Dict[str, str] = {
     "markets": "error",
     "prices": "error",
     "storage": "error",
+    "tracker": "error",
     "analytics": "warning",
     "price history": "warning",
     "constraints": "warning",
@@ -126,12 +147,23 @@ def _server_wait(exc: BaseException) -> Optional[float]:
     return None
 
 
-def _problem_text(exc: Any) -> str:
+def _clip_message(text: str, secrets: Sequence[str] = ()) -> str:
+    """One line of at most ``PROBLEM_MESSAGE_MAX`` characters, secrets masked *before* cutting
+    (a key cut at the boundary would otherwise leak its start)."""
+    text = " ".join(redact(text, secrets).split())
+    return text if len(text) <= PROBLEM_MESSAGE_MAX else text[: PROBLEM_MESSAGE_MAX - 1].rstrip() + "…"
+
+
+def _problem_text(exc: Any, secrets: Sequence[str] = ()) -> str:
     text = str(exc).split(" — ")[0].strip() or type(exc).__name__  # drop the long hint ApiError adds
     if isinstance(exc, BaseException) and not isinstance(exc, SuperMarketError):
         text = f"{type(exc).__name__}: {text}"
-    text = " ".join(text.split())
-    return text if len(text) <= PROBLEM_MESSAGE_MAX else text[: PROBLEM_MESSAGE_MAX - 1].rstrip() + "…"
+    return _clip_message(text, secrets)
+
+
+def _storage_error(exc: BaseException) -> bool:
+    """A failure of the local database or disk (full disk, locked or broken SQLite file)."""
+    return isinstance(exc, (sqlite3.Error, OSError)) and not isinstance(exc, SuperMarketError)
 
 
 class _WorkerReadLimiter:
@@ -224,6 +256,8 @@ class Tracker:
         self.analyze_enabled = bool(analyze)
         self.max_overround_markets = max(0, int(max_overround_markets))
         self._clock = clock
+        # The client's API key: masked in every problem message before it is cut to length.
+        self._secrets: Tuple[str, ...] = tuple(s for s in getattr(client, "_secrets", ()) or () if isinstance(s, str))
         self._bot = MarketDataBot(client, context)  # snapshots keep the client's retries
         self._quick = single_attempt_client(client)  # backfill and context: one attempt per read
 
@@ -252,6 +286,11 @@ class Tracker:
         self._infos: Dict[str, ExchangeInfo] = {}  # currently open outcomes, in market order
         self._all_infos: Dict[str, ExchangeInfo] = {}  # every stored outcome (titles for old surges)
         self._rows: Dict[str, Dict[str, Any]] = {}  # latest snapshot row per exchange
+        # Outcomes the latest bulk price read did not return (missingIds: settled, closed or out
+        # of scope since the market list was read): no ticks are stored and they count as closed.
+        self._missing: Set[str] = set()
+        self._missing_listed: Set[str] = set()  # the missing set the last early market-list read was for
+        self._missing_refresh_at = float("-inf")
         self._series: Dict[str, List[PricePoint]] = {}
         self._series_loaded: Dict[str, float] = {}
         self._dirty: Set[str] = set()  # exchanges whose stored history changed under the cache
@@ -266,6 +305,11 @@ class Tracker:
         self._bf_streak: List[str] = []  # series ids of the current run of transient failures
         self._bf_pause_until = 0.0  # time.monotonic() before which the backfill queue rests
         self._bf_backoffs = 0
+        # Series that failed and are queued to be tried again: the "price history" problem stays
+        # while any is left (a success on another series does not clear it) and goes away once
+        # each one has loaded or been given up (then detection.reason explains the gap).
+        self._bf_retrying: Set[Tuple[str, str]] = set()
+        self._bf_last_error: Optional[str] = None  # why the last backfill read failed
 
         # attribution queue
         self._queue: Deque[int] = deque()
@@ -275,6 +319,10 @@ class Tracker:
         self._analyses = 0
         self._requeued = False  # stored surges without an analysis are queued on the first cycle
         self._analyzing: Optional[int] = None  # the surge the analysis worker is working on
+        # While the "news" problem is set, a surge analysed without headlines is re-analysed on a
+        # backoff (5 min doubling to 30 min) to find out whether news search works again.
+        self._news_recheck_at: Optional[float] = None
+        self._news_recheck_wait = NEWS_RECHECK_S
 
         # context
         self._context: Dict[str, Any] = {
@@ -283,7 +331,9 @@ class Tracker:
             "name": context.name,
             "currency": context.currency,
             "tournament": None,
-            "balance": None,
+            "balance": None,  # cash (the tournament's myBalance)
+            "account_value": None,  # cash + open positions at market value (like the leaderboard's value)
+            "positions_value": None,
             "initial_balance": None,
             "leaderboard": None,
             "constraints": None,
@@ -291,7 +341,8 @@ class Tracker:
             "updated_at": None,
         }
         self._context_at = float("-inf")
-        self._overround_offset = 0
+        self._overround_read: Dict[str, int] = {}  # market id -> refresh round its book was last read in
+        self._overround_round = 0
 
         # status
         self._cycles = 0
@@ -314,7 +365,7 @@ class Tracker:
             raise _Stopping()
 
     def _record_error(self, where: str, exc: Any, source: Optional[str] = None) -> None:
-        message = str(exc)
+        message = redact(str(exc), self._secrets)
         with self._lock:
             self._errors += 1
             self._recent_errors.append({"at": self._clock(), "where": where, "error": message})
@@ -322,10 +373,16 @@ class Tracker:
         if source is not None:
             self._problem(source, exc)
 
+    def _storage_failed(self, where: str, exc: BaseException) -> None:
+        """A local database/disk failure: counted and shown as the "storage" problem."""
+        self._record_error(where, f"{type(exc).__name__}: {exc}", None)
+        self._problem("storage", f"{where[:1].upper()}{where[1:]} failed: {exc} ({type(exc).__name__}). Check the free "
+                                 "disk space, and that no other bot or dashboard uses the same data folder")
+
     def _problem(self, source: str, exc: Any, severity: Optional[str] = None) -> None:
         """Record (or extend) the current failure of ``source`` for ``status()["problems"]``."""
         now = self._clock()
-        message = exc if isinstance(exc, str) else _problem_text(exc)
+        message = _clip_message(exc, self._secrets) if isinstance(exc, str) else _problem_text(exc, self._secrets)
         with self._lock:
             entry = self._problems.get(source)
             if entry is None:
@@ -351,10 +408,11 @@ class Tracker:
                 limiter.pause(_server_wait(exc) or 1.0)
 
     def _set_fatal(self, where: str, exc: BaseException) -> None:
+        message = redact(str(exc), self._secrets)
         with self._lock:
-            self._fatal_error = str(exc)
-            self._recent_errors.append({"at": self._clock(), "where": where, "error": str(exc)})
-        log.error("tracker stopped: %s failed: %s", where, exc)
+            self._fatal_error = message
+            self._recent_errors.append({"at": self._clock(), "where": where, "error": message})
+        log.error("tracker stopped: %s failed: %s", where, message)
         self._signal_stop()
 
     def _signal_stop(self) -> None:
@@ -432,13 +490,21 @@ class Tracker:
                 self._requeued = True
                 summary["queued"].extend(self._requeue_unanalyzed(now))
 
-            # 1. market list
-            if self._markets is None or now - self._markets_at >= self.market_refresh:
+            # 1. market list (early when outcomes went missing from the bulk prices: they may have settled)
+            if self._markets is None or now - self._markets_at >= self.market_refresh or self._missing_changed(now):
                 markets = self._call("market list", lambda: self._bot.list_markets(status="open"), "markets")
                 if markets is not None:
-                    self.store.upsert_markets(markets)
+                    try:
+                        self.store.upsert_markets(markets)
+                    except Exception as exc:
+                        if not _storage_error(exc):
+                            raise
+                        self._storage_failed("storing the market list", exc)
                     self._set_markets(markets, now)
                     summary["markets_refreshed"] = True
+                with self._lock:
+                    self._missing_listed = set(self._missing)
+                    self._missing_refresh_at = now
 
             # 2. snapshot
             if self._markets:
@@ -446,15 +512,30 @@ class Tracker:
                 snap = self._call("price snapshot", lambda: self._bot.snapshot(markets_now), "prices")
                 if snap is not None:
                     now = self._clock()
-                    added = self.store.add_ticks(now, snap.rows)
+                    missing = {str(eid) for eid in snap.missing_ids or []}
+                    missing |= {str(r.get("exchange_id")) for r in snap.rows if r.get("missing")}
+                    rows = [r for r in snap.rows if str(r.get("exchange_id")) not in missing]
+                    added = 0
+                    try:
+                        added = self.store.add_ticks(now, rows)
+                    except Exception as exc:
+                        if not _storage_error(exc):
+                            raise
+                        # Keep going on the in-memory snapshot: prices, surges and the view stay
+                        # live, and the banner says why history stopped growing.
+                        self._storage_failed("saving price snapshot", exc)
+                    else:
+                        self._resolve("storage")
                     with self._lock:
-                        self._rows = snap.by_exchange()
+                        self._rows = {str(r["exchange_id"]): r for r in rows if r.get("exchange_id") is not None}
+                        self._missing = missing
                         self._last_snapshot_at = now
                         self._ticks_recorded += added
                     summary["ticks"] = added
 
             # 3 + 4. analytics, surges, attribution queue
             results = self._analyze_all(now, summary)
+            self._maybe_recheck_news(now)
 
             # 5. context (inline only in synchronous use; the threaded tracker has a worker for it)
             if refresh_context and self._context_due(now):
@@ -467,13 +548,34 @@ class Tracker:
                 self._last_cycle_at = now
                 self._last_cycle_s = round(time.monotonic() - started, 4)
                 summary["errors"] = self._errors - errors_before
+            self._resolve("tracker")  # a whole cycle ran: an earlier crash is over
             self._first_cycle.set()
             summary.update(at=now, markets=len(self._markets or []), exchanges=len(self._infos))
             summary["high_band"] = sum(1 for r in results.values() if r.get("band") is not None)
             return summary
 
+    def _missing_changed(self, now: float) -> bool:
+        """Outcomes went missing from the bulk prices since the last market-list read (and that
+        read is at least ``MISSING_REFRESH_MIN_S`` old): re-read the list now, so a settled
+        market leaves the open list within a cycle instead of after ``market_refresh``."""
+        with self._lock:
+            new = bool(self._missing - self._missing_listed)
+            return new and now - self._missing_refresh_at >= MISSING_REFRESH_MIN_S
+
+    def _open_ids(self) -> Set[str]:
+        """Outcomes that count as open: on the market list and quoted by the latest bulk read."""
+        with self._lock:
+            return set(self._infos) - self._missing
+
     def _set_markets(self, markets: List[Dict[str, Any]], now: float) -> None:
-        all_infos = {info.exchange_id: info for info in self.store.exchanges()}
+        try:
+            stored = self.store.exchanges()
+        except Exception as exc:
+            if not _storage_error(exc):
+                raise
+            self._storage_failed("reading the stored outcomes", exc)
+            stored = []
+        all_infos = {info.exchange_id: info for info in stored}
         infos: Dict[str, ExchangeInfo] = {}
         for market in markets:
             for ex in market.get("exchanges") or []:
@@ -526,9 +628,12 @@ class Tracker:
     def _analyze_all(self, now: float, summary: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
         with self._lock:
             infos = dict(self._infos)
+        with self._lock:
+            missing = set(self._missing)
         results: Dict[str, Dict[str, Any]] = {}
         failed: List[str] = []
         first_error: Optional[BaseException] = None
+        storage_error: Optional[BaseException] = None
         states: Dict[str, int] = {"ready": 0, "pending": 0, "unavailable": 0}
         for eid, info in infos.items():
             result: Dict[str, Any] = {"last": None, "band": None, "changes": {}, "sparkline": []}
@@ -538,28 +643,44 @@ class Tracker:
                 result["last"] = points[-1] if points else None
                 state = self._history_state(eid, now)
                 states[state] += 1
-                self._analyze_exchange(eid, info, points, now, result, summary, state)
+                self._analyze_exchange(eid, info, points, now, result, summary, state, quoted=eid not in missing)
             except Exception as exc:  # one broken series must not stop the others
+                if _storage_error(exc):
+                    storage_error = storage_error or exc
+                    continue
                 failed.append(eid)
                 first_error = first_error or exc
+        if storage_error is not None:
+            self._storage_failed("recording surges", storage_error)
         if failed:
             log.debug("analytics failure detail", exc_info=first_error)
             self._record_error("analytics", f"{len(failed)} outcome(s), e.g. {failed[0]}: {first_error!r}", "analytics")
         else:
             self._resolve("analytics")
         self._set_detection(len(infos), states)
-        self._update_open_surges(now, results)
+        try:
+            self._update_open_surges(now, results)
+        except Exception as exc:
+            if not _storage_error(exc):
+                raise
+            self._storage_failed("updating surge status", exc)
         return results
 
     def _analyze_exchange(
         self, eid: str, info: ExchangeInfo, points: List[PricePoint], now: float,
-        result: Dict[str, Any], summary: Dict[str, Any], state: str = "ready",
+        result: Dict[str, Any], summary: Dict[str, Any], state: str = "ready", quoted: bool = True,
     ) -> None:
         recent = [p for p in points if p.ts >= now - SPARKLINE_WINDOW_S and p.ts <= now and p.price is not None]
         spark = analytics.downsample_by_time(recent, SPARKLINE_POINTS, now - SPARKLINE_WINDOW_S, now)
         result["sparkline"] = [[p.ts, p.price] for p in spark]
         result["changes"] = {name: analytics.change_over(points, now, secs) for name, secs in CHANGE_WINDOWS}
-        result["band"] = analytics.high_band(points, now, eid, info.market_id, settlement_date=info.settlement_date)
+        if not quoted:
+            # Missing from the bulk prices (settled, closed or out of scope): no fresh mark, so no
+            # high band (no carry idea) and no new surges on its last stored price.
+            return
+        # A band needs a current mark (an 8-hour-old price after a restart is not "in the band now").
+        result["band"] = analytics.high_band(points, now, eid, info.market_id, settlement_date=info.settlement_date,
+                                             max_staleness_s=BAND_MAX_STALENESS_S)
         if state == "pending":
             # Detecting on partial history mis-sizes the window (e.g. a 20-minute spike read as a
             # 24h move); wait, briefly, for this outcome's candle backfill (see _history_state).
@@ -624,8 +745,14 @@ class Tracker:
             else:
                 with self._lock:
                     problem = self._problems.get("price history")
-                why = (f"price history is unavailable ({problem['message']})" if problem
-                       else "price history is not loaded yet")
+                    last_error = self._bf_last_error
+                    gave_up = bool(self._bf_failed)
+                if problem:
+                    why = f"price history is unavailable ({problem['message']})"
+                elif gave_up and last_error:
+                    why = f"price history could not be loaded ({last_error})"
+                else:
+                    why = "price history is not loaded yet"
             reason = (f"For {live} of {total} outcome(s) {why}: surges are detected from live prices only, so moves "
                       "from before tracking started are not seen, and the high-90s check needs 6 h of prices")
         with self._lock:
@@ -637,32 +764,65 @@ class Tracker:
             }
 
     def _record_surge(self, surge: Surge) -> Optional[Tuple[Surge, bool]]:
-        """Store a detection, unless it only re-detects a move that already reverted or held.
+        """Store a detection, unless it only re-detects a known move or is a known move's reversion.
+
+        * The detection's window reaches back over a stored move of the same direction (it
+          starts before that move's frame ended) and goes no further than its peak: the same
+          move seen again (for example a plateau seen through the 24h window hours later). An
+          open surge absorbs it, whatever its age; a reverted, held or closed one ignores it.
+        * The detection runs against a recent surge (opposite direction, starting after that
+          surge started) and stays inside its start -> peak range: it is that surge giving its
+          move back, which the surge's own status reports ("reverted"). Recording it as a new
+          surge would turn the reversion of a participant spike into a "surge" to fade.
 
         Returns ``(stored surge, created)``, or None when the detection was ignored.
         """
         recent = self.store.surges(exchange_id=surge.exchange_id, limit=10)
-        same_dir = [s for s in recent if s.direction == surge.direction]
-        if not any(s.status == SURGE_OPEN for s in same_dir):
-            for old in same_dir:
-                if surge.start_ts > old.end_ts:
-                    continue  # the window starts after the old move ended: a new move
-                if surge.direction == "down":
-                    beyond = surge.end_price < old.peak_price - _EPS
-                else:
-                    beyond = surge.end_price > old.peak_price + _EPS
-                if not beyond:
-                    return None  # the same (reverted or held) move seen again through a longer window
+        if any(self._is_reversion(surge, old) for old in recent):
+            return None
+        into: Optional[int] = None
+        for old in recent:  # newest first
+            if old.direction != surge.direction or surge.start_ts > old.end_ts + _EPS:
+                continue  # another direction, or the window starts after the old move ended: a new move
+            if surge.direction == "down":
+                beyond = surge.end_price < old.peak_price - _EPS
+            else:
+                beyond = surge.end_price > old.peak_price + _EPS
+            if old.status == SURGE_OPEN:
+                into = old.id  # the same (or a growing) move: merge into it however old it is
+                break
+            if not beyond:
+                return None  # the same (reverted, held or closed) move seen again through a longer window
         known = {s.id for s in recent}
-        stored = self.store.record_surge(surge)
+        stored = self.store.record_surge(surge, into=into)
         return stored, stored.id not in known
+
+    @staticmethod
+    def _is_reversion(surge: Surge, old: Surge) -> bool:
+        """``surge`` is ``old`` giving its move back (see :meth:`_record_surge`)."""
+        if old.direction == surge.direction or old.id is None:
+            return False
+        if surge.start_ts < old.start_ts - _EPS:
+            return False  # it started before the old move: not a reaction to it
+        if surge.start_ts > old.end_ts + max(old.window_s, 0.0) + REVERSION_LINK_S:
+            return False  # long after: a move of its own
+        if old.direction == "down":
+            within = surge.end_price <= old.start_price + _EPS and surge.end_price >= old.peak_price - _EPS
+        else:
+            within = surge.end_price >= old.start_price - _EPS and surge.end_price <= old.peak_price + _EPS
+        return within
 
     def _update_open_surges(self, now: float, results: Mapping[str, Mapping[str, Any]]) -> None:
         """Refresh every open surge's status; close the surges of markets that left the open list.
 
-        A surge whose outcome is no longer among the open markets (closed or settled) becomes
-        ``closed``: its last price is stale, so it no longer counts as open and gets no trade
-        ideas. If the market shows up in the open list again, its closed surges reopen.
+        A surge whose outcome is no longer open (it left the open-market list, or the bulk price
+        read stopped returning it: closed or settled) becomes ``closed`` with its last real
+        price as the final one: it no longer counts as open and gets no trade ideas. That holds
+        for reverted and held surges of the last 48 h too, so their card reads "Market closed".
+        If the market shows up again, its closed surges reopen and are re-evaluated.
+
+        Reverted and held surges of the last 48 h on open markets keep their status but follow
+        the live price: their ``current_price`` ("Now") and ``reverted_fraction`` stay current.
         """
         try:
             open_surges = self.store.surges(status=SURGE_OPEN, limit=1000)
@@ -671,22 +831,24 @@ class Tracker:
             return
         with self._lock:
             listed = self._markets is not None
-            open_ids = set(self._infos)
+        open_ids = self._open_ids()
         reopened: Set[Optional[int]] = set()
+        settled: List[Surge] = []
         if listed:
+            since = now - SURGE_VIEW_LOOKBACK_S
             try:
-                reopen = [s for s in self.store.surges(since=now - SURGE_VIEW_LOOKBACK_S, status=SURGE_CLOSED, limit=200)
-                          if s.exchange_id in open_ids]
+                closed = self.store.surges(since=since, status=SURGE_CLOSED, limit=200)
+                settled = [s for status in (SURGE_REVERTED, SURGE_HELD)
+                           for s in self.store.surges(since=since, status=status, limit=200)]
             except Exception as exc:
                 self._record_error("surge status", exc, "storage")
-                reopen = []
-            else:
-                self._resolve("storage")
-            for surge in reopen:
-                surge.status = SURGE_OPEN  # re-evaluated below like any open surge
-                surge.attribution = None
-                reopened.add(surge.id)
-                open_surges.append(surge)
+                closed, settled = [], []
+            for surge in closed:
+                if surge.exchange_id in open_ids:
+                    surge.status = SURGE_OPEN  # re-evaluated below like any open surge
+                    surge.attribution = None
+                    reopened.add(surge.id)
+                    open_surges.append(surge)
         failures = 0
         for surge in open_surges:
             if listed and surge.exchange_id not in open_ids:
@@ -707,6 +869,28 @@ class Tracker:
             if (surge.status, surge.current_price, surge.reverted_fraction, surge.peak_price) != before or \
                     surge.id in reopened:
                 surge.attribution = None  # never overwrite an analysis that finished meanwhile
+                self.store.update_surge(surge)
+        for surge in settled:
+            if surge.exchange_id not in open_ids:
+                surge.status = SURGE_CLOSED  # the market closed or settled after the move resolved
+                surge.attribution = None
+                self.store.update_surge(surge)
+                continue
+            last = (results.get(surge.exchange_id) or {}).get("last")
+            if last is None or last.price is None:
+                continue
+            status = surge.status
+            before = (surge.current_price, surge.reverted_fraction)
+            try:
+                analytics.update_surge_status(surge, last.price, now)
+            except Exception as exc:
+                failures += 1
+                if failures == 1:
+                    self._record_error("surge status", repr(exc))
+                continue
+            surge.status = status  # reverted and held are final: only the live numbers move
+            if (surge.current_price, surge.reverted_fraction) != before:
+                surge.attribution = None
                 self.store.update_surge(surge)
 
     # ------------------------------------------------------------------ attribution queue
@@ -830,8 +1014,11 @@ class Tracker:
             if news_status == NEWS_UNAVAILABLE:
                 failed = next((r for r in attribution.reasons if r.startswith("News search failed")), "News search failed")
                 self._problem("news", failed.split(": missing headlines")[0])
+                with self._lock:
+                    if self._news_recheck_at is None:
+                        self._news_recheck_at = self._clock() + self._news_recheck_wait
             elif news_status == NEWS_OK:
-                self._resolve("news")
+                self._news_recovered(sid)
             self.store.set_attribution(sid, attribution)
             with self._lock:
                 self._analyzed_change[sid] = abs(surge.change)
@@ -845,6 +1032,67 @@ class Tracker:
             self.store.set_state(ANALYZED_STATE_KEY, remembered)
             done += 1
         return done
+
+    def _queue_back(self, ids: Sequence[int]) -> List[int]:
+        """Queue surges for (re-)analysis behind the ones already waiting. Returns those queued."""
+        queued: List[int] = []
+        with self._lock:
+            for sid in ids:
+                if sid in self._queued or sid == self._analyzing:
+                    continue
+                self._queue.append(sid)
+                self._queued.add(sid)
+                queued.append(sid)
+                self._patch_view_pending(sid, True)
+        if queued:
+            self._analysis_wake.set()
+        return queued
+
+    def _news_less(self, now: float) -> List[int]:
+        """Ids of recent surges (newest first) whose analysis ran while news search was down."""
+        try:
+            recent = self.store.surges(since=now - SURGE_VIEW_LOOKBACK_S, limit=SURGE_VIEW_LIMIT)
+        except Exception as exc:
+            self._record_error("surge list", exc, "storage")
+            return []
+        return [int(s.id) for s in recent
+                if s.id is not None and s.attribution is not None and s.attribution.news_status == NEWS_UNAVAILABLE]
+
+    def _maybe_recheck_news(self, now: float) -> None:
+        """While news search is reported failing, re-analyse one surge that was analysed without
+        headlines, on a backoff (5 min, doubling to 30 min): its news search tells whether the
+        outage is over (then the problem clears and the other such surges are re-analysed), and
+        every failed retry updates the problem's "last failed" time and count."""
+        if not self.analyze_enabled or self.attributor is None:
+            return
+        with self._lock:
+            due = "news" in self._problems and self._news_recheck_at is not None and now >= self._news_recheck_at
+        if not due:
+            return
+        candidates = self._news_less(now)
+        with self._lock:
+            self._news_recheck_wait = min(NEWS_RECHECK_MAX_S, self._news_recheck_wait * 2)
+            self._news_recheck_at = now + self._news_recheck_wait
+        if not candidates:
+            # Nothing left that was analysed without news (re-analysed meanwhile, or older than 48 h):
+            # there is no current evidence of an outage.
+            self._news_recovered(None)
+            return
+        if self._queue_back(candidates[:1]):
+            log.info("tracker: news search failed earlier; re-checking it with surge %s", candidates[0])
+
+    def _news_recovered(self, sid: Optional[int]) -> None:
+        """News search works (again): clear the problem, stop re-checking and re-analyse the recent
+        surges whose verdict was made without headlines."""
+        with self._lock:
+            was_down = "news" in self._problems
+            self._news_recheck_at = None
+            self._news_recheck_wait = NEWS_RECHECK_S
+        self._resolve("news")
+        if was_down and sid is not None:
+            others = [i for i in self._news_less(self._clock()) if i != sid]
+            if others:
+                self._queue_back(others)
 
     def _patch_view_attribution(self, sid: int, attribution: Dict[str, Any]) -> None:
         """Show a finished analysis right away instead of at the next cycle (caller holds the lock)."""
@@ -910,6 +1158,7 @@ class Tracker:
                     if eid in self._infos:
                         return eid, res, limit
                     self._bf_done.add((eid, res))  # market closed meanwhile: nothing to chart
+                    self._bf_retrying.discard((eid, res))
         return None
 
     def backfill_step(self, max_reads: int = 1) -> int:
@@ -931,6 +1180,7 @@ class Tracker:
                 break
             task = self._next_backfill()
             if task is None:
+                self._update_history_problem()  # nothing left to retry: no live problem
                 break
             eid, res, limit = task
             try:
@@ -945,21 +1195,50 @@ class Tracker:
                     eid, tournament_id=self.context.tournament_id, resolution=res, limit=limit
                 )
             except SuperMarketError as exc:
-                self._api_error(f"backfill {res} for exchange {eid}", exc, "price history")
+                self._api_error(f"backfill {res} for exchange {eid}", exc)
                 self._backfill_failed(eid, res, exc)
                 continue
             candles = resp.get("candles") if isinstance(resp, Mapping) else None
-            written = self.store.add_candles(eid, res, candles or [])
-            self.store.set_state(_backfill_key(eid, res), {"at": self._clock(), "candles": written})
+            try:
+                written = self.store.add_candles(eid, res, candles or [])
+                self.store.set_state(_backfill_key(eid, res), {"at": self._clock(), "candles": written})
+            except Exception as exc:
+                if not _storage_error(exc):
+                    raise
+                self._storage_failed("saving price history", exc)
+                with self._lock:
+                    self._bf_queues[res].append(eid)  # the read worked: try it again later
+                continue
             with self._lock:
                 self._bf_done.add((eid, res))
+                self._bf_retrying.discard((eid, res))
                 self._bf_streak = []
                 self._bf_backoffs = 0
                 self._bf_pause_until = 0.0
                 if written:
                     self._dirty.add(eid)
-            self._resolve("price history")
+            self._update_history_problem()
         return reads
+
+    def _update_history_problem(self, exc: Optional[BaseException] = None) -> None:
+        """Keep the "price history" problem while a failed series is queued to be retried.
+
+        A failure (``exc``) records or extends it, counting every failed read; a success on
+        another series does not clear it. It goes away once every failed series has loaded or
+        been given up: nothing is retrying then, and ``detection.reason`` says which outcomes
+        are watched from live prices only and why.
+        """
+        if exc is not None:
+            with self._lock:
+                self._bf_last_error = _problem_text(exc, self._secrets)
+                retrying = bool(self._bf_retrying)
+            if retrying:
+                self._problem("price history", exc)
+                return
+        with self._lock:
+            retrying = bool(self._bf_retrying)
+        if not retrying:
+            self._resolve("price history")
 
     def _backfill_resting(self) -> bool:
         with self._lock:
@@ -974,19 +1253,27 @@ class Tracker:
     def _backfill_failed(self, eid: str, res: str, exc: SuperMarketError) -> None:
         key = (eid, res)
         wait = _server_wait(exc)
-        with self._lock:
-            if isinstance(exc, ApiError) and exc.status == 429:
+        if isinstance(exc, ApiError) and exc.status == 429:
+            with self._lock:
                 # The account budget, not this series: try it again first, after the wait.
                 self._bf_queues[res].appendleft(eid)
+                self._bf_retrying.add(key)
                 self._bf_pause_until = max(self._bf_pause_until, time.monotonic() + (wait or 1.0))
-                return
+            self._update_history_problem(exc)
+            return
+        transient = _transient(exc)
+        with self._lock:
             attempts = self._bf_attempts.get(key, 0) + 1
             self._bf_attempts[key] = attempts
-            transient = _transient(exc)
             if transient and attempts < BACKFILL_MAX_ATTEMPTS:
                 self._bf_queues[res].append(eid)  # try again after the rest of the queue
+                self._bf_retrying.add(key)
             else:
                 self._bf_failed.add(key)
+                self._bf_retrying.discard(key)
+        self._update_history_problem(exc)
+        rest = 0.0
+        with self._lock:
             if not transient:
                 self._bf_streak = []  # the server answered: price history itself is up
                 return
@@ -998,7 +1285,8 @@ class Tracker:
                 self._bf_streak = self._bf_streak[-BACKFILL_FAIL_STREAK:]
             if rest > 0:
                 self._bf_pause_until = max(self._bf_pause_until, time.monotonic() + rest)
-                log.info("tracker: price history failing (%s); backfill rests %.0fs", _problem_text(exc), rest)
+        if rest > 0:
+            log.info("tracker: price history failing (%s); backfill rests %.0fs", _problem_text(exc, self._secrets), rest)
 
     # ------------------------------------------------------------------ context
 
@@ -1043,14 +1331,27 @@ class Tracker:
                         updates["balance"] = balance
                     if start is not None:
                         updates["initial_balance"] = initial = start
+                    updates.update(self._account_value(slug, balance))
                 board = self._call("leaderboard", lambda: quick.get_tournament_leaderboard(slug, limit=3), "leaderboard")
                 if isinstance(board, Mapping):
                     updates["leaderboard"] = self._leaderboard(board, initial)
 
+            book_failures: List[str] = []
+            book_reads = 0
             if self.max_overround_markets:
-                rows = self._overround_rows()
+                rows, reads, failed = self._overround_rows(now)
+                book_reads += reads
+                book_failures += failed
                 if rows is not None:
                     updates["overround"] = rows
+            reads, failed = self._refresh_idea_books(now, updates.get("constraints"))
+            book_reads += reads
+            book_failures += failed
+            if book_failures:
+                self._problem("order books", f"{len(book_failures)} of {book_reads} order book read(s) failed: "
+                                             f"{book_failures[-1]}")
+            elif book_reads:
+                self._resolve("order books")
             complete = True
         finally:
             with self._lock:
@@ -1058,6 +1359,113 @@ class Tracker:
                 if complete:
                     self._context["updated_at"] = now
                     self._context_at = now
+
+    def _account_value(self, slug: str, cash: Optional[float]) -> Dict[str, Any]:
+        """``account_value`` (cash + open positions at market value) and ``positions_value``.
+
+        ``myBalance`` is cash only, while the leaderboard's value (initial + P&L) counts
+        positions too: comparing the two would call a player with money in positions "far
+        behind". Read from ``GET /tournaments/{slug}/portfolio/pnl`` (``totalAccountValue``);
+        a failed read (e.g. ``409`` while a holding has no valuation price) leaves both None,
+        and the strategy then says it compared cash. Not a banner problem: it is optional.
+        """
+        pnl = self._call("portfolio value", lambda: self._quick.get_tournament_pnl(slug, period="all"))
+        if not isinstance(pnl, Mapping):
+            return {}
+        total, holdings = _num(pnl.get("totalAccountValue")), _num(pnl.get("totalHoldingsValue"))
+        if total is None and holdings is not None and cash is not None:
+            total = round(cash + holdings, 6)
+        if holdings is None and total is not None and cash is not None:
+            holdings = round(total - cash, 6)
+        out: Dict[str, Any] = {}
+        if total is not None:
+            out["account_value"] = total
+        if holdings is not None:
+            out["positions_value"] = holdings
+        return out
+
+    def _save_book(self, eid: str, payload: Any, now: float, market_id: Optional[str] = None) -> bool:
+        """Store one exchange's order book (``books.Book`` or an API book dict) for idea sizing."""
+        from .books import Book
+
+        try:
+            book = payload if isinstance(payload, Book) else Book.from_payload(payload, market_id=market_id)
+            self.store.put_book(eid, now, book.bids, book.asks)
+        except Exception as exc:
+            if not _storage_error(exc):
+                log.debug("could not keep the order book of %s", eid, exc_info=True)
+                return False
+            self._storage_failed("saving an order book", exc)
+            return False
+        return True
+
+    def _idea_candidates(self, constraints: Any) -> List[str]:
+        """Outcomes a trade idea may size right now, most important first: the legs of
+        engine-reported violations, open participant-driven surges (fades) and stable high
+        bands (carry). Their books are read so the strategy caps sizes by real depth."""
+        open_ids = self._open_ids()
+        out: List[str] = []
+        data = constraints.get("data") if isinstance(constraints, Mapping) else None
+        if data is None:
+            with self._lock:
+                held = self._context.get("constraints")
+            data = held.get("data") if isinstance(held, Mapping) else None
+        for violation in data or []:
+            if not isinstance(violation, Mapping):
+                continue
+            for trade in violation.get("suggestedCorrectiveTrades") or []:
+                if isinstance(trade, Mapping) and trade.get("exchangeId") is not None:
+                    out.append(str(trade["exchangeId"]))
+        try:
+            surges = self.store.surges(status=SURGE_OPEN, limit=200)
+        except Exception:
+            surges = []
+        for surge in surges:
+            att = surge.attribution
+            if att is not None and att.verdict == VERDICT_PARTICIPANTS:
+                out.append(str(surge.exchange_id))
+        with self._lock:
+            view = self._view or {}
+            bands = [dict(b) for b in view.get("high_band") or [] if isinstance(b, Mapping)]
+            spreads = {str(r.get("exchange_id")): _num(r.get("spread")) for r in view.get("exchanges") or []
+                       if isinstance(r, Mapping)}
+
+        def carry_edge(band: Mapping[str, Any]) -> float:
+            # the carry rule's edge at the ask: min(0.01, 0.2 x room) less half the spread
+            fav = _num(band.get("favorite_price")) or 1.0
+            spread = spreads.get(str(band.get("exchange_id"))) or 0.0
+            return min(0.01, 0.2 * (1.0 - fav)) - spread / 2
+
+        stable = [b for b in bands if b.get("stable") and b.get("exchange_id") is not None]
+        for band in sorted(stable, key=carry_edge, reverse=True):  # the ideas most likely to rank first
+            out.append(str(band["exchange_id"]))
+        return [eid for eid in dict.fromkeys(out) if eid in open_ids]
+
+    def _refresh_idea_books(self, now: float, constraints: Any) -> Tuple[int, List[str]]:
+        """Read the 20-level books of up to ``IDEA_BOOKS_PER_REFRESH`` idea candidates (skipping
+        books stored less than half a refresh ago). Returns (reads, failure messages)."""
+        tid = self.context.tournament_id
+        reads = 0
+        failures: List[str] = []
+        for eid in self._idea_candidates(constraints):
+            if reads >= IDEA_BOOKS_PER_REFRESH:
+                break
+            try:
+                held = self.store.book(eid)
+            except Exception:
+                held = None
+            if held is not None and now - held["at"] < min(IDEA_BOOK_MAX_AGE_S, 0.5 * self.context_refresh):
+                continue
+            reads += 1
+            try:
+                payload = self._quick.get_exchange_orderbook(eid, depth=IDEA_BOOK_DEPTH, tournament_id=tid)
+            except SuperMarketError as exc:
+                self._api_error(f"order book for exchange {eid}", exc)
+                failures.append(_problem_text(exc, self._secrets))
+                continue
+            if isinstance(payload, Mapping):
+                self._save_book(eid, payload, now)
+        return reads, failures
 
     @staticmethod
     def _leaderboard(board: Mapping[str, Any], initial: Optional[float]) -> Dict[str, Any]:
@@ -1083,49 +1491,62 @@ class Tracker:
             "value_assumption": "value = initialBalance + pnl (the leaderboard reports PnL only)",
         }
 
-    def _overround_rows(self) -> Optional[List[Dict[str, Any]]]:
-        """Up to ``max_overround_markets`` multi-outcome books per refresh, rotating through all."""
+    def _overround_rows(self, now: Optional[float] = None) -> Tuple[Optional[List[Dict[str, Any]]], int, List[str]]:
+        """Up to ``max_overround_markets`` multi-outcome books per refresh: the markets flagged
+        for arbitrage last time first (their ideas need fresh numbers), then the rest in
+        rotation. Each read takes 20 levels per outcome and keeps every outcome's book for
+        idea sizing. Returns (rows, reads, failure messages); rows is None before the market
+        list is known."""
         multi = [m for m in self._markets or [] if m.get("isMultiOutcome") and m.get("id") is not None]
         if not multi:
-            return [] if self._markets is not None else None
+            return ([] if self._markets is not None else None), 0, []
         tid = self.context.tournament_id
+        stamp = self._clock() if now is None else now
         with self._lock:
             previous = {r["market_id"]: r for r in self._context.get("overround") or []}
-            start = self._overround_offset % len(multi)
-            self._overround_offset = start + self.max_overround_markets
-        batch = (multi[start:] + multi[:start])[: self.max_overround_markets]
+            flagged = [m for m in multi if (previous.get(str(m["id"])) or {}).get("arbitrage")][: self.max_overround_markets]
+            rest = [m for m in multi if m not in flagged]
+            take = max(0, self.max_overround_markets - len(flagged))
+            # the rest take turns: never read first, then the longest ago (market order breaks ties)
+            order = {str(m["id"]): i for i, m in enumerate(multi)}
+            rest.sort(key=lambda m: (self._overround_read.get(str(m["id"]), float("-inf")), order[str(m["id"])]))
+        batch = flagged + rest[:take]
+        with self._lock:
+            self._overround_round += 1
+            for m in batch:
+                self._overround_read[str(m["id"])] = self._overround_round
         fetched: Dict[str, Dict[str, Any]] = {}
-        failures = 0
+        failures: List[str] = []
         for market in batch:
             mid = str(market["id"])
-            resp = self._call(
-                f"orderbook for market {mid}",
-                lambda mid=mid: self._quick.get_market_orderbook(mid, tournament_id=tid, depth=1),
-            )
-            if not isinstance(resp, Mapping):
-                failures += 1
+            try:
+                resp = self._quick.get_market_orderbook(mid, tournament_id=tid, depth=IDEA_BOOK_DEPTH)
+            except SuperMarketError as exc:
+                self._api_error(f"orderbook for market {mid}", exc)
+                failures.append(_problem_text(exc, self._secrets))
                 continue
-            _, ob = books_from_market_orderbook(resp, tid)
+            if not isinstance(resp, Mapping):
+                failures.append("unreadable response")
+                continue
+            books, ob = books_from_market_orderbook(resp, tid, market_id=mid)
+            for book in books:
+                if book.exchange_id and book.exchange_id != "None":
+                    self._save_book(book.exchange_id, book, stamp)
             fetched[mid] = {
                 "market_id": mid,
                 "title": market.get("title"),
                 "overround": _num(ob.get("overround")),
                 "arbitrage": bool(ob.get("hasArbitrageOpportunity")),
                 "outcomes": len(ob.get("exchanges") or []),
+                "at": stamp,
             }
-        if failures:
-            with self._lock:
-                last = self._recent_errors[-1]["error"] if self._recent_errors else "read failed"
-            self._problem("order books", f"{failures} of {len(batch)} market order book read(s) failed: {_problem_text(last)}")
-        else:
-            self._resolve("order books")
         rows = []
         for market in multi:
             mid = str(market["id"])
             row = fetched.get(mid) or previous.get(mid)
             if row is not None:
                 rows.append(row)
-        return rows
+        return rows, len(batch), failures
 
     # ------------------------------------------------------------------ view
 
@@ -1160,6 +1581,7 @@ class Tracker:
 
         exchanges: List[Dict[str, Any]] = []
         bands: List[Dict[str, Any]] = []
+        stale_after = max(3 * self.interval, 60.0)
         for eid, info in infos.items():
             result = results.get(eid) or {}
             last_point: Optional[PricePoint] = result.get("last")
@@ -1177,6 +1599,9 @@ class Tracker:
             band = result.get("band")
             band_dict = band.to_dict() if band is not None else None
             changes = result.get("changes") or {}
+            updated_at = last_point.ts if last_point is not None else None
+            if snap is not None and self._last_snapshot_at is not None:
+                updated_at = max(updated_at or 0.0, self._last_snapshot_at)
             row = {
                 "exchange_id": eid,
                 "market_id": info.market_id,
@@ -1194,7 +1619,10 @@ class Tracker:
                 "sparkline": result.get("sparkline") or [],
                 "high_band": band_dict,
                 "surge_id": open_by_exchange.get(eid),
-                "updated_at": last_point.ts if last_point is not None else None,
+                "updated_at": updated_at,
+                # The shown price is not from a recent snapshot (e.g. stored by an earlier run
+                # before a restart, or the bulk price read stopped returning this outcome).
+                "stale": updated_at is None or now - updated_at > stale_after,
             }
             exchanges.append(row)
             if band_dict is not None:
@@ -1345,8 +1773,7 @@ class Tracker:
                 if self._stop.is_set():
                     break  # fatal: already recorded in status
             except Exception as exc:  # a bug in one cycle should not end tracking
-                log.exception("tracker cycle failed")
-                self._record_error("cycle", repr(exc))
+                self._cycle_failed("cycle", exc, label="tracker cycle")
             next_at += self.interval
             now = time.monotonic()
             if next_at <= now:  # fell behind: skip the missed slots instead of bursting
@@ -1354,10 +1781,29 @@ class Tracker:
             if self._stop.wait(next_at - now):
                 break
 
+    def _cycle_failed(self, where: str, exc: BaseException, source: str = "tracker", label: Optional[str] = None) -> None:
+        """An unexpected exception ended a cycle or a worker step: count it and show it.
+
+        A database or disk failure is the "storage" problem; anything else is reported under
+        ``source`` ("tracker" for the snapshot loop, "<name> worker" for a worker), so the banner
+        explains why data stopped updating. The loop and the workers retry on their own; the
+        next step that completes clears the problem.
+        """
+        if _storage_error(exc):
+            log.debug("%s failed on storage", where, exc_info=True)
+            self._storage_failed(where, exc)
+            return
+        log.exception("%s failed", label or where)
+        self._record_error(where, repr(exc))
+        self._problem(source, f"The {label or where} failed ({type(exc).__name__}: {exc}); it is retried automatically",
+                      severity="error")
+
     def _worker(self, step: Callable[[int], int], wake: threading.Event, name: str) -> None:
+        source = f"{name} worker"
         while not self._stop.is_set():
             try:
                 worked = step(1)
+                self._resolve(source)
             except _Stopping:
                 break
             except SuperMarketError:
@@ -1365,8 +1811,7 @@ class Tracker:
                     break
                 worked = 0
             except Exception as exc:
-                log.exception("tracker %s worker failed", name)
-                self._record_error(f"{name} worker", repr(exc))
+                self._cycle_failed(f"{name} worker", exc, source)
                 worked = 0
             if not worked and wake.wait(WORKER_IDLE_S):
                 wake.clear()
@@ -1384,14 +1829,14 @@ class Tracker:
                 now = self._clock()
                 if self._context_due(now):
                     self._refresh_context(now)
+                    self._resolve("context worker")
             except _Stopping:
                 break
             except SuperMarketError:
                 if self._stop.is_set():
                     break  # fatal: already recorded in status
             except Exception as exc:
-                log.exception("tracker context refresh failed")
-                self._record_error("context worker", repr(exc))
+                self._cycle_failed("context refresh", exc, "context worker")
                 with self._lock:
                     self._context_at = self._clock()  # do not spin on a bug: try again next period
             if self._stop.wait(min(WORKER_IDLE_S, max(0.05, self.context_refresh))):

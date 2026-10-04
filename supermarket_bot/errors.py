@@ -6,7 +6,10 @@ The API returns errors as ``{"error": {"code", "message", "details"?}}``. Branch
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+import logging
+import re
+import threading
+from typing import Any, Dict, Iterable, Optional, Set
 
 # Codes whose fix is on the account/key, not in the request. Retrying never helps.
 AUTH_CODES = {
@@ -84,3 +87,74 @@ class ApiError(SuperMarketError):
         if self.hint:
             text += f" — {self.hint}"
         return text
+
+
+# --------------------------------------------------------------------------- secret masking
+# The API key must never reach a log line, a status message or a JSON response. An upstream
+# error (a proxy, a misconfigured gateway) can echo the request's ``Authorization`` header, so
+# error text is masked where it is created and again on its way into the log.
+
+MIN_SECRET_LEN = 8  # shorter strings (the demo's "demo" key) would mask ordinary words
+MASK = "***"
+_SECRETS: Set[str] = set()
+_SECRETS_LOCK = threading.Lock()
+# "Bearer <token>" in any text: the token is a credential whatever it is.
+_BEARER_RE = re.compile(r"(?i)\b(bearer)(\s+)[A-Za-z0-9._~+/=-]{4,}")
+
+
+def register_secret(value: Any) -> None:
+    """Mask ``value`` in every later :func:`redact` call (and so in every package log line)."""
+    if isinstance(value, str) and len(value.strip()) >= MIN_SECRET_LEN:
+        with _SECRETS_LOCK:
+            _SECRETS.add(value.strip())
+
+
+def redact(text: Any, secrets: Iterable[Any] = ()) -> str:
+    """``text`` with every registered secret, every one of ``secrets`` and any ``Bearer <token>``
+    replaced by ``***``. Mask before truncating: a key cut at the boundary would leak its start."""
+    out = text if isinstance(text, str) else str(text)
+    with _SECRETS_LOCK:
+        known = set(_SECRETS)
+    known.update(s.strip() for s in secrets if isinstance(s, str) and len(s.strip()) >= MIN_SECRET_LEN)
+    for secret in sorted(known, key=len, reverse=True):
+        if secret in out:
+            out = out.replace(secret, MASK)
+    return _BEARER_RE.sub(lambda m: m.group(1) + m.group(2) + MASK, out)
+
+
+def redact_json(value: Any, secrets: Iterable[Any] = ()) -> Any:
+    """:func:`redact` applied to every string in a JSON-shaped value (dict keys included)."""
+    secrets = list(secrets)
+    if isinstance(value, str):
+        return redact(value, secrets)
+    if isinstance(value, dict):
+        return {redact_json(k, secrets): redact_json(v, secrets) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [redact_json(v, secrets) for v in value]
+    return value
+
+
+class RedactingFilter(logging.Filter):
+    """A logging filter that masks secrets in the formatted message (see :func:`redact`)."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            message = record.getMessage()
+        except Exception:  # a broken format string: let logging report it as usual
+            return True
+        clean = redact(message)
+        if clean != message:
+            record.msg, record.args = clean, ()
+        return True
+
+
+def install_log_redaction(*loggers: logging.Logger) -> None:
+    """Add a :class:`RedactingFilter` to the package logger, the given loggers and every handler
+    of the root logger (records of other libraries pass through those). Idempotent."""
+    targets = [logging.getLogger("supermarket_bot"), *loggers, *logging.getLogger().handlers]
+    for target in targets:
+        if not any(isinstance(f, RedactingFilter) for f in getattr(target, "filters", [])):
+            target.addFilter(RedactingFilter())
+
+
+install_log_redaction()  # every package log line is masked, however logging is configured

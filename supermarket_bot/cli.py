@@ -20,7 +20,7 @@ from .bot import Context, MarketDataBot, market_rows, price_table, resolve_conte
 from .client import SuperMarketClient
 from .config import ConfigError, Settings, mask_key
 from .display import fmt_num, fmt_price, sparkline, table, truncate
-from .errors import ApiError, SuperMarketError
+from .errors import ApiError, SuperMarketError, install_log_redaction
 
 log = logging.getLogger("supermarket_bot")
 
@@ -577,6 +577,9 @@ def _tree_lines(node: Dict[str, Any], depth: int = 0) -> List[str]:
 def configure_logging(verbosity: int) -> None:
     level = logging.WARNING if verbosity <= 0 else logging.INFO if verbosity == 1 else logging.DEBUG
     logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(name)s: %(message)s", stream=sys.stderr)
+    # Mask the API key (registered by every client) in every line any handler prints, including
+    # other libraries' records: an upstream error can echo the Authorization header.
+    install_log_redaction()
     if verbosity < 2:
         for noisy in ("httpx", "httpcore"):
             logging.getLogger(noisy).setLevel(logging.WARNING)

@@ -705,7 +705,9 @@ def test_snapshot_requests_bulk_prices_and_joins_rows(fake, client) -> None:
     assert by["38"]["option"] == "YES" and by["38"]["market_id"] == "27"
 
 
-def test_snapshot_missing_quote_falls_back_to_market_price(fake, client, caplog) -> None:
+def test_r2_live_api_1_missing_quote_has_no_price(fake, client, caplog) -> None:
+    """An outcome missing from the bulk prices (settled, closed, out of scope) gets no price: the
+    market list's latestPrice can be minutes old, and a stale price must not pass for a fresh one."""
     fake.add("GET", MARKETS_PATH, market_page(two_markets()))
     fake.add(
         "GET",
@@ -715,10 +717,11 @@ def test_snapshot_missing_quote_falls_back_to_market_price(fake, client, caplog)
     snap = MarketDataBot(client, tournament_ctx()).snapshot()
     assert snap.missing_ids == ["37"]
     row = snap.by_exchange()["37"]
-    assert row["latest_price"] == 0.60  # market listing's latestPrice
+    assert row["latest_price"] is None and row["missing"] is True  # not the listing's 0.60
     assert row["best_bid"] is None and row["best_ask"] is None
     assert row["spread"] is None and row["mid"] is None
     assert row["option"] == "B"
+    assert "missing" not in snap.by_exchange()["36"]
     # a quote that exists with a null latestPrice is authoritative: no fallback
     row38 = snap.by_exchange()["38"]
     assert row38["latest_price"] is None and row38["best_ask"] == 0.30 and row38["mid"] is None
@@ -779,7 +782,7 @@ def test_build_rows_stamp_and_label() -> None:
     rows = build_rows([market("26", "T", [("36", "YES", 0.5)])], [], Context.public(), taken)
     assert rows[0]["taken_at"] == "2026-10-03T12:30:15.123Z"
     assert rows[0]["tournament"] == "public"
-    assert rows[0]["latest_price"] == 0.5 and rows[0]["best_bid"] is None
+    assert rows[0]["latest_price"] is None and rows[0]["best_bid"] is None and rows[0]["missing"] is True
 
 
 def test_diff_first_snapshot_and_unchanged_yield_no_changes() -> None:

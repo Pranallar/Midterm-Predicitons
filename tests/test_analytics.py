@@ -511,20 +511,23 @@ class TestHighBand:
         assert b is not None and b.side == "NO" and b.favorite_price == pytest.approx(0.95)
 
     def test_time_in_band_is_time_weighted(self) -> None:
+        # sparse points carried until the next one (max_gap_s=None), as candle closes would be
         mostly = [P(NOW - 6 * H, 0.90), P(NOW - 5 * H, 0.97)]  # 5 of 6 hours in band
-        b = high_band(mostly, NOW, "e1", "m1")
+        b = high_band(mostly, NOW, "e1", "m1", max_gap_s=None)
         assert b is not None and b.time_in_band == pytest.approx(5 / 6, abs=1e-4)
         assert b.mean == pytest.approx((0.90 + 5 * 0.97) / 6)
         too_little = [P(NOW - 6 * H, 0.90), P(NOW - 4.5 * H, 0.97)]  # 75%
-        assert high_band(too_little, NOW, "e1", "m1") is None
-        assert high_band(too_little, NOW, "e1", "m1", min_fraction=0.7) is not None
+        assert high_band(too_little, NOW, "e1", "m1", max_gap_s=None) is None
+        assert high_band(too_little, NOW, "e1", "m1", min_fraction=0.7, max_gap_s=None) is not None
+        candles = [P(NOW - 6 * H, 0.90, "candle"), P(NOW - 5 * H, 0.97, "candle"), P(NOW, 0.97)]
+        assert high_band(candles, NOW, "e1", "m1").time_in_band == pytest.approx(5 / 6, abs=1e-4)  # type: ignore[union-attr]
 
     def test_stable_flag(self) -> None:
         wide = [P(NOW - 7 * H, 0.95), P(NOW - 3 * H, 0.99)]
-        b = high_band(wide, NOW, "e1", "m1")
+        b = high_band(wide, NOW, "e1", "m1", max_gap_s=None)
         assert b is not None and b.stable is False and (b.low, b.high) == (0.95, 0.99)
         edge = [P(NOW - 7 * H, 0.96), P(NOW - 3 * H, 0.99)]  # 0.99 - 0.96 == 0.030000000000000027
-        assert high_band(edge, NOW, "e1", "m1").stable is True  # type: ignore[union-attr]
+        assert high_band(edge, NOW, "e1", "m1", max_gap_s=None).stable is True  # type: ignore[union-attr]
 
     def test_current_below_threshold(self) -> None:
         pts = build(lambda t: 0.97 if t < NOW - 10 * M else 0.94, NOW - 8 * H, NOW, 60)
@@ -535,16 +538,32 @@ class TestHighBand:
         assert high_band(pts, NOW, "e1", "m1") is None
 
     def test_value_before_lookback_is_carried_in(self) -> None:
-        pts = [P(NOW - 10 * H, 0.97), P(NOW, 0.97)]
-        b = high_band(pts, NOW, "e1", "m1")
+        candle = [P(NOW - 10 * H, 0.97, "candle"), P(NOW, 0.97)]  # no trades since: the close held
+        b = high_band(candle, NOW, "e1", "m1")
         assert b is not None and b.time_in_band == 1.0
+        recent = [P(NOW - 6 * H - 600, 0.97)] + build(lambda t: 0.97, NOW - 6 * H + 300, NOW, 300)
+        assert high_band(recent, NOW, "e1", "m1").time_in_band == 1.0  # type: ignore[union-attr]
+        assert high_band([P(NOW - 10 * H, 0.97), P(NOW, 0.97)], NOW, "e1", "m1", max_gap_s=None).time_in_band == 1.0  # type: ignore[union-attr]
+
+    def test_r2_live_api_4_a_gap_without_data_counts_as_outside(self) -> None:
+        """After a restart, an 8-hour-old tick is not carried across the gap: 5 live ticks in
+        the last 25 s are not "100% of the last 6 h"."""
+        stale = [P(NOW - 8 * H, 0.975)] + [P(NOW - 25 + 5 * i, 0.975) for i in range(6)]
+        assert high_band(stale, NOW, "e1", "m1") is None
+        assert high_band(stale, NOW, "e1", "m1", min_fraction=0.0) is not None  # in band now, but only briefly
+        assert high_band(stale, NOW, "e1", "m1", min_fraction=0.0).time_in_band < 0.01  # type: ignore[union-attr]
+        # a tracking gap inside the window counts as outside too (20 min of carry at most)
+        gap = build(lambda t: 0.98, NOW - 6 * H, NOW - 3 * H, 60) + build(lambda t: 0.98, NOW - 30 * 60, NOW, 60)
+        b = high_band(gap, NOW, "e1", "m1", min_fraction=0.0)
+        assert b is not None and b.time_in_band == pytest.approx((3 * H + 1200 + 30 * 60) / (6 * H), abs=0.01)
+        assert high_band(gap, NOW, "e1", "m1") is None
 
     def test_settlement_hours_and_staleness(self) -> None:
-        pts = [P(NOW - 10 * H, 0.98), P(NOW - 2 * H, 0.98)]
+        pts = [P(NOW - 10 * H, 0.98, "candle"), P(NOW - 2 * H, 0.98, "candle"), P(NOW - 60, 0.98)]
         settle = datetime.fromtimestamp(NOW + 36 * H, tz=timezone.utc).isoformat().replace("+00:00", "Z")
         b = high_band(pts, NOW, "e1", "m1", settlement_date=settle)
         assert b is not None and b.hours_to_settlement == pytest.approx(36.0) and b.settlement_date == settle
-        assert high_band(pts, NOW, "e1", "m1", max_staleness_s=3600) is None
+        assert high_band(pts, NOW, "e1", "m1", max_staleness_s=30) is None
 
     def test_unsorted_and_empty(self) -> None:
         pts = build(lambda t: 0.97, NOW - 8 * H, NOW, 600)

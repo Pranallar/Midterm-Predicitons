@@ -738,7 +738,7 @@ class TestRound1Regressions:
         watch = next(o for o in r.opportunities if o.kind == "watch")
         assert not any("starting balance" in line for line in watch.rationale)  # nothing sized
         # everything known: no assumptions, the usual wording
-        known = build_report(**scenario())
+        known = build_report(**scenario(account_value=BAL))
         assert known.assumptions == [] and "neither defending" in known.principles[-1]
         late = build_report(**scenario(leader_value=None, my_rank=None, now=CUP_END - 5 * 86400))
         assert late.risk_mode == "aggressive" and "treated as outside the top 10" in late.assumptions[0]
@@ -750,3 +750,156 @@ class TestRound1Regressions:
         closed = [mk_surge(eid="e1", status=SURGE_CLOSED), mk_surge(eid="e3", verdict="unclear", status=SURGE_CLOSED)]
         r = build_report(**scenario(surges=closed, bands=[], constraints=None, overround_rows=()))
         assert r.opportunities == []
+
+
+# --------------------------------------------------------------------------- round 2 regressions
+
+
+def booked(bid: float, ask: float, bids: Sequence[Tuple[float, float]] = (), asks: Sequence[Tuple[float, float]] = (),
+           at: float = NOW - 60) -> PricePoint:
+    """A live quote with a stored order book (as ``TrackerStore.latest`` returns it)."""
+    point = quote(bid, ask)
+    point.book = {"at": at, "bids": [list(lv) for lv in bids], "asks": [list(lv) for lv in asks]}
+    return point
+
+
+def arizona_infos() -> Dict[str, ExchangeInfo]:
+    title = "Who will win the Arizona Governor race?"
+    return {eid: ExchangeInfo(exchange_id=eid, market_id="m-az", option=opt, market_title=title,
+                              settlement_date=iso(NOW + 30 * 86400))
+            for eid, opt in (("9011", "Democratic nominee"), ("9012", "Republican nominee"), ("9013", "Any other candidate"))}
+
+
+AZ_ROW = {"market_id": "m-az", "market_title": "Who will win the Arizona Governor race?", "outcomes": 3,
+          "overround": 0.965, "arbitrage": True}
+
+
+class TestRound2Regressions:
+    def test_r2_functional_1_fade_is_capped_by_the_side_it_takes(self) -> None:
+        """A NO buy fills against the YES bids: only bid levels whose NO cost keeps an edge count."""
+        # EV of a NO share (p 0.66, target 0.40, stop 0.22) = 0.3388: bids at 0.69/0.685/0.68 give
+        # NO at 0.31/0.315/0.32; 0.66 gives NO at 0.34, past the EV.
+        point = booked(0.69, 0.70, bids=[(0.69, 300), (0.685, 200), (0.68, 100), (0.66, 5000)], asks=[(0.70, 9000)])
+        o = fade_opportunity(mk_surge(depth=99_999), point, info(), NOW, BAL)
+        assert o is not None and o.depth_checked is True
+        assert o.suggested_shares == 600  # the asks (9,000) and the 5,000 bid past the EV do not count
+        assert o.fill_price == pytest.approx((300 * 0.31 + 200 * 0.315 + 100 * 0.32) / 600, abs=1e-6)
+        assert any("600 fill at an average" in line for line in o.rationale)
+        assert "and by book depth" in " ".join(o.rationale)
+        # per-side depth from the analysis is the fallback cap (not both sides together)
+        a = att(depth=5000)
+        a.bid_depth, a.ask_depth = 450.0, 4550.0
+        s = mk_surge()
+        s.attribution = a
+        o = fade_opportunity(s, quote(0.69, 0.70), info(), NOW, BAL)
+        assert o is not None and o.suggested_shares == 450 and o.depth_checked is False
+        assert any("Size not checked against a recent order book" in r for r in o.risks)
+        assert any("Thin book: about 450 shares rest on the side a NO buy takes" in r for r in o.risks)
+
+    def test_r2_functional_1_carry_only_takes_levels_below_fair_value(self) -> None:
+        point = booked(0.025, 0.03, bids=[(0.03, 188), (0.025, 400), (0.02, 179)], asks=[(0.035, 1000)])
+        o = carry_opportunity(band(side="NO", fav=0.97), point, info("e2"), NOW, CUP_END, BAL)
+        # NO at 0.97 (188) and 0.975 (400) vs fair value 0.9725 + 0.0055 = 0.978: 0.98 is past it
+        assert o is not None and o.entry_price == 0.975 and o.depth_checked is True
+        assert o.suggested_shares == 400 and o.fill_price == pytest.approx(0.975)
+        # a book older than 15 minutes does not size the idea
+        old = booked(0.025, 0.03, bids=[(0.025, 400)], at=NOW - 3600)
+        o = carry_opportunity(band(side="NO", fav=0.97), old, info("e2"), NOW, CUP_END, BAL)
+        assert o is not None and o.depth_checked is False and o.suggested_shares > 400
+        assert any("Size not checked against a recent order book" in r for r in o.risks)
+
+    def test_r2_functional_1_arbitrage_sets_are_capped_by_the_books(self) -> None:
+        """The demo's Arizona set: 0.515 + 0.415 + 0.040 = 0.970, but walking the asks soon costs
+        more than the 1.00 a set pays."""
+        latest = {
+            "9011": booked(0.505, 0.515, asks=[(0.515, 232), (0.53, 400), (0.56, 700)]),
+            "9012": booked(0.405, 0.415, asks=[(0.415, 218), (0.43, 500), (0.47, 600)]),
+            "9013": booked(0.03, 0.04, asks=[(0.04, 157), (0.05, 600), (0.09, 800)]),
+        }
+        [o] = arbitrage_opportunities(None, [AZ_ROW], BAL, latest=latest, infos=arizona_infos(), now=NOW)
+        assert o.depth_checked is True
+        # a further set must keep half of the 0.03 edge (cost up to 0.985): 157 sets at 0.97, 61 at 0.98
+        # (9013's next level); the next set (0.515 + 0.43 + 0.05 = 0.995) would keep less
+        assert o.suggested_shares == 157 + 61
+        assert o.fill_price == pytest.approx((157 * 0.97 + 61 * 0.98) / 218, abs=1e-6)
+        assert o.suggested_cost == pytest.approx(o.suggested_shares * 0.97, abs=0.01)
+        assert "the books' depth" in " ".join(o.rationale) and "at up to 0.985 per set" in " ".join(o.rationale)
+        # without books on every leg: the 8% cap, labelled as not depth-checked
+        bare = {eid: quote(p.bid, p.ask) for eid, p in latest.items()}
+        [o] = arbitrage_opportunities(None, [AZ_ROW], BAL, latest=bare, infos=arizona_infos(), now=NOW)
+        assert o.depth_checked is False and o.suggested_shares == math.floor(8000 / 0.97)
+        assert any("Size not checked against recent order books" in r for r in o.risks)
+
+    def test_r2_functional_1_constraint_set_is_capped_by_its_thinnest_leg(self) -> None:
+        latest = {"9016": booked(0.705, 0.715, bids=[(0.705, 231), (0.69, 2000)]),
+                  "9017": booked(0.325, 0.335, bids=[(0.325, 216), (0.30, 2000)])}
+        [o] = arbitrage_opportunities({"data": [senate_violation()]}, [], BAL, latest=latest, infos=senate_infos(),
+                                      cup_end=CUP_END, now=NOW)
+        # NO legs cost 0.295 + 0.675 = 0.97 for 216 sets (the thinnest leg); the next set would cost
+        # 0.295 + 0.70 = 0.995, keeping less than half of the 0.03 edge
+        assert o.depth_checked is True and o.suggested_shares == 216
+        assert o.fill_price == pytest.approx(0.97)
+
+    def test_r2_functional_2_book_arbitrage_set_price_is_the_sum_of_its_legs(self) -> None:
+        latest = {"9011": quote(0.505, 0.515), "9012": quote(0.405, 0.415), "9013": quote(0.03, 0.04)}
+        row = {**AZ_ROW, "overround": 0.965}  # the engine's number from the last book read
+        [o] = arbitrage_opportunities(None, [row], BAL, latest=latest, infos=arizona_infos(), now=NOW)
+        assert [leg["price"] for leg in o.legs] == [0.515, 0.415, 0.04]
+        assert o.entry_price == pytest.approx(sum(leg["price"] for leg in o.legs)) == pytest.approx(0.97)
+        assert o.edge == pytest.approx(0.03) and o.suggested_shares == math.floor(8000 / 0.97)
+        assert "sum to 0.97" in o.rationale[0]
+        # the asks moved up to 1.00 or more: no riskless profit is claimed
+        closed = {"9011": quote(0.52, 0.535), "9012": quote(0.42, 0.43), "9013": quote(0.03, 0.04)}
+        assert arbitrage_opportunities(None, [row], BAL, latest=closed, infos=arizona_infos(), now=NOW) == []
+        # a leg without a quote: fall back to the engine's overround, and say so
+        [o] = arbitrage_opportunities(None, [row], BAL, latest={"9011": quote(0.505, 0.515)}, infos=arizona_infos(), now=NOW)
+        assert o.legs == [] and o.entry_price == 0.965 and "not re-checked" in o.rationale[0]
+
+    def test_r2_functional_3_risk_mode_compares_account_values(self) -> None:
+        # 60k cash + 40k in positions = 100k: within 10% of the leader's 105k
+        assert risk_mode(60_000, 100_000, 105_000, 8, 30, account_value=100_000) == "balanced"
+        assert risk_mode(60_000, 100_000, 105_000, 8, 30) == "aggressive"  # cash only: looks far behind
+        r = build_report(**scenario(balance=60_000, account_value=100_000))
+        assert r.risk_mode == "balanced" and r.account_value == 100_000 and r.balance == 60_000
+        assert not any("Account value unknown" in a for a in r.assumptions)
+        behind = build_report(**scenario(balance=60_000, account_value=80_000))
+        assert behind.risk_mode == "aggressive"
+        assert "your account value 80,000 is more than 10% behind the leader's 105,000" in behind.principles[-1]
+        cash = build_report(**scenario(balance=60_000))
+        assert "your cash (positions not counted) 60,000" in cash.principles[-1]
+        assert any("Account value unknown" in a for a in cash.assumptions)
+        fade = next(o for o in r.opportunities if o.kind == "fade")
+        assert fade.suggested_shares == math.floor(0.08 * 60_000 / 0.31)  # sized on cash
+
+    def test_r2_functional_6_no_carry_against_an_arbitrage_leg(self) -> None:
+        """The Arizona arbitrage buys YES on 'Any other candidate'; a NO carry on it would pair
+        YES and NO at 1.01 for a payoff of exactly 1.00."""
+        infos = arizona_infos()
+        latest = {"9011": quote(0.505, 0.515), "9012": quote(0.405, 0.415), "9013": quote(0.03, 0.04)}
+        carry_band = HighBand(exchange_id="9013", market_id="m-az", side="NO", favorite_price=0.965, time_in_band=1.0,
+                              mean=0.965, low=0.96, high=0.97, lookback_s=6 * H, stable=True,
+                              settlement_date=iso(NOW + 30 * 86400))
+        args = scenario(surges=[], bands=[carry_band], latest=latest, infos=infos, constraints=None,
+                        overround_rows=[AZ_ROW])
+        r = build_report(**args)
+        assert [o.kind for o in r.opportunities] == ["arbitrage"]
+        # without the arbitrage (asks sum above 1), the NO carry stays but names the cheaper legs
+        latest = {"9011": quote(0.52, 0.53), "9012": quote(0.41, 0.42), "9013": quote(0.04, 0.055)}
+        r = build_report(**{**args, "latest": latest})
+        [carry] = [o for o in r.opportunities if o.kind == "carry"]
+        assert carry.side == "no" and carry.entry_price == 0.96
+        assert "YES on every other outcome of this market costs 0.95" in carry.risks[0]
+
+    def test_r2_fixcheck_5_the_reversion_of_a_participant_spike_is_not_faded(self) -> None:
+        spike = mk_surge(eid="e1", start=0.385, peak=0.595, detected_at=NOW - 2 * H, sid=2, status=SURGE_REVERTED)
+        spike.attribution = att(odds=0.8, conf=0.9)
+        back = mk_surge(eid="e1", start=0.595, peak=0.47, direction="down", detected_at=NOW - 600, sid=4)
+        back.attribution = att(odds=0.74, conf=0.76)
+        r = build_report(**scenario(surges=[spike, back], latest={"e1": quote(0.48, 0.49)}, bands=[], constraints=None,
+                                    overround_rows=()))
+        assert [o for o in r.opportunities if o.kind in ("fade", "watch")] == []
+        # a drop that goes below where the spike started is a move of its own
+        deeper = mk_surge(eid="e1", start=0.595, peak=0.30, direction="down", detected_at=NOW - 600, sid=5)
+        r = build_report(**scenario(surges=[spike, deeper], latest={"e1": quote(0.29, 0.30)}, bands=[], constraints=None,
+                                    overround_rows=()))
+        assert [o.surge_id for o in r.opportunities if o.kind == "fade"] == [5]

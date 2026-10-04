@@ -84,12 +84,20 @@
       </button>
     </div>
   </section>
-  <section class="banner banner-warning" id="problems-banner" aria-labelledby="problems-title" hidden>
+  <section class="banner banner-warning banner-compact" id="problems-banner" aria-labelledby="problems-title" hidden>
     <svg class="icon icon-lg" aria-hidden="true" viewBox="0 0 16 16"><path d="M8 1.5l7 13H1z"/><path d="M8 6v4M8 12v.3"/></svg>
     <div class="banner-body">
       <h2 class="banner-title" id="problems-title">Some data is unavailable</h2>
       <p class="banner-hint" id="problems-intro">The bot is still running and keeps retrying. Everything else on the page is up to date.</p>
-      <ul class="problem-list" id="problems-list"></ul>
+      <details class="problem-details" id="problems-details">
+        <summary>Details <span id="problems-count"></span></summary>
+        <ul class="problem-list" id="problems-list"></ul>
+      </details>
+    </div>
+    <div class="banner-actions banner-actions-corner">
+      <button type="button" class="btn btn-ghost btn-icon" id="problems-dismiss" aria-label="Hide this message until something else fails" title="Hide until something else fails">
+        <svg class="icon" aria-hidden="true" viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8"/></svg>
+      </button>
     </div>
   </section>
   <section class="banner banner-warning" id="view-error-banner" aria-labelledby="view-error-title" hidden>
@@ -116,7 +124,7 @@
   <section class="view" id="view-overview" data-view="overview" aria-labelledby="h-overview" hidden>
     <div class="view-errors" id="view-errors-overview" hidden></div>
     <div class="view-head">
-      <h2 id="h-overview">Overview</h2>
+      <h2 id="h-overview" tabindex="-1">Overview</h2>
       <p class="view-sub" id="overview-sub">What the bot is watching right now.</p>
     </div>
     <div class="tiles" id="tiles">
@@ -168,7 +176,7 @@
   <section class="view" id="view-markets" data-view="markets" aria-labelledby="h-markets" hidden>
     <div class="view-errors" id="view-errors-markets" hidden></div>
     <div class="view-head">
-      <h2 id="h-markets">Markets</h2>
+      <h2 id="h-markets" tabindex="-1">Markets</h2>
       <p class="view-sub" id="markets-sub">Every open outcome with its latest prices and moves.</p>
     </div>
     <div class="filter-row">
@@ -187,7 +195,8 @@
           High 90s <span class="chip-count" id="chip-count-high"></span>
         </button>
       </div>
-      <p class="result-count" id="markets-count" role="status" aria-atomic="true"></p>
+      <!-- not a live region: the search and filter result is announced once typing pauses (app.js) -->
+      <p class="result-count" id="markets-count"></p>
     </div>
     <div class="table-frame" id="markets-frame">
     <div class="table-wrap" id="markets-wrap" tabindex="0" role="region" aria-label="Markets table">
@@ -196,7 +205,7 @@
         <thead>
           <tr>
             <th scope="col" data-sort="title"><button type="button" class="sort-btn">Market<span class="sort-ind" aria-hidden="true"></span></button></th>
-            <th scope="col" data-sort="option"><button type="button" class="sort-btn">Outcome<span class="sort-ind" aria-hidden="true"></span></button></th>
+            <th scope="col" class="col-option" data-sort="option"><button type="button" class="sort-btn">Outcome<span class="sort-ind" aria-hidden="true"></span></button></th>
             <th scope="col" class="num" data-sort="last" title="Last tournament trade (— when nobody has traded yet)"><button type="button" class="sort-btn">Last<span class="sort-ind" aria-hidden="true"></span></button></th>
             <th scope="col" class="num" data-sort="bid"><button type="button" class="sort-btn">Bid<span class="sort-ind" aria-hidden="true"></span></button></th>
             <th scope="col" class="num" data-sort="ask"><button type="button" class="sort-btn">Ask<span class="sort-ind" aria-hidden="true"></span></button></th>
@@ -213,13 +222,13 @@
       </table>
     </div>
     </div>
-    <div role="status" class="empty-live"><p class="empty" id="markets-empty" hidden></p></div>
+    <p class="empty" id="markets-empty" hidden></p>
   </section>
 
   <section class="view" id="view-surges" data-view="surges" aria-labelledby="h-surges" hidden>
     <div class="view-errors" id="view-errors-surges" hidden></div>
     <div class="view-head">
-      <h2 id="h-surges">Surges</h2>
+      <h2 id="h-surges" tabindex="-1">Surges</h2>
       <p class="view-sub" id="surges-sub">Sudden price moves, newest first, with the bot's verdict on what caused them.</p>
     </div>
     <div class="legend-note" id="verdict-legend">
@@ -236,9 +245,10 @@
   <section class="view" id="view-high" data-view="high" aria-labelledby="h-high" hidden>
     <div class="view-errors" id="view-errors-high" hidden></div>
     <div class="view-head">
-      <h2 id="h-high">High 90s</h2>
+      <h2 id="h-high" tabindex="-1">High 90s</h2>
       <p class="view-sub" id="high-sub">Outcomes whose favourite side has sat at 0.95 or more. Buying the favourite pays a little if it wins, and loses the whole stake on an upset.</p>
     </div>
+    <p class="muted-note detection-note" id="high-note" hidden></p>
     <div class="table-frame" id="high-frame">
     <div class="table-wrap" id="high-wrap" tabindex="0" role="region" aria-label="High 90s table">
       <table class="data-table high-table" id="high-table">
@@ -246,14 +256,14 @@
         <thead>
           <tr>
             <th scope="col">Market</th>
-            <th scope="col">Outcome</th>
+            <th scope="col" class="col-option">Outcome</th>
             <th scope="col">Favourite</th>
             <th scope="col" class="num">Price</th>
             <th scope="col" class="num">Time in band</th>
             <th scope="col">Stable</th>
             <th scope="col">Settles</th>
             <th scope="col">Before Cup end</th>
-            <th scope="col" class="num">Payout if held to 1</th>
+            <th scope="col" class="num">Payout if held to&nbsp;1</th>
           </tr>
         </thead>
         <tbody id="high-body"></tbody>
@@ -266,7 +276,7 @@
   <section class="view" id="view-strategy" data-view="strategy" aria-labelledby="h-strategy" hidden>
     <div class="view-errors" id="view-errors-strategy" hidden></div>
     <div class="view-head">
-      <h2 id="h-strategy">Strategy</h2>
+      <h2 id="h-strategy" tabindex="-1">Strategy</h2>
       <p class="view-sub">Ranked, read-only trade ideas. Nothing is traded for you.</p>
     </div>
     <div id="strategy-body"></div>
@@ -278,7 +288,7 @@
   <p>Read-only market data from the Super Market API. Nothing on this page places, changes or cancels orders. Estimates are heuristics, not guarantees.</p>
 </footer>
 
-<dialog class="drawer" id="drawer" aria-labelledby="drawer-title">
+<dialog class="drawer" id="drawer" aria-labelledby="drawer-title" aria-describedby="drawer-sub">
   <div class="drawer-inner" id="drawer-inner">
     <header class="drawer-head">
       <div class="drawer-titles">

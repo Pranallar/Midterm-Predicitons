@@ -21,7 +21,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, TextIO
+from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Set, TextIO
 
 from .books import books_from_market_orderbook
 from .client import SuperMarketClient
@@ -179,15 +179,24 @@ def build_rows(
     context: Context,
     taken_at: datetime,
 ) -> List[Dict[str, Any]]:
-    """Join market metadata with bulk price quotes into one flat row per exchange."""
+    """Join market metadata with bulk price quotes into one flat row per exchange.
+
+    An exchange with no quote (``missingIds``: not found, not in scope, or settled since the
+    market list was read) gets a row with no prices and ``"missing": True``. It never falls
+    back to the market list's ``latestPrice``: that list can be minutes old, so a stale price
+    would be recorded as a fresh one (a market that settles right after a jump would look
+    like it fell back).
+    """
     quotes = {str(p.get("exchangeId")): p for p in prices}
     stamp = iso(taken_at)
     rows: List[Dict[str, Any]] = []
     for market in markets:
         for ex in market.get("exchanges") or []:
             eid = str(ex.get("id"))
-            quote = quotes.get(eid, {})
-            latest = quote.get("latestPrice", ex.get("latestPrice"))
+            quote = quotes.get(eid)
+            missing = quote is None
+            quote = quote or {}
+            latest = quote.get("latestPrice")
             bid, ask = quote.get("bestBid"), quote.get("bestAsk")
             spread = quote.get("spread")
             if spread is None and isinstance(bid, (int, float)) and isinstance(ask, (int, float)):
@@ -209,6 +218,8 @@ def build_rows(
                     "mid": _mid(bid, ask),
                 }
             )
+            if missing:
+                rows[-1]["missing"] = True
     return rows
 
 
@@ -360,6 +371,7 @@ class MarketDataBot:
         self.out = out
         self._sleep = sleep
         self._clock = clock
+        self._last_missing: Set[str] = set()  # missingIds of the previous snapshot (logged once per change)
 
     def _print(self, text: str = "") -> None:
         if self.out is not None:
@@ -384,8 +396,12 @@ class MarketDataBot:
         prices = self.client.get_prices(ids, tournament_id=self.context.tournament_id) if ids else {"data": [], "missingIds": []}
         taken_at = utc_now()
         rows = build_rows(markets, prices["data"], self.context, taken_at)
-        if prices["missingIds"]:
-            log.warning("%d exchange(s) missing from the price snapshot: %s", len(prices["missingIds"]), ", ".join(prices["missingIds"][:10]))
+        missing = [str(i) for i in prices["missingIds"]]
+        if missing:
+            # Once per change: a settled or out-of-scope outcome stays missing every few seconds.
+            level = logging.WARNING if set(missing) != self._last_missing else logging.DEBUG
+            log.log(level, "%d exchange(s) missing from the price snapshot: %s", len(missing), ", ".join(missing[:10]))
+        self._last_missing = set(missing)
         snap = Snapshot(taken_at, self.context, [dict(m) for m in markets], rows, list(prices["missingIds"]))
         if self.writer is not None:
             try:

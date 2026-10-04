@@ -1561,7 +1561,8 @@ def test_build_live_masks_the_settings_key(tmp_path: Path, monkeypatch: pytest.M
         assert runtime.app.news_enabled is False and runtime.news is None  # --no-news: no news hosts at all
         runtime.tracker.run_once()
         assert f"Bearer {FAKE_KEY}" in seen_auth  # the key really was used …
-        assert any(FAKE_KEY in str(e) for e in runtime.tracker.status()["recent_errors"])  # … and leaked into an error
+        # … and reached an error: as it is (an older client) or already masked where the error was made.
+        assert any(FAKE_KEY in str(e) or "key *** is not allowed" in str(e) for e in runtime.tracker.status()["recent_errors"])
         with serve(runtime.app) as srv:
             http_client = HTTP(srv.port)
             bodies = [http_client.get(p).body for p in GET_ENDPOINTS]
@@ -1704,8 +1705,8 @@ def test_run_dashboard_port_zero_prints_the_url_and_needs_no_key(tmp_path: Path,
     servers: List[web.DashboardServer] = []
     real_make_server = web.make_server
 
-    def capture(app: web.DashboardApp, host: str = "127.0.0.1", port: int = 8765) -> web.DashboardServer:
-        srv = real_make_server(app, host, port)
+    def capture(app: web.DashboardApp, host: str = "127.0.0.1", port: int = 8765, **kwargs: Any) -> web.DashboardServer:
+        srv = real_make_server(app, host, port, **kwargs)
         servers.append(srv)
         return srv
 
@@ -1827,35 +1828,36 @@ def test_robustness_3_exchange_detail_never_waits_for_a_slow_order_book(
     assert fresh["book_fetched_at"] == NOW + web.BOOK_TTL_S + 1
 
 
+def _fixed_machine(monkeypatch: pytest.MonkeyPatch) -> None:
+    """This machine is "VM" (FQDN vm.lan.example) at 192.0.2.2, whatever the test host really is."""
+    monkeypatch.setattr(web, "machine_addresses", lambda ipv6=False: ["192.0.2.2"])
+    monkeypatch.setattr(web.socket, "gethostname", lambda: "VM")
+    monkeypatch.setattr(web.socket, "getfqdn", lambda name="": "vm.lan.example")
+
+
 def test_robustness_5_a_wildcard_bind_accepts_requests_from_other_devices(
     make_app: Callable[..., web.DashboardApp], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(web, "machine_addresses", lambda ipv6=False: ["192.0.2.2"])
-    monkeypatch.setattr(web.socket, "gethostname", lambda: "VM")
+    _fixed_machine(monkeypatch)
     with serve(make_app(), host="0.0.0.0") as srv:
         port = srv.port
-        assert srv.local_only is False and srv.allow_any_host is True
+        assert srv.local_only is False and srv.allow_any_host is False  # r2-fixcheck-16: the check stays on
         assert srv.url == f"http://127.0.0.1:{port}"
         assert srv.network_urls == [f"http://192.0.2.2:{port}"]
-        assert {f"192.0.2.2:{port}", f"vm:{port}"} <= srv.allowed_hosts
+        assert {f"192.0.2.2:{port}", f"vm:{port}", f"vm.local:{port}", f"vm.lan.example:{port}"} <= srv.allowed_hosts
         http = HTTP(port)
-        for host in (f"127.0.0.1:{port}", f"192.0.2.2:{port}", f"VM:{port}", f"my-laptop.local:{port}", f"[2001:db8::5]:{port}"):
+        for host in (f"127.0.0.1:{port}", f"192.0.2.2:{port}", f"VM:{port}", f"vm.local:{port}", f"vm.lan.example:{port}"):
             resp = http.get("/api/health", headers={"Host": host})
             assert resp.status == 200, (host, resp.body)
             resp = http.post("/api/surges/999/analyze", Host=host, Origin=f"http://{host.lower()}")
             assert resp.status == 404, (host, resp.body)  # past the host and origin checks; the surge just does not exist
         assert_json_error(http.post("/api/surges/999/analyze", Host=f"192.0.2.2:{port}", Origin="http://evil.example"), 403)
-        for bad in ("", f"127.0.0.1:{port}@evil.example", "a b", "x" * 300):
+        for bad in ("", f"127.0.0.1:{port}@evil.example", "a b", "x" * 300, f"my-laptop.local:{port}", f"[2001:db8::5]:{port}"):
             assert_json_error(http.get("/api/health", headers={"Host": bad}), 421)
     with serve(make_app()) as srv:  # the default loopback bind still turns other names away (DNS rebinding)
         assert srv.local_only is True and srv.allow_any_host is False and srv.network_urls == []
         assert_json_error(HTTP(srv.port).get("/api/health", headers={"Host": f"192.0.2.2:{srv.port}"}), 421)
-    strict = web.make_server(make_app(), "0.0.0.0", 0, allow_any_host=False)  # a wildcard bind locked to this machine
-    try:
-        assert strict.host_allowed(f"192.0.2.2:{strict.port}") and strict.host_allowed(f"vm:{strict.port}")
-        assert not strict.host_allowed(f"evil.example:{strict.port}")
-    finally:
-        strict.server_close()
+        assert_json_error(HTTP(srv.port).get("/api/health", headers={"Host": f"vm:{srv.port}"}), 421)
     assert web.is_loopback_host("127.0.0.2") and web.is_loopback_host("[::1]") and web.is_loopback_host("localhost")
     assert not web.is_loopback_host("0.0.0.0") and not web.is_loopback_host("192.168.1.5") and not web.is_loopback_host("")
 
@@ -1867,8 +1869,8 @@ def test_robustness_5_run_dashboard_prints_the_lan_url_and_an_accurate_warning(
     servers: List[web.DashboardServer] = []
     real_make_server = web.make_server
 
-    def capture(app: web.DashboardApp, host: str = "127.0.0.1", port: int = 8765) -> web.DashboardServer:
-        srv = real_make_server(app, host, port)
+    def capture(app: web.DashboardApp, host: str = "127.0.0.1", port: int = 8765, **kwargs: Any) -> web.DashboardServer:
+        srv = real_make_server(app, host, port, **kwargs)
         servers.append(srv)
         return srv
 
@@ -1889,7 +1891,9 @@ def test_robustness_5_run_dashboard_prints_the_lan_url_and_an_accurate_warning(
         assert f"From other devices on your network: http://192.0.2.2:{port}" in out.getvalue()
         warning = err.getvalue()
         assert "listening on 0.0.0.0" in warning and "DNS-rebinding" in warning and "read-only" in warning
+        assert "is off" not in warning and "could also read" not in warning  # r2-fixcheck-16: no longer true
         assert HTTP(port).get("/api/health", headers={"Host": f"192.0.2.2:{port}"}).status == 200
+        assert_json_error(HTTP(port).get("/api/health", headers={"Host": f"rebind.attacker.example:{port}"}), 421)
     finally:
         if servers:
             servers[0].shutdown()
@@ -2150,3 +2154,352 @@ def test_visual_9_chart_series_spreads_over_time_not_tick_count() -> None:
     span_24h = [p for p in out if p.ts >= now - 86400]
     hours_covered = {int((p.ts - (now - 86400)) // 3600) for p in span_24h}
     assert len(hours_covered) >= 20  # the whole day is represented, not just the tick-dense last hours
+
+
+# --------------------------------------------------------------------------- round 2 (server)
+
+
+def test_r2_fixcheck_16_a_wildcard_bind_still_blocks_dns_rebinding(
+    make_app: Callable[..., web.DashboardApp], store: TrackerStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--host 0.0.0.0 answers this machine's own addresses and names only; a rebinding page gets 421/403."""
+    _fixed_machine(monkeypatch)
+    sid = store.record_surge(make_surge("e1", "m1")).id
+    tracker = FakeTracker({"context": {"balance": 98_518.75}})
+    with serve(make_app(tracker), host="0.0.0.0") as srv:
+        port = srv.port
+        http = HTTP(port)
+        evil = f"rebind.attacker.example:{port}"
+        resp = assert_json_error(http.get("/api/status", headers={"Host": evil}), 421)
+        assert "98518" not in json.dumps(resp)
+        for path in ("/", "/api/health", "/api/markets", "/api/surges"):
+            assert http.get(path, headers={"Host": evil}).status == 421, path
+        # The POST a rebinding page would send (its Origin matches its own Host): refused, nothing queued.
+        assert http.post(f"/api/surges/{sid}/analyze", Host=evil, Origin=f"http://{evil}").status == 421
+        assert tracker.requests == []
+        # This machine's own address / name, with a foreign Origin: still refused.
+        for origin in (f"http://{evil}", "http://evil.example", f"http://192.0.2.2:{port + 1}", "null"):
+            assert_json_error(http.post(f"/api/surges/{sid}/analyze", Host=f"192.0.2.2:{port}", Origin=origin), 403)
+        assert tracker.requests == []
+        ok = http.post(f"/api/surges/{sid}/analyze", Host=f"192.0.2.2:{port}", Origin=f"http://192.0.2.2:{port}")
+        assert ok.status == 200 and ok.json()["queued"] is True and tracker.requests == [sid]
+        assert http.get("/api/status", headers={"Host": f"vm.local:{port}"}).json()["account"]["balance"] == 98_518.75
+        # The local address the connection arrived on is this machine's, on any interface.
+        assert srv.host_allowed(f"198.51.100.7:{port}", "198.51.100.7")
+        assert srv.host_allowed(f"198.51.100.7:{port}", "::ffff:198.51.100.7")  # a dual-stack socket
+        assert srv.host_allowed(f"[2001:db8::7]:{port}", "2001:db8::7")
+        assert not srv.host_allowed(f"198.51.100.7:{port}", "192.0.2.2")  # not the address it arrived on
+        assert not srv.host_allowed(f"198.51.100.7:{port + 1}", "198.51.100.7")  # another port
+        assert not srv.host_allowed(evil, "198.51.100.7")  # a name is never matched this way
+        assert not srv.host_allowed(f"0.0.0.0:{port}", "0.0.0.0")
+    # ...and through the handler: a client on another interface (198.51.100.7) uses that address.
+    monkeypatch.setattr(web.DashboardHandler, "_local_address", lambda self: "198.51.100.7")
+    with serve(make_app(), host="0.0.0.0") as srv:
+        http = HTTP(srv.port)
+        assert http.get("/api/health", headers={"Host": f"198.51.100.7:{srv.port}"}).status == 200
+        assert http.get("/api/health", headers={"Host": f"203.0.113.9:{srv.port}"}).status == 421
+    with serve(make_app()) as srv:  # a loopback bind never accepts a non-loopback address this way
+        assert not srv.host_allowed(f"198.51.100.7:{srv.port}", "198.51.100.7")
+
+
+def test_r2_fixcheck_16_allow_host_adds_names_and_allow_any_host_never_opens_posts(
+    make_app: Callable[..., web.DashboardApp], store: TrackerStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fixed_machine(monkeypatch)
+    sid = store.record_surge(make_surge("e1", "m1")).id
+    tracker = FakeTracker({})
+    srv = web.make_server(
+        make_app(tracker), "127.0.0.1", 0, allow_hosts=["Dash.Example.org", "proxy.example:8443", "https://pasted.example/", "", "bad name"]
+    )
+    thread = threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+    thread.start()
+    try:
+        port, http = srv.port, HTTP(srv.port)
+        assert srv.extra_names == {"dash.example.org", "pasted.example"} and srv.extra_hosts == {"proxy.example:8443"}
+        for host in ("dash.example.org", f"dash.example.org:{port}", "dash.example.org:9000", "proxy.example:8443", "pasted.example"):
+            assert http.get("/api/health", headers={"Host": host}).status == 200, host
+        for host in ("proxy.example", f"proxy.example:{port}", f"evil.dash.example.org:{port}", f"vm:{port}"):
+            assert http.get("/api/health", headers={"Host": host}).status == 421, host
+        # A TLS-terminating reverse proxy: https Origin for an --allow-host name only.
+        assert http.post(f"/api/surges/{sid}/analyze", Host="dash.example.org", Origin="https://dash.example.org").status == 200
+        assert_json_error(http.post(f"/api/surges/{sid}/analyze", Host=f"127.0.0.1:{port}", Origin=f"https://127.0.0.1:{port}"), 403)
+        assert_json_error(http.post(f"/api/surges/{sid}/analyze", Host="dash.example.org", Origin="https://evil.example"), 403)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        thread.join(5)
+    assert tracker.requests == [sid]
+    # allow_any_host (no CLI option sets it) lets reads through but never a POST from a foreign Host.
+    opened = web.make_server(make_app(tracker), "0.0.0.0", 0, allow_any_host=True)
+    try:
+        evil = f"rebind.attacker.example:{opened.port}"
+        assert opened.host_allowed(evil)
+        assert not opened.origin_allowed(f"http://{evil}", evil)
+        assert opened.origin_allowed(f"http://192.0.2.2:{opened.port}", f"192.0.2.2:{opened.port}")
+    finally:
+        opened.server_close()
+
+
+def test_r2_fixcheck_16_run_dashboard_passes_allow_host_and_mentions_it(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(web, "machine_addresses", lambda ipv6=False: ["192.0.2.2"])
+    servers: List[web.DashboardServer] = []
+    real_make_server = web.make_server
+
+    def capture(app: web.DashboardApp, host: str = "127.0.0.1", port: int = 8765, **kwargs: Any) -> web.DashboardServer:
+        srv = real_make_server(app, host, port, **kwargs)
+        servers.append(srv)
+        return srv
+
+    monkeypatch.setattr(web, "make_server", capture)
+    out, err = io.StringIO(), io.StringIO()
+    result: Dict[str, Any] = {}
+    args = _dashboard_args(tmp_path, "--demo", "--no-browser", "--port", "0", "--host", "0.0.0.0")
+    args.allow_host = ["dash.example.org", "a.example,b.example", "*"]  # what a repeatable --allow-host option gives
+
+    def run() -> None:
+        result["code"] = web.run_dashboard(None, args, out=out, err=err)
+
+    thread = threading.Thread(target=run, name="test-run-dashboard-allow-host", daemon=True)
+    thread.start()
+    try:
+        assert _wait_for(lambda: "Dashboard running" in out.getvalue(), timeout=10.0), (out.getvalue(), err.getvalue())
+        srv = servers[0]
+        assert srv.extra_names == {"dash.example.org", "a.example", "b.example"} and srv.allow_any_host is False
+        assert "--allow-host NAME" in err.getvalue() and "DNS-rebinding" in err.getvalue()
+        assert "ignoring --allow-host '*'" in err.getvalue()  # never a wildcard that would turn the check off
+        assert HTTP(srv.port).get("/api/health", headers={"Host": "b.example"}).status == 200
+        assert HTTP(srv.port).get("/api/health", headers={"Host": f"rebind.attacker.example:{srv.port}"}).status == 421
+    finally:
+        if servers:
+            servers[0].shutdown()
+        thread.join(15)
+    assert result.get("code") == 0
+    assert web._allow_host_option(SimpleNamespace()) == []  # a CLI without the option
+    assert web._allow_host_option(SimpleNamespace(allow_host="x.example")) == ["x.example"]
+
+
+def test_r2_robustness_6_reanalyze_refuses_once_the_tracker_has_stopped(
+    make_app: Callable[..., web.DashboardApp], make_client: Callable[..., SuperMarketClient], fake: Any, store: TrackerStore
+) -> None:
+    sid = store.record_surge(make_surge("e1", "m1")).id
+    fake.add("GET", "/tournaments/cup/markets", (401, error_body("API_KEY_REVOKED", "This API key has been revoked.")))
+    client = make_client(max_retries=0)
+    tracker = tracker_mod.Tracker(client, Context("t-1", "cup", "Cup"), store, backfill=False, clock=lambda: NOW)
+    tracker.attributor = object()  # anything: request_analysis only queues when there is an attributor
+    with pytest.raises(ApiError):
+        tracker.run_once()
+    assert tracker.status()["fatal_error"]
+    app = make_app(tracker, client=client, secrets=[FAKE_KEY])
+    queued_before = tracker.status()["analysis"]["queued_ids"]
+    status, body = app.analyze(sid)
+    assert status == 409 and body["queued"] is False and body["surge_id"] == sid
+    assert body["error"].startswith("The tracker has stopped (HTTP 401 API_KEY_REVOKED")
+    assert body["error"].endswith("Restart the dashboard to analyse surges.")
+    assert tracker.status()["analysis"]["queued_ids"] == queued_before  # nothing re-queued that would never run
+    with serve(app) as srv:
+        resp = HTTP(srv.port).post(f"/api/surges/{sid}/analyze")
+    assert_json_error(resp, 409)
+    assert "The tracker has stopped" in resp.json()["error"] and "Queued" not in resp.body.decode()
+    # A tracker that was started and is no longer running (its threads ended) is stopped too.
+    stopped = StatusTracker({}, {"running": False, "started_at": NOW - 60, "fatal_error": None})
+    status, body = make_app(stopped).analyze(sid)
+    assert status == 409 and "The tracker has stopped" in body["error"] and stopped.requests == []
+    # A fatal error is masked and kept short.
+    leaky = StatusTracker({}, {"running": False, "started_at": NOW, "fatal_error": f"HTTP 401 bad key {FAKE_KEY} " + "x" * 500})
+    status, body = make_app(leaky, secrets=[FAKE_KEY]).analyze(sid)
+    assert status == 409 and FAKE_KEY not in body["error"] and "***" in body["error"] and len(body["error"]) < 300
+    # Running, or never started (driven by hand), or a tracker without status(): queued as before.
+    for live in (
+        StatusTracker({}, {"running": True, "started_at": NOW - 60, "fatal_error": None}),
+        StatusTracker({}, {"running": False, "started_at": None, "fatal_error": None}),
+        FakeTracker({}),
+    ):
+        status, body = make_app(live).analyze(sid)
+        assert status == 200 and body["queued"] is True and live.requests == [sid]
+
+
+def test_r2_live_api_11_ctrl_c_while_starting_exits_130_without_a_traceback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    from supermarket_bot import cli
+
+    def interrupted(settings: Any, args: Any, out: Any = None, **kwargs: Any) -> Any:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(web, "build_live", interrupted)
+    settings = Settings(api_key=FAKE_KEY, tournament="cup", data_dir=tmp_path)
+    out, err = io.StringIO(), io.StringIO()
+    assert web.run_dashboard(settings, _dashboard_args(tmp_path, "--no-browser", "--port", "0"), out=out, err=err) == 130
+    assert "Stopped before the dashboard started." in err.getvalue() and "Traceback" not in err.getvalue()
+    assert "Dashboard running" not in out.getvalue()
+    # Through the CLI entry point (which returns run_dashboard's code for this command).
+    monkeypatch.setenv("SUPERMARKET_API_KEY", FAKE_KEY)
+    code = cli.main(["--data-dir", str(tmp_path / "data"), "--env-file", str(tmp_path / "none.env"), "dashboard", "--no-browser", "--port", "0"])
+    assert code == 130
+    captured = capsys.readouterr()
+    assert "Stopped before the dashboard started." in captured.err and "Traceback" not in captured.err
+
+
+def test_r2_live_api_11_ctrl_c_in_a_slow_api_read_closes_the_half_built_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The real build_live: Ctrl-C arrives while GET /tournaments/{slug} is still waiting."""
+    monkeypatch.delenv("SUPERMARKET_LLM", raising=False)
+    clients: List[SuperMarketClient] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise KeyboardInterrupt  # what SIGINT does to the main thread in the middle of the read
+
+    def from_settings(cls: Any, settings: Settings, **kwargs: Any) -> SuperMarketClient:
+        made = SuperMarketClient(settings.api_key, "https://fake.invalid/api/v1", transport=httpx.MockTransport(handler), max_retries=0)
+        clients.append(made)
+        return made
+
+    monkeypatch.setattr(SuperMarketClient, "from_settings", classmethod(from_settings))
+    settings = Settings(api_key=FAKE_KEY, tournament="cup", data_dir=tmp_path)
+    out, err = io.StringIO(), io.StringIO()
+    code = web.run_dashboard(settings, _dashboard_args(tmp_path, "--no-browser", "--port", "0", "--no-news"), out=out, err=err)
+    assert code == 130
+    text = err.getvalue()
+    assert text.startswith("Connecting to the Super Market API…")  # a wait has context
+    assert "Stopped before the dashboard started." in text and "Traceback" not in text
+    assert len(clients) == 1 and clients[0]._http.is_closed
+    assert not (tmp_path / "cup").exists()  # no store was opened
+
+
+def test_r2_live_api_11_sigterm_while_starting_also_stops_cleanly(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import os
+    import signal
+
+    if threading.current_thread() is not threading.main_thread() or not hasattr(signal, "SIGTERM"):
+        pytest.skip("needs the main thread")
+
+    class Unhandled(Exception):
+        pass
+
+    def fallback(signum: int, frame: Any) -> None:  # only reached if run_dashboard installed no handler
+        raise Unhandled("SIGTERM reached the test's own handler")
+
+    original = signal.signal(signal.SIGTERM, fallback)  # never let a regression kill the test run
+    before = signal.getsignal(signal.SIGTERM)
+
+    def slow_start(settings: Any, args: Any, out: Any = None, **kwargs: Any) -> Any:
+        os.kill(os.getpid(), signal.SIGTERM)  # run_dashboard's handler turns it into KeyboardInterrupt
+        time.sleep(5)
+        raise AssertionError("SIGTERM did not interrupt the start-up")
+
+    monkeypatch.setattr(web, "build_live", slow_start)
+    settings = Settings(api_key=FAKE_KEY, tournament="cup", data_dir=tmp_path)
+    err = io.StringIO()
+    started = time.monotonic()
+    try:
+        assert web.run_dashboard(settings, _dashboard_args(tmp_path, "--no-browser"), out=io.StringIO(), err=err) == 130
+        assert time.monotonic() - started < 4 and "Stopped before the dashboard started." in err.getvalue()
+        assert signal.getsignal(signal.SIGTERM) is before  # restored
+    finally:
+        signal.signal(signal.SIGTERM, original)
+
+
+def _flaky_tournament_api(monkeypatch: pytest.MonkeyPatch, failures: Any, status: int = 503) -> Dict[str, int]:
+    """The demo API, whose GET /tournaments/{slug} fails ``failures`` times (an int, or "always")."""
+    market = demo_mod.DemoMarket(seed=7)
+    inner = market.transport()
+    seen = {"tournament": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith(f"/tournaments/{demo_mod.DEMO_SLUG}"):
+            seen["tournament"] += 1
+            if failures == "always" or seen["tournament"] <= failures:
+                if status == 401:
+                    return httpx.Response(401, json=error_body("API_KEY_REVOKED", "This API key has been revoked."))
+                return httpx.Response(
+                    status, json=error_body("SERVICE_UNAVAILABLE", "Authoritative tournament balances are temporarily unavailable.")
+                )
+        return inner.handle_request(request)
+
+    def from_settings(cls: Any, settings: Settings, **kwargs: Any) -> SuperMarketClient:
+        return market.client(api_key=settings.api_key, transport=httpx.MockTransport(handler), reads_per_min=10_000, max_retries=0)
+
+    monkeypatch.setattr(SuperMarketClient, "from_settings", classmethod(from_settings))
+    monkeypatch.delenv("SUPERMARKET_LLM", raising=False)
+    return seen
+
+
+def test_r2_live_api_14_startup_rides_out_a_temporary_503(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    seen = _flaky_tournament_api(monkeypatch, failures=2)
+    waits: List[float] = []
+    settings = Settings(api_key=FAKE_KEY, tournament=demo_mod.DEMO_SLUG, data_dir=tmp_path)
+    args = build_parser().parse_args(["dashboard", "--no-news"])
+    out = io.StringIO()
+    runtime = web.build_live(settings, args, out=out, sleep=waits.append)
+    try:
+        assert runtime.context.slug == demo_mod.DEMO_SLUG and runtime.context.tournament_id
+        assert seen["tournament"] == 3 and waits == list(web.STARTUP_RETRY_WAITS_S[:2]) == [5.0, 10.0]
+        text = out.getvalue()
+        assert "The Super Market API is temporarily unavailable (HTTP 503 SERVICE_UNAVAILABLE" in text
+        assert "trying again in 5 s" in text and "trying again in 10 s" in text and "Ctrl-C to stop" in text
+        assert FAKE_KEY not in text
+        # The resolved tournament is remembered for the next start.
+        saved = runtime.store.get_state(web.CONTEXT_STATE_KEY)
+        assert saved["slug"] == demo_mod.DEMO_SLUG and saved["tournament_id"] == runtime.context.tournament_id
+    finally:
+        runtime.close()
+    assert 4.5 * 60 <= sum(web.STARTUP_RETRY_WAITS_S) <= 6 * 60  # about 5 minutes in all, not 2.6 s
+
+
+def test_r2_live_api_14_a_later_start_uses_the_saved_tournament_while_the_lookup_is_down(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = Settings(api_key=FAKE_KEY, tournament=demo_mod.DEMO_SLUG, data_dir=tmp_path)
+    args = build_parser().parse_args(["dashboard", "--no-news"])
+    _flaky_tournament_api(monkeypatch, failures=0)
+    first = web.build_live(settings, args, out=io.StringIO(), sleep=lambda s: None)
+    expected = first.context
+    first.close()
+    _flaky_tournament_api(monkeypatch, failures="always")
+    waits: List[float] = []
+    out = io.StringIO()
+    runtime = web.build_live(settings, args, out=out, sleep=waits.append)
+    try:
+        assert waits == []  # no need to wait: the tournament id is known
+        assert (runtime.context.tournament_id, runtime.context.slug, runtime.context.name) == (
+            expected.tournament_id, expected.slug, expected.name
+        )
+        assert "using the details saved for" in out.getvalue() and "balance will show once the API answers" in out.getvalue()
+        runtime.tracker.run_once()  # market data works; only the balance is missing
+        status = runtime.app.status()
+        assert status["counts"]["outcomes"] == 22 and status["account"]["balance"] is None
+        assert status["tracker"]["fatal_error"] is None
+    finally:
+        runtime.app.wait_backtest(10)
+        runtime.close()
+
+
+def test_r2_live_api_14_gives_up_after_the_retries_and_never_retries_a_rejected_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = Settings(api_key=FAKE_KEY, tournament=demo_mod.DEMO_SLUG, data_dir=tmp_path)
+    args = build_parser().parse_args(["dashboard", "--no-news"])
+    seen = _flaky_tournament_api(monkeypatch, failures="always")
+    waits: List[float] = []
+    out = io.StringIO()
+    with pytest.raises(ApiError) as caught:
+        web.build_live(settings, args, out=out, sleep=waits.append, retry_waits=(0.5, 1.0))
+    assert caught.value.status == 503 and waits == [0.5, 1.0] and seen["tournament"] == 3
+    assert "still unavailable after 1 min of retries" in out.getvalue()
+    assert not (tmp_path / demo_mod.DEMO_SLUG).exists()  # nothing saved, no store left open
+    seen = _flaky_tournament_api(monkeypatch, failures="always", status=401)
+    waits.clear()
+    with pytest.raises(ApiError) as caught:
+        web.build_live(settings, args, out=io.StringIO(), sleep=waits.append)
+    assert caught.value.status == 401 and waits == [] and seen["tournament"] == 1
+    # Through run_dashboard: a clear error and exit 1, no traceback.
+    _flaky_tournament_api(monkeypatch, failures="always")
+    monkeypatch.setattr(web, "STARTUP_RETRY_WAITS_S", (0.0,))
+    err = io.StringIO()
+    assert web.run_dashboard(settings, _dashboard_args(tmp_path, "--no-browser", "--no-news"), out=io.StringIO(), err=err) == 1
+    assert "error: HTTP 503 SERVICE_UNAVAILABLE" in err.getvalue() and "Traceback" not in err.getvalue()
+    assert web.is_transient_error(ApiError(429, "RATE_LIMITED", "slow down"))
+    assert web.is_transient_error(ApiError(502, "BAD_GATEWAY", "x"))
+    assert not web.is_transient_error(ApiError(404, "NOT_FOUND", "no such tournament"))
+    assert not web.is_transient_error(ApiError(403, "FORBIDDEN", "not visible"))

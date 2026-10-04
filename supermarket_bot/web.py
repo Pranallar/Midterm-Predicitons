@@ -6,8 +6,8 @@ See docs/DESIGN.md (Web section).
 * :class:`DashboardApp` turns the tracker's live view and the SQLite store into plain,
   JSON-safe dicts, one method per endpoint, so it can be tested without HTTP.
 * :class:`DashboardServer` / :class:`DashboardHandler` serve those dicts as JSON and the
-  static UI files, with local-only protections: Host-header allow-list (DNS rebinding; only
-  on loopback binds, see :class:`DashboardServer`), same-origin JSON-only POSTs, a strict
+  static UI files, with local-only protections: Host-header allow-list (DNS rebinding; see
+  :class:`DashboardServer`), JSON-only POSTs from an allowed Origin, a strict
   Content-Security-Policy and no secrets in any response.
 * :func:`run_dashboard` wires everything together for the CLI.
 
@@ -1201,6 +1201,28 @@ class DashboardApp:
             thread.join(timeout)
 
     # ------------------------------------------------------------------ actions
+    def _tracker_stopped(self) -> Optional[str]:
+        """Why queued analyses would never run (the tracker stopped), or None while it can still run them.
+
+        A fatal error (a rejected key) stops every worker. A tracker that was started and is no
+        longer running has stopped too; one that was never started (driven by hand, as in the
+        tests) is not judged.
+        """
+        status = self._tracker_status()
+        if status is None:
+            return None
+        fatal = status.get("fatal_error") or status.get("fatal")
+        if isinstance(fatal, Mapping):
+            fatal = fatal.get("message") or fatal.get("error")
+        if fatal:
+            reason = self._short(RuntimeError(str(fatal)))
+            if len(reason) > 200:
+                reason = reason[:197] + "…"
+            return f"The tracker has stopped ({reason}). Restart the dashboard to analyse surges."
+        if status.get("started_at") is not None and status.get("running") is False:
+            return "The tracker has stopped, so nothing would analyse the surge. Restart the dashboard to analyse surges."
+        return None
+
     def analyze(self, surge_id: Any) -> Tuple[int, Dict[str, Any]]:
         """Re-queue a surge for attribution. Returns (HTTP status, body)."""
         text = str(surge_id)
@@ -1218,6 +1240,9 @@ class DashboardApp:
         request = getattr(self.tracker, "request_analysis", None)
         if request is None:
             return 409, {"queued": False, "error": "This tracker cannot re-analyze surges."}
+        stopped = self._tracker_stopped()
+        if stopped is not None:
+            return 409, {"queued": False, "surge_id": sid, "error": stopped}
         try:
             queued = bool(request(sid))
         except Exception as exc:
@@ -1279,14 +1304,80 @@ def machine_addresses(ipv6: bool = False) -> List[str]:
     return found
 
 
+def _split_host(host: str) -> Tuple[str, Optional[int]]:
+    """``"name:port"`` / ``"[v6]:port"`` / ``"name"`` -> (lower-case name without brackets, port or None)."""
+    host = (host or "").strip().lower()
+    port_text = ""
+    if host.startswith("["):
+        name, _, rest = host[1:].partition("]")
+        if rest.startswith(":"):
+            port_text = rest[1:]
+        elif rest:
+            return "", None
+    elif host.count(":") == 1:
+        name, _, port_text = host.partition(":")
+    elif ":" in host:  # a bare IPv6 address (not valid in a Host header, but harmless here)
+        name = host
+    else:
+        name = host
+    if port_text:
+        if not port_text.isdigit() or len(port_text) > 5:
+            return "", None
+        return name, int(port_text)
+    return name, None
+
+
+def _ip_of(text: Any) -> Any:
+    """An :mod:`ipaddress` object (IPv4-mapped IPv6 as IPv4), or None for a name."""
+    try:
+        ip = ipaddress.ip_address(str(text or "").strip().strip("[]").split("%", 1)[0])
+    except ValueError:
+        return None
+    mapped = getattr(ip, "ipv4_mapped", None)
+    return mapped if mapped is not None else ip
+
+
+def machine_names() -> List[str]:
+    """This machine's own host names (best effort, lower-case): ``gethostname()``, its FQDN and ``<name>.local``."""
+    found: List[str] = []
+
+    def add(name: Any) -> None:
+        text = str(name or "").strip().lower().rstrip(".")
+        if text and not is_loopback_host(text) and _ip_of(text) is None and text not in found:
+            found.append(text)
+
+    try:
+        name = socket.gethostname()
+    except OSError:
+        name = ""
+    add(name)
+    short = str(name or "").strip().lower().split(".", 1)[0]
+    if short:
+        add(short)
+        add(f"{short}.local")  # mDNS / Bonjour
+    try:
+        add(socket.getfqdn(name) if name else "")
+    except (OSError, UnicodeError):
+        pass
+    return found
+
+
 class DashboardServer(ThreadingHTTPServer):
     """The dashboard's HTTP server.
 
-    On a loopback bind (the default ``127.0.0.1``) only the loopback names are accepted as
-    ``Host`` (421 otherwise), which stops DNS-rebinding pages from reading the dashboard. On a
-    non-loopback bind (``--host 0.0.0.0``, a LAN address) the user chose to let other devices
-    in, and those reach it by this machine's IP address or name, so any well-formed ``Host`` is
-    accepted (``allow_any_host``); the trade-off is printed by :func:`run_dashboard`.
+    Every request must carry a ``Host`` this server knows as its own (421 otherwise), which
+    stops DNS-rebinding pages (a page on some domain that re-points that domain at this
+    machine) from reading the dashboard or queueing analyses:
+
+    * always the loopback names (``127.0.0.1``, ``localhost``, ``[::1]``) and the bound address;
+    * on a non-loopback bind (``--host 0.0.0.0``, a LAN address) also this machine's own IP
+      addresses and names (:func:`machine_addresses`, :func:`machine_names`) and the local
+      address the connection actually arrived on, so other devices can open the printed URL;
+    * any name passed in ``allow_hosts`` (``--allow-host``), e.g. a reverse proxy's. ``name``
+      matches on any port, ``name:port`` only on that port.
+
+    ``allow_any_host=True`` switches the check off for reads (no CLI option sets it); a POST
+    still needs a known ``Host`` and that page's own ``Origin`` (:meth:`origin_allowed`).
     """
 
     daemon_threads = True
@@ -1295,21 +1386,50 @@ class DashboardServer(ThreadingHTTPServer):
     request_queue_size = 32
 
     def __init__(
-        self, app: DashboardApp, host: str = "127.0.0.1", port: int = 8765, *, allow_any_host: Optional[bool] = None
+        self,
+        app: DashboardApp,
+        host: str = "127.0.0.1",
+        port: int = 8765,
+        *,
+        allow_any_host: Optional[bool] = None,
+        allow_hosts: Iterable[str] = (),
     ) -> None:
         self.app = app
         self.bind_host = host
         self.local_only = is_loopback_host(host)
-        self.allow_any_host = (not self.local_only) if allow_any_host is None else bool(allow_any_host)
+        self.allow_any_host = bool(allow_any_host)
         if ":" in host:
             self.address_family = socket.AF_INET6
         super().__init__((host, port), DashboardHandler)
         self.lan_addresses: List[str] = machine_addresses(ipv6=":" in host) if is_wildcard_host(host) else []
+        self.machine_names: List[str] = [] if self.local_only else machine_names()
+        self.extra_hosts, self.extra_names = self._extra_hosts(allow_hosts)
         self.allowed_hosts = self._allowed_hosts()
 
     @property
     def port(self) -> int:
         return int(self.server_address[1])
+
+    @staticmethod
+    def _extra_hosts(allow_hosts: Iterable[str]) -> Tuple[frozenset, frozenset]:
+        """``--allow-host`` entries: (exact ``name:port`` values, names allowed on any port)."""
+        exact, names = set(), set()
+        for entry in allow_hosts or ():
+            text = str(entry or "").strip().lower()
+            if "://" in text:  # tolerate a pasted URL
+                text = urlsplit(text).netloc
+            text = text.rstrip("/").rstrip(".")
+            if not text or not _HOST_HEADER_RE.match(text):
+                continue
+            name, port = _split_host(text)
+            if not name:
+                continue
+            shown = f"[{name}]" if ":" in name else name
+            if port is None:
+                names.add(name)
+            else:
+                exact.add(f"{shown}:{port}")
+        return frozenset(exact), frozenset(names)
 
     def _allowed_hosts(self) -> frozenset:
         port = self.port
@@ -1317,24 +1437,51 @@ class DashboardServer(ThreadingHTTPServer):
         host = self.bind_host.strip().lower()
         if host and not is_wildcard_host(host):
             names.add(f"[{host}]:{port}" if ":" in host else f"{host}:{port}")
-        for address in self.lan_addresses:  # a wildcard bind: this machine's own addresses and name
+        for address in self.lan_addresses:  # a wildcard bind: this machine's own addresses
             names.add(f"[{address}]:{port}" if ":" in address else f"{address}:{port}")
-        if self.lan_addresses:
-            try:
-                name = socket.gethostname().strip().lower()
-            except OSError:
-                name = ""
-            if name:
-                names.add(f"{name}:{port}")
+        for name in self.machine_names:  # a non-loopback bind: this machine's own names
+            names.add(f"{name}:{port}")
         if port == 80:
             names |= {name.rsplit(":", 1)[0] for name in names}
-        return frozenset(names)
+        return frozenset(names | self.extra_hosts)
 
-    def host_allowed(self, host_header: Optional[str]) -> bool:
+    def host_allowed(self, host_header: Optional[str], local_address: Any = None, *, any_host: Optional[bool] = None) -> bool:
+        """Whether ``host_header`` names this server (``local_address``: where the connection arrived)."""
         host = (host_header or "").strip().lower()
+        if not host or not _HOST_HEADER_RE.match(host):
+            return False
         if host in self.allowed_hosts:
             return True
-        return self.allow_any_host and bool(_HOST_HEADER_RE.match(host))
+        name, port = _split_host(host)
+        if not name:
+            return False
+        if name in self.extra_names:
+            return True
+        if not self.local_only and local_address is not None and (port == self.port or (port is None and self.port == 80)):
+            # The IP address the client connected to is this machine's by definition. A rebinding
+            # page always sends its own domain name, never an IP address.
+            local, asked = _ip_of(local_address), _ip_of(name)
+            if local is not None and asked is not None and asked == local and not local.is_unspecified:
+                return True
+        return self.allow_any_host if any_host is None else bool(any_host)
+
+    def origin_allowed(self, origin: Optional[str], host_header: Optional[str], local_address: Any = None) -> bool:
+        """A POST's ``Origin``: exactly the page's own origin, on a ``Host`` this server knows.
+
+        Origin equal to Host alone proves nothing when a rebinding page controls both, so the
+        Host must also pass the allow-list (even with ``allow_any_host``). ``https://`` is
+        accepted only for an ``--allow-host`` name (a TLS-terminating reverse proxy).
+        """
+        text = (origin or "").strip().lower()
+        host = (host_header or "").strip().lower()
+        if not text or not host or not self.host_allowed(host, local_address, any_host=False):
+            return False
+        if text == "http://" + host:
+            return True
+        if text == "https://" + host:
+            name, _port = _split_host(host)
+            return host in self.extra_hosts or name in self.extra_names
+        return False
 
     @property
     def url(self) -> str:
@@ -1391,8 +1538,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def _error(self, status: int, message: str, extra: Sequence[Tuple[str, str]] = ()) -> None:
         self._json(status, {"error": message}, extra)
 
+    def _local_address(self) -> Optional[str]:
+        """The address this connection arrived on (this machine's, whatever the interface)."""
+        try:
+            return str(self.connection.getsockname()[0])
+        except (OSError, AttributeError, IndexError, TypeError):
+            return None
+
     def _host_ok(self) -> bool:
-        return self.server.host_allowed(self.headers.get("Host"))
+        return self.server.host_allowed(self.headers.get("Host"), self._local_address())
 
     def _guard(self) -> bool:
         if not self._host_ok():
@@ -1425,9 +1579,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if not self._guard():
             return
         path = urlsplit(self.path).path
-        origin = (self.headers.get("Origin") or "").strip().lower()
-        expected = "http://" + (self.headers.get("Host") or "").strip().lower()
-        if origin != expected:
+        # Only a page this dashboard served (or an --allow-host name) may POST: an Origin merely
+        # equal to the Host header proves nothing when a rebinding page controls both.
+        if not self.server.origin_allowed(self.headers.get("Origin"), self.headers.get("Host"), self._local_address()):
             self.close_connection = True
             return self._error(403, "Cross-origin requests are not allowed.")
         ctype = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
@@ -1564,9 +1718,14 @@ def resolve_static(url_path: str, root: Path = WEB_DIR) -> Optional[Path]:
 
 
 def make_server(
-    app: DashboardApp, host: str = "127.0.0.1", port: int = 8765, *, allow_any_host: Optional[bool] = None
+    app: DashboardApp,
+    host: str = "127.0.0.1",
+    port: int = 8765,
+    *,
+    allow_any_host: Optional[bool] = None,
+    allow_hosts: Iterable[str] = (),
 ) -> DashboardServer:
-    return DashboardServer(app, host, port, allow_any_host=allow_any_host)
+    return DashboardServer(app, host, port, allow_any_host=allow_any_host, allow_hosts=allow_hosts)
 
 
 # --------------------------------------------------------------------------- runtime
@@ -1648,73 +1807,250 @@ def build_demo(
     client = SuperMarketClient(
         api_key="demo", base_url="https://demo.invalid/api/v1", transport=market.transport(), reads_per_min=600
     )
+    store: Any = None
     try:
         context = resolve_context(client, slug=DEMO_SLUG)
         db = Path(data_dir) / "demo" / "tracker.sqlite3"
         db.parent.mkdir(parents=True, exist_ok=True)
         _remove_db(db)
         store = TrackerStore(db)
-    except BaseException:
+        searcher = NewsSearcher([DemoNewsProvider(market)], store=store) if news else None
+        judge = _judge(llm, out)
+        attributor = Attributor(client, context, store, searcher, judge=judge)
+        tracker = Tracker(
+            client,
+            context,
+            store,
+            interval=interval,
+            attributor=attributor,
+            backfill_reads_per_min=240,
+            analyze_reads_per_min=120,
+        )
+        app = DashboardApp(
+            tracker, store, client, context, demo=True, interval=interval, news_enabled=news, llm_enabled=judge is not None
+        )
+    except BaseException:  # including Ctrl-C while starting
+        if store is not None:
+            store.close()
         client.close()
         raise
-    searcher = NewsSearcher([DemoNewsProvider(market)], store=store) if news else None
-    judge = _judge(llm, out)
-    attributor = Attributor(client, context, store, searcher, judge=judge)
-    tracker = Tracker(
-        client,
-        context,
-        store,
-        interval=interval,
-        attributor=attributor,
-        backfill_reads_per_min=240,
-        analyze_reads_per_min=120,
-    )
-    app = DashboardApp(
-        tracker, store, client, context, demo=True, interval=interval, news_enabled=news, llm_enabled=judge is not None
-    )
     return Runtime(app, tracker, store, client, context, news=searcher, demo_market=market)
 
 
-def build_live(settings: Any, args: Any, out: TextIO = sys.stderr) -> Runtime:
+# Startup against the real API: when the first read (the tournament) fails with a temporary
+# error (5xx such as the documented 503 "balances temporarily unavailable", 429, a network
+# error), wait this long before each new attempt: about 5 minutes in all, then give up.
+STARTUP_RETRY_WAITS_S: Tuple[float, ...] = (5.0, 10.0, 20.0, 30.0, 45.0, 60.0, 60.0, 60.0)
+MAX_STARTUP_WAIT_S = 120.0  # cap on a server-requested Retry-After between start-up attempts
+# Store state key: the tournament resolved on the last successful start (reused if the lookup
+# fails temporarily on a later start; the tracker then loads the balance once the API answers).
+CONTEXT_STATE_KEY = "dashboard.context"
+
+
+def is_transient_error(exc: BaseException) -> bool:
+    """A failure that may go away by itself (5xx, 408/425/429, no response), not a rejected key."""
+    from .bot import is_fatal
+    from .errors import ApiError, NetworkError
+
+    if is_fatal(exc):
+        return False
+    if isinstance(exc, NetworkError):
+        return True
+    return isinstance(exc, ApiError) and (exc.status in (408, 425, 429) or exc.status >= 500)
+
+
+def _save_context(store: Any, context: Any) -> None:
+    if not getattr(context, "tournament_id", None) or not getattr(context, "slug", None):
+        return
+    try:
+        store.set_state(
+            CONTEXT_STATE_KEY,
+            {
+                "tournament_id": str(context.tournament_id),
+                "slug": context.slug,
+                "name": context.name,
+                "currency": context.currency,
+                "status": context.status,
+                "saved_at": time.time(),
+            },
+        )
+    except Exception as exc:  # a cache only: never stop the start-up over it
+        log.debug("could not save the dashboard context: %s", exc)
+
+
+def _saved_context(store: Any, slug: str) -> Any:
+    """The context saved for ``slug`` by an earlier start, or None."""
+    from .bot import Context
+
+    try:
+        raw = store.get_state(CONTEXT_STATE_KEY)
+    except Exception:
+        return None
+    if not isinstance(raw, Mapping) or str(raw.get("slug") or "").lower() != str(slug).lower():
+        return None
+    tid = raw.get("tournament_id")
+    if not isinstance(tid, (str, int)) or isinstance(tid, bool) or not str(tid).strip():
+        return None
+
+    def text(key: str) -> Optional[str]:
+        value = raw.get(key)
+        return str(value) if isinstance(value, (str, int, float)) and not isinstance(value, bool) and str(value) else None
+
+    return Context(
+        tournament_id=str(tid).strip(),
+        slug=str(raw.get("slug")),
+        name=text("name") or str(raw.get("slug")),
+        currency=text("currency"),
+        status=text("status"),
+    )
+
+
+def _resolve_live_context(
+    client: Any,
+    slug: Optional[str],
+    public: bool,
+    data_dir: Path,
+    out: TextIO,
+    *,
+    sleep: Callable[[float], None],
+    waits: Sequence[float],
+    secrets: Sequence[str] = (),
+) -> Tuple[Any, Any]:
+    """``bot.resolve_context`` that rides out a temporarily unavailable API.
+
+    Returns ``(context, store)``; ``store`` is the already-open store when the context came
+    from it (a saved context), else None. Non-temporary errors are raised at once.
+    """
+    from .bot import resolve_context
+    from .errors import ApiError
+    from .store import TrackerStore
+
+    scrub = _Scrubber(secrets)
+    attempt = 0
+    looked_for_saved = False
+    while True:
+        try:
+            return resolve_context(client, slug=slug, public=public), None
+        except Exception as exc:
+            if not is_transient_error(exc):
+                raise
+            reason = scrub.text(str(exc) or type(exc).__name__)
+            if len(reason) > 240:
+                reason = reason[:237] + "…"
+            if slug and not public and not looked_for_saved:
+                looked_for_saved = True
+                db = Path(data_dir) / slug / "tracker.sqlite3"
+                if db.is_file():
+                    store = TrackerStore(db)
+                    try:
+                        saved = _saved_context(store, slug)
+                    except BaseException:
+                        store.close()
+                        raise
+                    if saved is not None:
+                        print(
+                            f"The Super Market API could not confirm the tournament right now ({reason}); "
+                            f"using the details saved for {slug} on the last run. "
+                            "Your balance will show once the API answers.",
+                            file=out,
+                            flush=True,
+                        )
+                        return saved, store
+                    store.close()
+            if attempt >= len(waits):
+                total = sum(float(w) for w in waits)
+                print(
+                    f"The Super Market API is still unavailable after {math.ceil(total / 60)} min of retries; "
+                    "try again later.",
+                    file=out,
+                    flush=True,
+                )
+                raise
+            wait = float(waits[attempt])
+            retry_after = getattr(exc, "retry_after", None) if isinstance(exc, ApiError) else None
+            if isinstance(retry_after, (int, float)) and math.isfinite(retry_after) and retry_after > wait:
+                wait = min(float(retry_after), MAX_STARTUP_WAIT_S)
+            attempt += 1
+            print(
+                f"The Super Market API is temporarily unavailable ({reason}); trying again in {wait:g} s "
+                f"(attempt {attempt + 1} of {len(waits) + 1}; Ctrl-C to stop).",
+                file=out,
+                flush=True,
+            )
+            sleep(wait)
+
+
+def build_live(
+    settings: Any,
+    args: Any,
+    out: TextIO = sys.stderr,
+    *,
+    sleep: Callable[[float], None] = time.sleep,
+    retry_waits: Optional[Sequence[float]] = None,
+) -> Runtime:
     """A dashboard over the real API (needs Settings with an API key)."""
     from .attribution import Attributor
-    from .bot import resolve_context
     from .client import SuperMarketClient
     from .news import NewsSearcher, default_providers
     from .store import TrackerStore
     from .tracker import Tracker
 
     client = SuperMarketClient.from_settings(settings)
+    store: Any = None
+    searcher: Any = None
     try:
         slug = getattr(args, "tournament", None) or settings.tournament
-        context = resolve_context(client, slug=slug, public=bool(getattr(args, "public", False)))
-        store = TrackerStore(Path(settings.data_dir) / context.label / "tracker.sqlite3")
-    except BaseException:
-        client.close()
+        data_dir = Path(settings.data_dir)
+        print("Connecting to the Super Market API…", file=out, flush=True)
+        context, store = _resolve_live_context(
+            client,
+            slug,
+            bool(getattr(args, "public", False)),
+            data_dir,
+            out,
+            sleep=sleep,
+            waits=STARTUP_RETRY_WAITS_S if retry_waits is None else tuple(retry_waits),
+            secrets=[settings.api_key],
+        )
+        if store is None:
+            store = TrackerStore(data_dir / context.label / "tracker.sqlite3")
+            _save_context(store, context)
+        no_news = bool(getattr(args, "no_news", False))
+        searcher = None if no_news else NewsSearcher(default_providers(), store=store)
+        llm = bool(getattr(args, "llm", False)) or os.environ.get("SUPERMARKET_LLM", "").strip().lower() in ("1", "true", "yes")
+        judge = _judge(llm, out)
+        attributor = Attributor(client, context, store, searcher, judge=judge)
+        interval = float(getattr(args, "interval", 30.0))
+        tracker = Tracker(client, context, store, interval=interval, attributor=attributor)
+        app = DashboardApp(
+            tracker,
+            store,
+            client,
+            context,
+            demo=False,
+            interval=interval,
+            secrets=[settings.api_key],
+            news_enabled=not no_news,
+            llm_enabled=judge is not None,
+        )
+    except BaseException:  # including Ctrl-C while connecting: release what was opened
+        for thing in (searcher, store, client):
+            close = getattr(thing, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception as exc:
+                    log.debug("closing %r after a failed start failed: %s", thing, exc)
         raise
-    no_news = bool(getattr(args, "no_news", False))
-    searcher = None if no_news else NewsSearcher(default_providers(), store=store)
-    llm = bool(getattr(args, "llm", False)) or os.environ.get("SUPERMARKET_LLM", "").strip().lower() in ("1", "true", "yes")
-    judge = _judge(llm, out)
-    attributor = Attributor(client, context, store, searcher, judge=judge)
-    interval = float(getattr(args, "interval", 30.0))
-    tracker = Tracker(client, context, store, interval=interval, attributor=attributor)
-    app = DashboardApp(
-        tracker,
-        store,
-        client,
-        context,
-        demo=False,
-        interval=interval,
-        secrets=[settings.api_key],
-        news_enabled=not no_news,
-        llm_enabled=judge is not None,
-    )
     return Runtime(app, tracker, store, client, context, news=searcher)
 
 
-def _bind(app: DashboardApp, host: str, port: int, out: TextIO) -> Optional[DashboardServer]:
+def _bind(
+    app: DashboardApp, host: str, port: int, out: TextIO, allow_hosts: Sequence[str] = ()
+) -> Optional[DashboardServer]:
     try:
+        if allow_hosts:
+            return make_server(app, host, port, allow_hosts=allow_hosts)
         return make_server(app, host, port)
     except OSError as exc:
         if exc.errno in (errno.EADDRINUSE, getattr(errno, "WSAEADDRINUSE", -1)) or "in use" in str(exc).lower():
@@ -1731,6 +2067,51 @@ def _bind(app: DashboardApp, host: str, port: int, out: TextIO) -> Optional[Dash
         return None
 
 
+def _allow_host_option(args: Any) -> List[str]:
+    """``--allow-host`` values (repeatable and/or comma-separated); [] when the CLI has no such option."""
+    raw = getattr(args, "allow_host", None)
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        raw = [raw]
+    names: List[str] = []
+    for item in raw:
+        for part in str(item or "").split(","):
+            part = part.strip()
+            if part and part not in names:
+                names.append(part)
+    return names
+
+
+def _install_sigterm(stopping: threading.Event) -> Any:
+    """Make SIGTERM stop the dashboard like Ctrl-C (also while it is still starting). Returns the old handler."""
+
+    def _sigterm(signum: int, frame: Any) -> None:
+        if not stopping.is_set():
+            stopping.set()
+            raise KeyboardInterrupt
+
+    try:
+        import signal
+
+        if threading.current_thread() is threading.main_thread():
+            return signal.signal(signal.SIGTERM, _sigterm)
+    except (ImportError, ValueError, OSError, AttributeError):
+        pass
+    return None
+
+
+def _restore_sigterm(previous: Any) -> None:
+    if previous is None:
+        return
+    try:
+        import signal
+
+        signal.signal(signal.SIGTERM, previous)
+    except (ImportError, ValueError, OSError, AttributeError):
+        pass
+
+
 def run_dashboard(settings: Any, args: Any, out: Optional[TextIO] = None, err: Optional[TextIO] = None) -> int:
     """``python -m supermarket_bot dashboard``: build, serve until Ctrl-C, shut down cleanly."""
     out = out or sys.stdout
@@ -1743,6 +2124,7 @@ def run_dashboard(settings: Any, args: Any, out: Optional[TextIO] = None, err: O
     host = str(getattr(args, "host", "127.0.0.1") or "127.0.0.1")
     port = int(getattr(args, "port", 8765))
     interval = float(getattr(args, "interval", 30.0))
+    allow_hosts = _allow_host_option(args)
     if not (0 <= port <= 65535):
         print("error: --port must be between 0 and 65535", file=err)
         return 2
@@ -1751,94 +2133,115 @@ def run_dashboard(settings: Any, args: Any, out: Optional[TextIO] = None, err: O
         return 2
     if not demo and interval < 10:
         print("warning: intervals under 10 s use a lot of the 100 reads/minute budget", file=err)
+    for name in allow_hosts:
+        exact, names = DashboardServer._extra_hosts([name])
+        if not exact and not names:
+            print(f"warning: ignoring --allow-host {name!r}: not a host name (use NAME or NAME:PORT)", file=err)
     if not is_loopback_host(host):
+        other_names = (
+            "; add any other name it is reached by (such as a reverse proxy's) with --allow-host NAME"
+            if hasattr(args, "allow_host")
+            else ""
+        )
         print(
             f"warning: listening on {host}, so any device that can reach this machine can open the dashboard "
-            "(there is no password). To let them in, the Host-header check that blocks DNS-rebinding attacks "
-            "is off, so a web page you visit could also read the dashboard's data. The dashboard is read-only "
-            "and never shows the API key; leave out --host (127.0.0.1) unless another device needs it.",
+            "(there is no password). It only answers to this machine's own addresses and names, which "
+            f"blocks DNS-rebinding pages{other_names}. The dashboard is read-only and never shows the API key; "
+            "leave out --host (127.0.0.1) unless another device needs it.",
             file=err,
         )
 
-    try:
-        if demo:
-            data_dir = Path(getattr(args, "data_dir", None) or "data")
-            runtime = build_demo(data_dir, interval, llm=bool(getattr(args, "llm", False)), news=not getattr(args, "no_news", False), out=err)
-        else:
-            if settings is None:
-                env_file = getattr(args, "env_file", ".env")
-                overrides = {"data_dir": args.data_dir} if getattr(args, "data_dir", None) else {}
-                settings = Settings.load(env_file=Path(env_file) if env_file else None, **overrides)
-            runtime = build_live(settings, args, out=err)
-    except ConfigError as exc:
-        print(f"error: {exc}", file=err)
-        return 2
-    except SuperMarketError as exc:
-        print(f"error: {exc}", file=err)
-        if is_fatal(exc):
-            print("The key was rejected; fix SUPERMARKET_API_KEY and try again (or use --demo).", file=err)
-        return 1
-    except OSError as exc:
-        print(f"error: {exc}", file=err)
-        return 1
-
-    server = _bind(runtime.app, host, port, err)
-    if server is None:
-        runtime.close()
-        return 1
     stopping = threading.Event()
-
-    def _sigterm(signum: int, frame: Any) -> None:
-        if not stopping.is_set():
-            stopping.set()
-            raise KeyboardInterrupt
-
-    previous = None
+    previous = _install_sigterm(stopping)
     try:
-        import signal
-
-        if threading.current_thread() is threading.main_thread():
-            previous = signal.signal(signal.SIGTERM, _sigterm)
-    except (ImportError, ValueError, OSError, AttributeError):
-        previous = None
-
-    try:
-        runtime.start()
-        url = server.url
-        if port == 0:
-            print(f"Picked free port {server.port}.", file=out)
-        print(f"Dashboard running at {url}  (Ctrl-C to stop)", file=out, flush=True)
-        if is_wildcard_host(host):
-            others = server.network_urls
-            if others:
-                print("From other devices on your network: " + "  ".join(others), file=out, flush=True)
-            else:
-                print(
-                    f"From other devices on your network: http://<this machine's IP address>:{server.port}",
-                    file=out,
-                    flush=True,
-                )
-        if runtime.app.demo:
-            print("Demo mode: simulated market data, no API key used.", file=out, flush=True)
-        if not getattr(args, "no_browser", False):
-            threading.Thread(target=_open_browser, args=(url,), name="open-browser", daemon=True).start()
-        server.serve_forever(poll_interval=0.5)
-    except KeyboardInterrupt:
-        print("\nStopping the dashboard…", file=out, flush=True)
-    finally:
-        stopping.set()
         try:
-            server.server_close()
-        finally:
-            runtime.close()
-            if previous is not None:
-                try:
-                    import signal
+            if demo:
+                data_dir = Path(getattr(args, "data_dir", None) or "data")
+                runtime = build_demo(
+                    data_dir, interval, llm=bool(getattr(args, "llm", False)), news=not getattr(args, "no_news", False), out=err
+                )
+            else:
+                if settings is None:
+                    env_file = getattr(args, "env_file", ".env")
+                    overrides = {"data_dir": args.data_dir} if getattr(args, "data_dir", None) else {}
+                    settings = Settings.load(env_file=Path(env_file) if env_file else None, **overrides)
+                runtime = build_live(settings, args, out=err)
+        except KeyboardInterrupt:
+            print("\nStopped before the dashboard started.", file=err, flush=True)
+            return 130
+        except ConfigError as exc:
+            print(f"error: {exc}", file=err)
+            return 2
+        except SuperMarketError as exc:
+            print(f"error: {exc}", file=err)
+            if is_fatal(exc):
+                print("The key was rejected; fix SUPERMARKET_API_KEY and try again (or use --demo).", file=err)
+            return 1
+        except OSError as exc:
+            print(f"error: {exc}", file=err)
+            return 1
+        return _serve(runtime, args, host, port, allow_hosts, stopping, out, err)
+    finally:
+        _restore_sigterm(previous)
 
-                    signal.signal(signal.SIGTERM, previous)
-                except (ValueError, OSError):
-                    pass
-    return 0
+
+def _serve(
+    runtime: Runtime,
+    args: Any,
+    host: str,
+    port: int,
+    allow_hosts: Sequence[str],
+    stopping: threading.Event,
+    out: TextIO,
+    err: TextIO,
+) -> int:
+    """Bind, start the tracker, serve until Ctrl-C/SIGTERM, then shut everything down."""
+    code = 0
+    try:
+        server = _bind(runtime.app, host, port, err, allow_hosts)
+    except KeyboardInterrupt:
+        server = None
+        code = 130
+    if server is None:
+        try:
+            runtime.close()
+        except KeyboardInterrupt:
+            pass
+        return code or 1
+    try:
+        try:
+            runtime.start()
+            url = server.url
+            if port == 0:
+                print(f"Picked free port {server.port}.", file=out)
+            print(f"Dashboard running at {url}  (Ctrl-C to stop)", file=out, flush=True)
+            if is_wildcard_host(host):
+                others = server.network_urls
+                if others:
+                    print("From other devices on your network: " + "  ".join(others), file=out, flush=True)
+                else:
+                    print(
+                        f"From other devices on your network: http://<this machine's IP address>:{server.port}",
+                        file=out,
+                        flush=True,
+                    )
+            if runtime.app.demo:
+                print("Demo mode: simulated market data, no API key used.", file=out, flush=True)
+            if not getattr(args, "no_browser", False):
+                threading.Thread(target=_open_browser, args=(url,), name="open-browser", daemon=True).start()
+            server.serve_forever(poll_interval=0.5)
+        except KeyboardInterrupt:
+            print("\nStopping the dashboard…", file=out, flush=True)
+        finally:
+            stopping.set()
+            try:
+                server.server_close()
+            finally:
+                runtime.close()
+    except KeyboardInterrupt:  # a second Ctrl-C while shutting down: stop waiting for the workers
+        print("Stopped without waiting for the background work to finish.", file=out, flush=True)
+        return 130
+    return code
 
 
 def _open_browser(url: str) -> None:

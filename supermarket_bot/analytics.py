@@ -38,6 +38,7 @@ MIN_TOLERANCE_S = 120.0
 HELD_AFTER_S = 86400.0  # a surge that has not reverted 24h after its end is "held"
 REVERT_FRACTION = 0.5
 STABLE_RANGE = 0.03
+BAND_MAX_GAP_S = 1200.0  # high band: a tick's price counts for at most this long without a newer point
 
 _EPS = 1e-9  # price/threshold slack (0.005 tick arithmetic)
 _TS_EPS = 1e-6  # timestamp slack in seconds
@@ -458,13 +459,20 @@ def high_band(
     settlement_date: Optional[str] = None,
     *,
     max_staleness_s: Optional[float] = None,
+    max_gap_s: Optional[float] = BAND_MAX_GAP_S,
 ) -> Optional[HighBand]:
     """The favourite side's band, when it sits at or above ``threshold`` now and for
     ``min_fraction`` of the lookback (time-weighted; time without data counts as outside).
 
-    The favourite is YES when the current mark is >= 0.5, else NO (``1 - p``). The value in
-    effect at the start of the lookback (the latest earlier point) is carried in.
-    ``max_staleness_s`` optionally rejects a current mark older than that.
+    The favourite is YES when the current mark is >= 0.5, else NO (``1 - p``). Each point's
+    value counts until the next point, but a tick (or the newest point) counts for at most
+    ``max_gap_s``: a longer pause is a gap in tracking (the dashboard was off, or snapshots
+    failed), not proof the price sat there. A candle close followed by a later point holds
+    until it (the price history only has candles for buckets with trades). The value in
+    effect at the start of the lookback (the latest earlier point) is carried in on the same
+    terms. ``max_gap_s=None`` carries every value until the next point. ``max_staleness_s``
+    optionally rejects a current mark older than that. Low, high and mean cover only the
+    values that count.
     """
     if lookback_s <= 0:
         raise ValueError("lookback_s must be positive")
@@ -487,16 +495,19 @@ def high_band(
     k0 = series.idx_at(start)
     if k0 is None:
         k0 = bisect.bisect_right(ts, start + _TS_EPS)
+    gap = _num(max_gap_s)
     in_band = covered = weighted = 0.0
     low = high = current
     for k in range(k0, i_now + 1):
         v = fav(prices[k])
-        low, high = min(low, v), max(high, v)
         seg_start = max(start, ts[k])
         seg_end = min(now, ts[k + 1]) if k < i_now else now
+        if gap is not None and not (series.held[k] and k < i_now):
+            seg_end = min(seg_end, ts[k] + gap)
         dur = seg_end - seg_start
         if dur <= 0:
             continue
+        low, high = min(low, v), max(high, v)
         covered += dur
         weighted += v * dur
         if v + _EPS >= threshold:

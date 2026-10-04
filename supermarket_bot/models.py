@@ -73,6 +73,16 @@ class PricePoint(_Serializable):
     bid: Optional[float] = None
     ask: Optional[float] = None
     source: str = "tick"
+    # Only on ``TrackerStore.latest()``: the newest stored order-book read for the exchange,
+    # ``{"at": epoch s, "bids": [[price, qty], ...] best first, "asks": [...]}`` (YES prices),
+    # used to size trade ideas by the depth they can really fill. Not part of equality.
+    book: Optional[Dict[str, Any]] = field(default=None, compare=False, repr=False)
+
+    def to_dict(self) -> Dict[str, Any]:
+        out = super().to_dict()
+        if out.get("book") is None:
+            out.pop("book", None)  # the usual point has no book: keep its shape unchanged
+        return out
 
 
 @dataclass
@@ -144,11 +154,15 @@ class Attribution(_Serializable):
     reasons: List[str] = field(default_factory=list)
     articles: List[Article] = field(default_factory=list)
     flow: Optional[TradeFlow] = None
-    book_depth: Optional[float] = None  # resting shares within 5 cents of the mid
+    book_depth: Optional[float] = None  # resting shares within 5 cents of the mid (both sides)
     method: str = "heuristic"  # "heuristic" | "llm" | "heuristic+llm"
     llm: Optional[Dict[str, Any]] = None
     analyzed_at: Optional[float] = None
     news_status: Optional[str] = None  # NEWS_OK | NEWS_UNAVAILABLE | NEWS_DISABLED (None: analysed before this existed)
+    # The same depth per side: YES bids within 5 cents below the mid (what a NO buy or a YES sale
+    # hits) and YES asks within 5 cents above it (what a YES buy hits). None when unknown.
+    bid_depth: Optional[float] = None
+    ask_depth: Optional[float] = None
 
 
 @dataclass
@@ -171,6 +185,14 @@ class Surge(_Serializable):
     reverted_fraction: Optional[float] = None  # share of the move given back since the peak
     attribution: Optional[Attribution] = None
     id: Optional[int] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        out = super().to_dict()
+        # The largest move seen (start -> peak), next to ``change`` (start -> end of the frame).
+        peak, start = self.peak_price, self.start_price
+        ok = all(isinstance(v, (int, float)) and not isinstance(v, bool) and v == v for v in (peak, start))
+        out["peak_change"] = round(peak - start, 6) if ok else None
+        return out
 
 
 @dataclass
@@ -219,6 +241,11 @@ class Opportunity(_Serializable):
     # single-outcome ideas, whose exchange_id / option / side / entry_price describe the order.
     legs: List[Dict[str, Any]] = field(default_factory=list)
     unit: str = "shares"  # what suggested_shares counts: "shares", or "sets" for multi-leg ideas
+    # Whether suggested_shares was checked against the order book on the side the idea buys
+    # (None: not applicable, e.g. a watch idea or nothing to size). When True, fill_price is the
+    # average price (per share, or per set) of filling the suggested size from the book.
+    depth_checked: Optional[bool] = None
+    fill_price: Optional[float] = None
 
 
 @dataclass
@@ -238,8 +265,10 @@ class StrategyReport(_Serializable):
     generated_at: float
     risk_mode: str  # "protect" | "balanced" | "aggressive"
     headline: str
-    balance: Optional[float] = None
+    balance: Optional[float] = None  # cash (the tournament's myBalance)
     initial_balance: Optional[float] = None
+    # Cash plus the market value of open positions: what the leaderboard's value compares with.
+    account_value: Optional[float] = None
     cup_end: Optional[float] = None
     days_left: Optional[float] = None
     leader_value: Optional[float] = None

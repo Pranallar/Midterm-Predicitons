@@ -141,7 +141,7 @@ body {
   flex-direction: column;
 }
 
-h1, h2, h3, h4 { margin: 0; line-height: 1.25; font-weight: 650; }
+h1, h2, h3, h4, h5 { margin: 0; line-height: 1.25; font-weight: 650; }
 p { margin: 0; }
 ul, ol { margin: 0; padding: 0; }
 button, input, select { font: inherit; color: inherit; }
@@ -343,11 +343,22 @@ main:focus, h2[tabindex="-1"]:focus { outline: none; }
   border-left-width: 4px;
   background: var(--surface);
 }
-.banner-body { flex: 1; min-width: 0; }
-.banner-title { font-size: 1rem; }
-.banner-body p { margin-top: 2px; overflow-wrap: anywhere; }
+.banner-body { flex: 1 1 0; min-width: 0; }
+.banner-title { font-size: 1rem; overflow-wrap: break-word; }
+/* break-word (not anywhere): words only split when one alone is wider than the line */
+.banner-body p { margin-top: 2px; overflow-wrap: break-word; }
 .banner-hint { color: var(--text-2); }
 .banner-actions { display: flex; gap: 6px; align-items: center; }
+.banner-actions-corner { margin: -6px -8px -6px 0; align-self: flex-start; }
+.problem-details { margin-top: 4px; }
+.problem-details > summary {
+  cursor: pointer;
+  display: inline-flex; align-items: center; gap: 4px;
+  min-height: 28px;
+  font-size: 0.875rem; font-weight: 600;
+  color: var(--link);
+}
+.problem-details[open] > summary { margin-bottom: 2px; }
 .banner-critical { background: var(--critical-wash); border-color: var(--critical); }
 .banner-critical > .icon { color: var(--critical); }
 .banner-warning { background: var(--warning-wash); border-color: var(--warning); }
@@ -356,8 +367,8 @@ main:focus, h2[tabindex="-1"]:focus { outline: none; }
 .banner-info > .icon { color: var(--series-1); }
 .banner-neutral { background: var(--surface-2); border-color: var(--muted); }
 .banner-neutral > .icon { color: var(--text-2); }
-.problem-list { list-style: none; margin-top: 6px; display: flex; flex-direction: column; gap: 4px; }
-.problem { overflow-wrap: anywhere; }
+.problem-list { list-style: none; margin-top: 2px; display: flex; flex-direction: column; gap: 4px; font-size: 0.9375rem; }
+.problem { overflow-wrap: break-word; }
 .problem-meta { color: var(--text-2); font-size: 0.875rem; }
 .view-errors { display: flex; flex-direction: column; gap: 6px; margin-bottom: 14px; }
 .inline-error {
@@ -404,6 +415,7 @@ main {
   border: 1px dashed var(--border-strong);
   border-radius: var(--radius);
 }
+.empty { overflow-wrap: anywhere; } /* a pasted URL in "No markets match …" wraps inside the box */
 .empty .btn { margin-left: 8px; }
 .look-col .empty { padding: 14px 12px; }
 
@@ -449,10 +461,20 @@ main {
   min-width: 0;
 }
 .tile-label { font-size: 0.875rem; font-weight: 600; color: var(--text-2); }
-.tile-value { font-size: 2rem; font-weight: 650; line-height: 1.2; overflow-wrap: normal; align-self: end; }
+/* Number and unit always share one line; --fit (set by app.js) is the value's width in em, so a
+   long value (a 7-digit balance) gets a smaller font instead of spilling out or wrapping. */
+.tile-value {
+  --tile-max: 2rem;
+  font-size: var(--tile-max);
+  font-weight: 650; line-height: 1.2;
+  white-space: nowrap; overflow: hidden;
+  align-self: end;
+  container-type: inline-size; /* .tile-fit sizes its font from this box's width (cqi) */
+}
+.tile-fit { font-size: clamp(1rem, calc(100cqi / var(--fit, 1)), var(--tile-max)); }
 .tile-num { white-space: nowrap; }
-.tile-unit { display: inline-block; white-space: nowrap; font-size: 0.9375rem; font-weight: 600; color: var(--text-2); }
-.tile-gap { font-size: 0.9375rem; }
+.tile-unit { white-space: nowrap; font-size: 0.47em; font-weight: 600; color: var(--text-2); }
+.tile-gap { font-size: 0.47em; }
 .tile-sub { font-size: 0.8125rem; color: var(--text-2); min-height: 1.5em; }
 
 /* ------------------------------------------------------------------ look-at-now lists */
@@ -585,6 +607,7 @@ main {
 .table-wrap {
   position: relative; /* contains .sr-only children so they cannot widen the page */
   overflow-x: auto;
+  scroll-padding-left: calc(var(--sticky-w, 0px) + 8px); /* focused cells scroll in beside the pinned column */
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius);
@@ -624,6 +647,16 @@ th[aria-sort] .sort-btn { color: var(--text); }
 .sort-ind { display: inline-block; width: 0.8em; font-size: 0.75em; color: var(--text); text-align: center; }
 .row-link { font-weight: 500; color: var(--text); text-decoration: none; }
 .row-link:hover { color: var(--link); text-decoration: underline; }
+/* The outcome inside the pinned title cell: screen-reader text on wide screens (it has its own
+   column there), a visible second line on narrow ones, where that column would scroll under the
+   pinned Market column. */
+.title-option {
+  position: absolute;
+  width: 1px; height: 1px;
+  margin: -1px; padding: 0;
+  overflow: hidden; clip: rect(0 0 0 0);
+  white-space: nowrap; border: 0;
+}
 .cell-title { min-width: 11rem; max-width: 22rem; }
 .cell-option { min-width: 5.5rem; }
 .cell-sub { display: block; font-size: 0.75rem; color: var(--text-2); white-space: nowrap; }
@@ -662,6 +695,22 @@ th[aria-sort] .sort-btn { color: var(--text); }
 }
 @media (max-width: 980px) {
   .markets-table th.spark-col, .markets-table td.spark-cell { display: none; }
+}
+/* Below this the tables scroll sideways: the outcome moves into the pinned Market cell so every
+   row still says which outcome it is while the prices scroll past. */
+@media (max-width: 1000px) {
+  .markets-table .col-option, .markets-table td.cell-option,
+  .high-table .col-option, .high-table td.cell-option { display: none; }
+  .markets-table .title-option, .high-table .title-option {
+    position: static;
+    display: block;
+    width: auto; height: auto;
+    margin: 1px 0 0;
+    overflow: visible; clip: auto;
+    white-space: normal;
+    font-size: 0.8125rem; font-weight: 600;
+    color: var(--text-2);
+  }
 }
 
 /* ------------------------------------------------------------------ surge cards */
@@ -822,9 +871,11 @@ th[aria-sort] .sort-btn { color: var(--text); }
   color: var(--text);
   box-shadow: var(--shadow-lg);
   overflow: hidden;
+  overflow: clip; /* the dialog itself never scrolls (find-in-page or a screen reader would slide the header away) */
 }
 .drawer::backdrop { background: var(--backdrop); }
-.drawer-inner { height: 100%; overflow-y: auto; overscroll-behavior: contain; scroll-padding-top: calc(var(--drawer-head-h, 0px) + 8px); }
+/* position: relative contains the absolutely positioned screen-reader helpers inside the scroll box */
+.drawer-inner { position: relative; height: 100%; overflow-y: auto; overscroll-behavior: contain; scroll-padding-top: calc(var(--drawer-head-h, 0px) + 8px); }
 @media (prefers-reduced-motion: no-preference) {
   .drawer[open] .drawer-inner { animation: drawer-in 0.18s ease-out; }
 }
@@ -859,6 +910,16 @@ th[aria-sort] .sort-btn { color: var(--text); }
   overflow-wrap: anywhere;
 }
 .drawer-stale .icon { margin-top: 0.2em; color: var(--text-2); }
+.drawer-closed {
+  display: flex; align-items: flex-start; gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--border-strong);
+  border-left-width: 4px;
+  border-radius: 8px;
+  background: var(--surface-2);
+}
+.drawer-closed .icon { margin-top: 0.2em; color: var(--text-2); }
+.drawer-question { font-weight: 600; overflow-wrap: break-word; margin-bottom: -6px; }
 .drawer-body .panel { padding: 14px 16px; }
 .drawer-body .panel + .panel { margin-top: 0; }
 .section-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 12px; margin-bottom: 10px; }
@@ -908,7 +969,7 @@ th[aria-sort] .sort-btn { color: var(--text); }
 .tooltip-key { display: inline-block; width: 12px; height: 2px; border-radius: 1px; background: var(--series-1); }
 .tooltip-key.surge { background: var(--series-2); }
 .tooltip-sub { color: var(--text-2); }
-.chart-empty { display: flex; align-items: center; justify-content: center; min-height: 290px; color: var(--text-2); text-align: center; padding: 0 16px; }
+.chart-empty { display: flex; flex-direction: column; gap: 10px; align-items: center; justify-content: center; min-height: 290px; color: var(--text-2); text-align: center; padding: 0 16px; }
 .legend { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 0.8125rem; color: var(--text-2); margin-top: 8px; }
 .legend-item { display: inline-flex; align-items: center; gap: 6px; }
 .key-line { display: inline-block; width: 16px; height: 2px; border-radius: 1px; background: var(--series-1); }
@@ -927,15 +988,19 @@ th[aria-sort] .sort-btn { color: var(--text); }
 .ladder th, .ladder td { padding: 4px 8px; }
 .ladder th:first-child, .ladder td:first-child { padding-left: 8px; }
 .ladder .qty { width: auto; }
-.ladder .px { width: 4.4em; text-align: center; font-variant-numeric: tabular-nums; font-weight: 600; white-space: nowrap; }
+/* wide enough for "0.655" with WCAG 1.4.12 letter spacing, with room on the divider side */
+.ladder .px { width: 5.4em; text-align: center; font-variant-numeric: tabular-nums; font-weight: 600; white-space: nowrap; }
 .ladder th.px { text-align: center; }
 .ladder .bid-px { border-right: 1px solid var(--axis); }
 .qty-cell { display: flex; align-items: center; gap: 8px; }
-.qty-cell.bid { justify-content: flex-end; }
-.qty-cell .bar { height: 14px; border-radius: 0; min-width: 2px; flex: none; }
+/* the bar fills a share of its track (flex: 1), so it stays proportional at every width */
+.qty-cell .bar-track { flex: 1 1 auto; min-width: 0; display: flex; height: 14px; }
+.qty-cell.bid .bar-track { justify-content: flex-end; }
+.qty-cell .bar { height: 14px; border-radius: 0; flex: none; max-width: 100%; }
+.qty-cell .bar.has-qty { min-width: 2px; }
 .qty-cell.bid .bar { background: var(--series-1); border-radius: 4px 0 0 4px; }
 .qty-cell.ask .bar { background: var(--series-2); border-radius: 0 4px 4px 0; }
-.qty-cell .qty-num { font-variant-numeric: tabular-nums; min-width: 3.5em; }
+.qty-cell .qty-num { font-variant-numeric: tabular-nums; min-width: 3.5em; flex: none; }
 .qty-cell.bid .qty-num { text-align: right; }
 .ladder tr.best td { background: var(--surface-2); }
 .ladder thead th.px:nth-child(2) { border-right: 1px solid var(--axis); }
@@ -962,6 +1027,11 @@ th[aria-sort] .sort-btn { color: var(--text); }
 
 @media (max-width: 640px) {
   body { font-size: 15px; }
+  /* banner actions ("Retry now", dismiss) go on their own row under the text, so the message
+     keeps the full width instead of a narrow column */
+  .banner { flex-wrap: wrap; }
+  .banner-actions { flex-basis: 100%; padding-left: calc(1.375em + 12px); }
+  .banner-actions.banner-actions-corner { flex-basis: auto; padding-left: 0; }
   .header-top { padding: 12px 14px 6px; }
   .app-nav { padding: 0 6px; }
   .app-nav a { padding: 8px 8px 7px; }
@@ -973,7 +1043,7 @@ th[aria-sort] .sort-btn { color: var(--text); }
   .dot-sep { display: none; }
   .brand-sub { flex-direction: column; align-items: flex-start; }
   .tile { padding: 12px; }
-  .tile-value { font-size: 1.5rem; }
+  .tile-value { --tile-max: 1.5rem; }
   .tile[data-tile="balance"] { grid-column: 1 / -1; }
   .panel { padding: 14px; }
   .card { padding: 14px; }
@@ -984,11 +1054,13 @@ th[aria-sort] .sort-btn { color: var(--text); }
   .drawer-body { padding: 12px 14px 24px; }
   .cell-title { min-width: 9rem; }
   .ladder th, .ladder td { padding: 4px 5px; }
-  .ladder .px { width: 4.2em; }
-  .qty-cell { gap: 5px; }
-  .qty-cell .qty-num { min-width: 2.8em; }
+  .ladder .px { width: 5em; }
+  .qty-cell { gap: 4px; }
+  .qty-cell .qty-num { min-width: 2.2em; }
   .look-item a { grid-template-columns: auto 1fr; }
-  .look-side { grid-column: 2; align-items: flex-start; text-align: left; flex-direction: row; flex-wrap: wrap; }
+  .look-side { grid-column: 2; align-items: flex-start; text-align: left; flex-direction: row; flex-wrap: wrap; column-gap: 0; }
+  /* on one line the two metrics need a visible separator ("Win 80% · Edge +0.026/share") */
+  .look-side > span + span::before { content: "·"; content: "·" / ""; margin: 0 8px; color: var(--text-2); }
   .idea { grid-template-columns: 1fr; gap: 6px; }
 }
 
@@ -998,6 +1070,17 @@ th[aria-sort] .sort-btn { color: var(--text); }
   .key-line, .key-band, .tooltip-key, .spark { forced-color-adjust: none; }
   .meter { outline: 1px solid CanvasText; }
   .chip[aria-pressed="true"], .seg[aria-pressed="true"], .btn-toggle[aria-pressed="true"] { outline: 2px solid CanvasText; }
+  /* focus on a pressed toggle must still change it (the pressed ring above would otherwise win) */
+  .chip[aria-pressed="true"]:focus-visible, .seg[aria-pressed="true"]:focus-visible, .btn-toggle[aria-pressed="true"]:focus-visible {
+    outline: 3px solid Highlight; outline-offset: 3px;
+  }
+  /* chart text, grid and band in system colours whatever the in-app theme (the price and surge
+     lines keep their colours, which the legend keys match) */
+  .chart svg text, .chart .tick, .chart .end-label, .chart .band-label { fill: CanvasText; }
+  .chart .band rect { fill: Canvas; stroke: GrayText; }
+  .chart .grid line, .chart .baseline { stroke: GrayText; }
+  .chart .crosshair { stroke: CanvasText; }
+  .chart .end-dot, .chart .surge-dot, .chart .hover-dot { stroke: Canvas; }
   /* only the current view is underlined (a transparent border would be forced to the link colour) */
   .app-nav a { forced-color-adjust: none; color: LinkText; background: Canvas; border-bottom-color: Canvas; }
   .app-nav a:hover { border-bottom-color: GrayText; }
@@ -1032,6 +1115,15 @@ th[aria-sort] .sort-btn { color: var(--text); }
 .key-band.key-bid { background: var(--series-1); border-color: transparent; }
 .key-band.key-ask { background: var(--series-2); border-color: transparent; }
 .chart-summary { margin-bottom: 8px; font-size: 0.875rem; }
+/* a surge that reverted, held or closed is history: its verdict is toned down in "Look at now" */
+.look-item.is-past .look-side .verdict { background: transparent; border-color: var(--border-strong); }
+.look-item.is-past .look-side .verdict .icon { color: var(--text-2); }
+.look-meta .status-badge { padding: 0 7px; font-size: 0.75rem; }
+/* an idea opened from the Overview (#strategy/<key>) */
+.idea { scroll-margin-top: 16px; }
+.idea.is-target { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-wash), var(--shadow); }
+.idea-title:focus { outline: none; }
+.book-error .icon { color: var(--text); }
 .card-section-title:not(:first-child) { margin-top: 14px; }
 .headline-title { font-weight: 600; }
 .updated time { display: inline-block; min-width: 4.6em; }

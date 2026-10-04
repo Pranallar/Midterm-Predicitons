@@ -1064,3 +1064,54 @@ def test_parse_retry_after_http_date_relative_to_now():
 def test_parse_retry_after_http_date_defaults_to_wall_clock():
     value = email.utils.formatdate(time.time() + 120, usegmt=True)
     assert 118.0 <= parse_retry_after(value) <= 120.0
+
+
+# --------------------------------------------------------------------------- round 2: secrets
+
+
+def test_r2_robustness_9_errors_never_carry_the_api_key(fake, make_client, caplog):
+    """An upstream error that echoes the Authorization header is masked where the ApiError is
+    made, so neither str(exc), its details, nor any log line can carry the key."""
+    import logging
+
+    echo = f"Request with credentials Bearer {API_KEY} could not be served"
+    fake.add("GET", "/markets/26", (503, {"error": {"code": "SERVICE_UNAVAILABLE", "message": echo,
+                                                    "details": {"authorization": f"Bearer {API_KEY}", "seen": [API_KEY]}}}))
+    client = make_client(max_retries=1)
+    with caplog.at_level(logging.DEBUG, logger="supermarket_bot"):
+        with pytest.raises(ApiError) as info:
+            client.get_market("26")
+        logging.getLogger("supermarket_bot").warning("tracker: leaderboard failed: %s", info.value)
+        logging.getLogger("supermarket_bot").info("raw text with the key %s inside", API_KEY)
+    err = info.value
+    assert API_KEY not in str(err) and API_KEY not in json.dumps(err.details)
+    assert "Bearer ***" in err.message and err.details == {"authorization": "Bearer ***", "seen": ["***"]}
+    assert API_KEY not in caplog.text and "Bearer ***" in caplog.text
+    assert "raw text with the key *** inside" in caplog.text  # any package log line is masked
+
+
+def test_r2_robustness_9_plain_text_errors_and_network_errors_are_masked(fake, make_client):
+    fake.add("GET", "/markets/27", (502, f"<html>bad gateway for Authorization: Bearer {API_KEY}</html>"))
+    with pytest.raises(ApiError) as info:
+        make_client(max_retries=0).get_market("27")
+    assert API_KEY not in str(info.value) and "***" in str(info.value)
+    fake.add("GET", "/markets/28", httpx.ConnectError(f"proxy refused Bearer {API_KEY}"))
+    with pytest.raises(NetworkError) as net:
+        make_client(max_retries=0).get_market("28")
+    assert API_KEY not in str(net.value)
+
+
+def test_r2_robustness_9_redaction_helpers():
+    from supermarket_bot.errors import RedactingFilter, redact, register_secret
+
+    register_secret("demo")  # too short to be a key: never masks ordinary words
+    assert redact("the demo market") == "the demo market"
+    register_secret("sk_live_QA_SECRET_9f8e7d6c5b4a")
+    assert redact("x sk_live_QA_SECRET_9f8e7d6c5b4a y") == "x *** y"
+    assert redact("Authorization: Bearer abc.def-123") == "Authorization: Bearer ***"
+    assert redact("token one-off-secret-value!", ["one-off-secret-value"]) == "token ***!"
+    import logging
+
+    record = logging.LogRecord("supermarket_bot", logging.WARNING, __file__, 1, "failed: %s",
+                               ("Bearer sk_live_QA_SECRET_9f8e7d6c5b4a",), None)
+    assert RedactingFilter().filter(record) and record.getMessage() == "failed: Bearer ***"
