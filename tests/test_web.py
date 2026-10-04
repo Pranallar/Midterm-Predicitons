@@ -1006,7 +1006,6 @@ def test_book_errors_are_short_and_scrubbed(make_app: Callable[..., web.Dashboar
     assert len(data["book_error"]) <= 300
 
 
-@pytest.mark.xfail(strict=True, reason="BUG: DashboardApp._short truncates an error to 300 chars before masking secrets, so a key cut at the boundary leaks its first characters")
 def test_truncated_errors_do_not_leak_part_of_a_secret(make_app: Callable[..., web.DashboardApp]) -> None:
     class BrokenClient:
         def get_exchange_orderbook(self, *args: Any, **kwargs: Any) -> Any:
@@ -1358,7 +1357,6 @@ def test_post_to_unknown_api_route_is_404(client: HTTP) -> None:
     assert_json_error(client.post("/api/nope"), 404)
 
 
-@pytest.mark.xfail(strict=True, reason="BUG: methods without a do_* handler (TRACE, PROPFIND, …) get the stdlib 501 HTML page instead of a JSON 405")
 @pytest.mark.parametrize("method", ["TRACE", "PROPFIND", "FOO"])
 def test_exotic_methods_are_405_with_security_headers(server: web.DashboardServer, method: str) -> None:
     resp = raw_request(server.port, f"{method} /api/status HTTP/1.1\r\nHost: 127.0.0.1:{server.port}\r\nConnection: close\r\n\r\n".encode())
@@ -1366,7 +1364,6 @@ def test_exotic_methods_are_405_with_security_headers(server: web.DashboardServe
     assert_security_headers(resp)
 
 
-@pytest.mark.xfail(strict=True, reason="BUG: errors raised by BaseHTTPRequestHandler itself (send_error, e.g. 414 URI too long, 431 header too long) skip SECURITY_HEADERS")
 @pytest.mark.parametrize(
     "request_bytes",
     [
@@ -1582,7 +1579,6 @@ def test_non_ascii_text_round_trips(make_app: Callable[..., web.DashboardApp]) -
     assert row["title"] == title and row["option"] == "Ño"
 
 
-@pytest.mark.xfail(strict=True, reason="BUG: encode_json(ensure_ascii=False) raises UnicodeEncodeError on a lone surrogate (e.g. from API JSON), so the endpoint answers 500")
 def test_lone_surrogates_do_not_break_an_endpoint(make_app: Callable[..., web.DashboardApp]) -> None:
     app = make_app(FakeTracker({"exchanges": [{"exchange_id": "e1", "title": "broken \ud83d emoji"}]}))
     with serve(app) as srv:
@@ -1640,12 +1636,6 @@ def test_build_demo_runtime_start_and_stop(tmp_path: Path) -> None:
 RACE_T0 = 1_791_095_911.0  # a start time seen to hit the race in the threaded runtime
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: a surge detected while only the hourly backfill has landed (tracker loop racing the backfill worker) "
-    "gets a 24h window starting ~26 h back; later detections merge into it keeping that start and the stale "
-    "attribution, so the scripted Ohio participant spike stays 'unclear'",
-)
 def test_surges_seen_before_the_backfill_finishes_are_not_misattributed(tmp_path: Path) -> None:
     runtime, clock = build_frozen_demo(tmp_path, RACE_T0)
     try:

@@ -177,6 +177,7 @@ class Tracker:
         self._queue: Deque[int] = deque()
         self._queued: Set[int] = set()
         self._analyzed_change: Dict[int, float] = self._load_analyzed()
+        self._analyzed_window: Dict[int, str] = {}  # window each surge was last analysed over
         self._analyses = 0
 
         # context
@@ -410,6 +411,10 @@ class Tracker:
         result["sparkline"] = [[p.ts, p.price] for p in analytics.downsample(recent, SPARKLINE_POINTS)]
         result["changes"] = {name: analytics.change_over(points, now, secs) for name, secs in CHANGE_WINDOWS}
         result["band"] = analytics.high_band(points, now, eid, info.market_id, settlement_date=info.settlement_date)
+        if self._history_pending(eid):
+            # Detecting on partial history mis-sizes the window (e.g. a 20-minute spike read as a
+            # 24h move); wait until this outcome's candle backfill has landed or given up.
+            return
         for surge in analytics.detect_surges(points, now, eid, info.market_id):
             recorded = self._record_surge(surge)
             if recorded is None:
@@ -420,6 +425,14 @@ class Tracker:
                 summary["new_surges"].append(stored.id)
             if self._maybe_queue(stored):
                 summary["queued"].append(stored.id)
+
+    def _history_pending(self, eid: str) -> bool:
+        if not self.backfill_enabled:
+            return False
+        with self._lock:
+            return any(
+                (eid, res) not in self._bf_done and (eid, res) not in self._bf_failed for res, _ in BACKFILL_PLAN
+            )
 
     def _record_surge(self, surge: Surge) -> Optional[Tuple[Surge, bool]]:
         """Store a detection, unless it only re-detects a move that already reverted or held.
@@ -477,8 +490,10 @@ class Tracker:
             if baseline is None and stored.attribution is not None:
                 # analysed in an earlier run whose baseline was not saved: start from today's size
                 self._analyzed_change[sid] = abs(stored.change)
+                self._analyzed_window[sid] = stored.window
                 return False
-            if baseline is not None and abs(stored.change) - baseline < REANALYZE_GROWTH - _EPS:
+            reframed = sid in self._analyzed_window and self._analyzed_window[sid] != stored.window
+            if baseline is not None and not reframed and abs(stored.change) - baseline < REANALYZE_GROWTH - _EPS:
                 return False
             self._queue.append(sid)
             self._queued.add(sid)
@@ -542,6 +557,7 @@ class Tracker:
             self.store.set_attribution(sid, attribution)
             with self._lock:
                 self._analyzed_change[sid] = abs(surge.change)
+                self._analyzed_window[sid] = surge.window
                 self._analyses += 1
                 if len(self._analyzed_change) > MAX_ANALYZED_REMEMBERED:
                     for old in sorted(self._analyzed_change)[: len(self._analyzed_change) - MAX_ANALYZED_REMEMBERED]:

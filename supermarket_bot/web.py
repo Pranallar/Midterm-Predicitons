@@ -157,7 +157,9 @@ class _Scrubber:
 
 
 def encode_json(value: Any, secrets: Iterable[str] = ()) -> bytes:
-    return json.dumps(_Scrubber(secrets)(value), ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    text = json.dumps(_Scrubber(secrets)(value), ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+    # A lone surrogate (possible in API JSON) cannot be UTF-8 encoded; replace it, never 500.
+    return text.encode("utf-8", errors="replace")
 
 
 def _safe_url(url: Any) -> Optional[str]:
@@ -453,10 +455,11 @@ class DashboardApp:
         return view if isinstance(view, Mapping) else {}
 
     def _short(self, exc: BaseException) -> str:
-        text = str(exc) or type(exc).__name__
+        # Mask secrets BEFORE truncating, or a key cut at the boundary would leak its start.
+        text = _Scrubber(self.secrets).text(str(exc) or type(exc).__name__)
         if len(text) > 300:
             text = text[:297] + "…"
-        return _Scrubber(self.secrets).text(text)
+        return text
 
     def _rows(self, view: Mapping[str, Any]) -> List[Dict[str, Any]]:
         rows: List[Dict[str, Any]] = []
@@ -1112,6 +1115,28 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self._error(405, "Method not allowed.", (("Allow", "GET, HEAD, POST"),))
 
     do_PUT = do_DELETE = do_PATCH = do_OPTIONS = _not_allowed  # noqa: N815
+
+    def send_error(self, code: int, message: Optional[str] = None, explain: Optional[str] = None) -> None:
+        """Errors raised by the stdlib itself (unknown method, 414, 431…) as JSON with security headers."""
+        extra: Tuple[Tuple[str, str], ...] = (("Cache-Control", "no-store"),)
+        if code == 501:  # no do_<METHOD> handler: answer like the other unsupported methods
+            code, message = 405, "Method not allowed."
+            extra += (("Allow", "GET, HEAD, POST"),)
+        short = self.responses.get(code, ("Error", ""))[0]
+        body = json.dumps({"error": message or short}).encode("utf-8")
+        self.close_connection = True
+        try:
+            self.send_response(code, short)
+            self.send_header("Content-Type", JSON_TYPE)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            for name, value in SECURITY_HEADERS + extra:
+                self.send_header(name, value)
+            self.end_headers()
+            if self.command != "HEAD" and code >= 200 and code not in (204, 304):
+                self.wfile.write(body)
+        except OSError:  # the client went away
+            pass
 
     # ------------------------------------------------------------------ routes
     def _api_get(self, path: str, query: Mapping[str, List[str]]) -> None:

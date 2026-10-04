@@ -629,7 +629,6 @@ def test_snapshots_agree_with_price_history_and_the_tape() -> None:
         assert _consistency(client, demo) <= 0.05
 
 
-@pytest.mark.xfail(strict=True, reason="BUG: price-history drops a trade printed exactly at `now` (hi = min(now, nextafter(now)) = now) while /price latestPrice and /trades include it")
 def test_price_history_includes_a_trade_printed_exactly_now() -> None:
     offset = Offset()
     demo = make_market(offset=offset)
@@ -808,12 +807,6 @@ def test_live_surge_on_michigan_appears_about_90s_after_start(timeline: SimpleNa
     assert timeline.end[MI].status == "reverted"  # 60% of the move reverts within 40 minutes
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: the scripted 'participant-style' live surge (f) is attributed 'unclear' for many demo start times: "
-    "its quiet period is only 6 min, so background trades from the 1h window dilute the two scripted trades "
-    "below the crowd thresholds (top share 0.45 < 0.5, HHI 0.34 < 0.35, YES share 0.846 < 0.85)",
-)
 def test_live_surge_on_michigan_is_attributed_to_participants(timeline: SimpleNamespace) -> None:
     sid = next(sid for _, eid, sid in timeline.detections if eid == MI)
     assert timeline.store.get_surge(sid).attribution.verdict == "participants"

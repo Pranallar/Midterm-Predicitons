@@ -256,6 +256,9 @@ def _surge_values(surge: Surge) -> List[Any]:
     return [getattr(surge, name) for name, _ in _SURGE_COLUMNS]
 
 
+REFRAME_SHARE = 0.5  # same rule analytics uses to pick the shortest window holding most of a move
+
+
 def _merge_surges(old: Surge, new: Surge) -> Surge:
     """Merge a fresh detection into the stored open surge for the same exchange and direction.
 
@@ -264,11 +267,21 @@ def _merge_surges(old: Surge, new: Surge) -> Surge:
     detection) and the attribution are kept.
     """
     merged = dataclasses.replace(old)
-    if new.start_ts < old.start_ts:
+    # A later detection over a shorter window that still holds most of the move describes it
+    # better (e.g. the first sighting used partial history): adopt its start and window.
+    reframe = (
+        new.window_s < old.window_s
+        and new.start_ts > old.start_ts
+        and abs(new.change) + 1e-9 >= REFRAME_SHARE * abs(old.change)
+    )
+    if reframe:
+        merged.start_ts, merged.start_price = new.start_ts, new.start_price
+        merged.change, merged.window, merged.window_s, merged.zscore = new.change, new.window, new.window_s, new.zscore
+    elif new.start_ts < old.start_ts:
         merged.start_ts, merged.start_price = new.start_ts, new.start_price
     if new.end_ts >= old.end_ts:
         merged.end_ts, merged.end_price = new.end_ts, new.end_price
-    if abs(new.change) > abs(old.change):
+    if not reframe and abs(new.change) > abs(old.change):
         merged.change, merged.window, merged.window_s, merged.zscore = new.change, new.window, new.window_s, new.zscore
     if old.direction == "down":
         merged.peak_price = min(old.peak_price, new.peak_price)

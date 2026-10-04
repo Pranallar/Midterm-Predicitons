@@ -566,6 +566,8 @@ class DemoMarket:
             ts = start + (rng.random() ** 1.6) * 14 * MIN
             side = "YES" if rng.random() < 0.85 else "NO"
             pa.scripted.append((ts, side, _log_uniform(rng.random(), 10, 90)))
+        # small pre-move prints so there is always a reference price about an hour back
+        pa.scripted += [(start - 12 * MIN, "YES", 15), (start - 27 * MIN, "NO", 20)]
 
         # (b) participant spike: two large YES trades at t0-20m (+0.10 then +0.18) on a
         # thin book; 60% of the move reverts over the first 40 live minutes.
@@ -582,8 +584,10 @@ class DemoMarket:
         mi = self._by_key["mi-senate"].exchanges[0]
         f1, f2 = t0 + 90, t0 + 112
         mi.set_knots([(f1, 0.0), (f1, 0.06), (f2, 0.06), (f2, 0.10), (f2 + 8 * MIN, 0.10), (f2 + 38 * MIN, 0.04)])
-        mi.quiet.append((f1 - 6 * MIN, f2 + 6 * MIN))
-        mi.scripted += [(f1, "YES", 420), (f2, "YES", 330)]
+        # Like Ohio: a quiet hour before the spike so the two big trades dominate the 1h window,
+        # with one small print that anchors the price an hour back.
+        mi.quiet.append((f1 - 70 * MIN, f2 + 6 * MIN))
+        mi.scripted += [(f1 - 65 * MIN, "NO", 10), (f1, "YES", 420), (f2, "YES", 330)]
         for minutes, size in ((10, 50), (16, 70), (23, 40), (29, 65), (36, 45)):
             mi.scripted.append((f2 + minutes * MIN, "NO", size))
 
@@ -1311,7 +1315,8 @@ class DemoMarket:
             start = math.floor(start / res) * res
         if end is not None:
             end = math.floor(end / res) * res
-        stop = end if end is not None else now
+        # Without `to` the window runs through now inclusive, like /price and /trades.
+        stop = end if end is not None else math.nextafter(now, math.inf)
         if start is not None and stop <= start:
             raise _invalid("to", "the floored end must be after the floored start")
         trades = self._trades_between(ex, start if start is not None else self.history_start, stop, now)
