@@ -34,6 +34,58 @@ This prints your profile, balance and the tournaments your key can access. If ex
 tournament is active the bot uses it automatically. Otherwise pass `--tournament <slug>`
 (or set `SUPERMARKET_TOURNAMENT`).
 
+## Dashboard (recommended)
+
+```bash
+python -m supermarket_bot dashboard          # uses your key from .env
+python -m supermarket_bot dashboard --demo   # simulated market: no key, no internet
+```
+
+It opens `http://127.0.0.1:8765` in your browser. The page is served only to your own computer.
+While it runs, the bot records every outcome's price every 30 seconds into
+`data/<tournament>/tracker.sqlite3`. It also loads the last 7 days of price history, so surges
+show up straight away. Stop it with Ctrl-C.
+
+| View | What it shows |
+| --- | --- |
+| **Overview** | Outcomes tracked, surges in the last hour, competitor-driven surges still open, high-90s count, your balance and rank, and a "Look at now" list |
+| **Markets** | Every outcome: last price, bid, ask, spread, change over 5 minutes, 1 hour and 24 hours, a 24-hour sparkline, and flags. Click a row for detail |
+| **Surges** | Sudden moves, each with a verdict and the evidence behind it (see below) |
+| **High 90s** | Outcomes whose favourite side has sat at 0.95 or more, and whether they settle before the Cup ends |
+| **Strategy** | Ranked, sized trade ideas with reasoning and risks, plus a risk mode based on your standing |
+| **Market detail** | Price chart with surges marked, order book, recent trades, headlines |
+
+How a surge gets its verdict:
+
+1. **Spotting it.** A move counts as a surge when it is large over 5 minutes, 1 hour, 6 hours or
+   24 hours, judged against how much that market usually moves.
+2. **Checking the news.** The bot searches Google News and GDELT (a free global news index) for
+   headlines about that market published around the time of the move.
+3. **Checking the trades.** It looks at who moved the price. The price history doesn't name
+   traders, but a few large trades on a thin order book with no news points to a handful of
+   competitors.
+4. **The verdict.** **News** means the move is probably real and likely to hold. **Participants**
+   means it is likely to fall back, so it becomes a "fade" idea (a bet that the price returns).
+   **Unclear** means wait for confirmation.
+
+With `--llm` and an `ANTHROPIC_API_KEY`, Claude double-checks each verdict. This costs a little
+per surge and needs Python 3.10+ and `pip install anthropic`.
+
+The strategy ideas are:
+
+* **Fade**: bet against competitor-driven spikes.
+* **Carry**: buy near-certain favourites. These are flagged when the market settles after the Cup
+  ends on Nov 4; such positions are only valued at market price, not paid out.
+* **Arbitrage**: pricing errors the exchange reports itself.
+
+Sizes are a fraction of the Kelly bet size, which is calculated from your edge, and capped at
+8% of your balance.
+
+**Nothing is traded automatically.**
+
+Options: `--port`, `--interval` (seconds between snapshots), `--no-news`, `--no-browser`,
+`--host`. Screenshots are in `docs/screenshots/`.
+
 ## Commands
 
 | Command | What it reads |
@@ -131,8 +183,12 @@ pip install -r requirements-dev.txt
 python -m pytest
 ```
 
-The suite is fully offline: the REST API is faked with `httpx.MockTransport`, and the realtime
-tests run the real `realtime` client against a local fake Phoenix WebSocket server.
+The suite is fully offline:
+
+* The REST API is faked with `httpx.MockTransport`.
+* The realtime tests run the real `realtime` client against a local fake Phoenix WebSocket server.
+* The dashboard has a Playwright browser smoke test (`tests/e2e/`). It runs when Node and
+  Playwright are installed; skip it with `python -m pytest -m "not e2e"`.
 
 ## Reference
 
