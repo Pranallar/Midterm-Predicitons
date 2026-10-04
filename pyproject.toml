@@ -20,5 +20,11 @@ supermarket-bot = "supermarket_bot.cli:main"
 [tool.setuptools]
 packages = ["supermarket_bot"]
 
+[tool.setuptools.package-data]
+supermarket_bot = ["web/*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "e2e: browser end-to-end tests (need node + Playwright; skipped otherwise). Deselect with -m 'not e2e'.",
+]

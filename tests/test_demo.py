@@ -1,0 +1,929 @@
+"""Tests for supermarket_bot/demo.py: the simulated Super Market API and DemoNewsProvider.
+
+Everything goes through the real :class:`SuperMarketClient` (or a raw ``httpx`` client on the
+demo's ``MockTransport`` where the error body itself is under test); nothing touches the
+network. Time is injected: ``DemoMarket(now=T0, clock=...)`` pins the demo start, so every run
+sees the same prices.
+
+* Response shapes are validated against ``docs/supermarket-openapi.json`` with a small
+  validator (``$ref``, ``allOf``/``anyOf``/``oneOf``, types, ``required``, ``enum``, bounds).
+* The scripted events (docs/DESIGN.md, Demo section) run through the real tracker, attribution
+  and news pipeline on a fake clock that steps through the first 45 simulated minutes.
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import math
+from datetime import datetime, timezone
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
+
+import httpx
+import pytest
+
+import supermarket_bot.demo as demo_mod
+from supermarket_bot.attribution import Attributor
+from supermarket_bot.bot import resolve_context
+from supermarket_bot.client import SuperMarketClient
+from supermarket_bot.demo import DEMO_BASE_URL, DEMO_SLUG, DEMO_TOURNAMENT_ID, DemoMarket, DemoNewsProvider
+from supermarket_bot.errors import ApiError
+from supermarket_bot.models import Article
+from supermarket_bot.news import NewsProvider, NewsSearcher
+from supermarket_bot.store import TrackerStore
+from supermarket_bot.tracker import Tracker
+
+SPEC_PATH = Path(__file__).resolve().parent.parent / "docs" / "supermarket-openapi.json"
+T0 = 1_790_900_000.0  # 2026-10-02T00:13:20Z: the demo start for every test here
+MIN, HOUR, DAY = 60.0, 3600.0, 86400.0
+CUP_END = "2026-11-04T17:00:00.000Z"
+TID = DEMO_TOURNAMENT_ID
+OTHER_UUID = "00000000-0000-4000-8000-000000000000"
+OPEN_EXCHANGES = [str(9001 + i) for i in range(22)]  # 9023 belongs to the settled debate market
+ALL_MARKETS = [str(301 + i) for i in range(15)]
+MULTI_MARKETS = {"311", "312", "313", "314"}
+PA, OH, MI = "9001", "9002", "9003"  # news surge, participant spike, live surge
+BAND_BEFORE_CUP_END = {"9007", "9008"}
+BAND_AFTER_CUP_END = {"9009", "9010"}
+
+
+# --------------------------------------------------------------------------- helpers
+
+
+class Offset:
+    """Demo clock offset: ``market.now() == T0 + offset.now``."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def iso(ts: float) -> str:
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def epoch(text: str) -> float:
+    return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+
+
+def on_tick(price: float) -> bool:
+    return abs(price / 0.005 - round(price / 0.005)) < 1e-6
+
+
+def make_market(seed: int = 7, offset: Optional[Offset] = None) -> DemoMarket:
+    return DemoMarket(seed=seed, now=T0, clock=offset if offset is not None else (lambda: 0.0))
+
+
+def make_client(market: DemoMarket) -> SuperMarketClient:
+    return market.client(reads_per_min=100_000)
+
+
+# --------------------------------------------------------------------------- OpenAPI validation
+
+
+class Spec:
+    def __init__(self, data: Dict[str, Any]) -> None:
+        self.data = data
+
+    def deref(self, schema: Any) -> Any:
+        for _ in range(50):
+            if not (isinstance(schema, dict) and "$ref" in schema):
+                return schema
+            node: Any = self.data
+            for part in schema["$ref"].lstrip("#/").split("/"):
+                node = node[part]
+            extra = {k: v for k, v in schema.items() if k != "$ref"}
+            schema = {**node, **extra} if extra else node
+        raise AssertionError("$ref loop")
+
+    def response_schema(self, path: str, method: str = "get", status: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        responses = self.data["paths"][path][method]["responses"]
+        if status is None:
+            status = "200" if "200" in responses else "201"
+        if status not in responses:
+            return None
+        response = self.deref(responses[status])
+        return response.get("content", {}).get("application/json", {}).get("schema")
+
+    def validate(self, value: Any, schema: Any, where: str = "$", depth: int = 0) -> List[str]:
+        errors: List[str] = []
+        schema = self.deref(schema)
+        if not isinstance(schema, dict) or depth > 40:
+            return errors
+        for sub in schema.get("allOf", []):
+            errors += self.validate(value, sub, where, depth + 1)
+        for key in ("anyOf", "oneOf"):
+            if key in schema:
+                options = [self.validate(value, sub, where, depth + 1) for sub in schema[key]]
+                if all(options):
+                    errors.append(f"{where}: matches no {key} branch ({'; '.join(o[0] for o in options)})")
+        kinds = schema.get("type")
+        if kinds is not None:
+            kinds = list(kinds) if isinstance(kinds, list) else [kinds]
+            if schema.get("nullable"):
+                kinds.append("null")
+            if not any(_is_type(value, k) for k in kinds):
+                return errors + [f"{where}: expected {kinds}, got {type(value).__name__} {value!r:.60}"]
+        if "enum" in schema and value not in schema["enum"]:
+            errors.append(f"{where}: {value!r} not in {schema['enum']}")
+        if "const" in schema and value != schema["const"]:
+            errors.append(f"{where}: {value!r} != {schema['const']!r}")
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            if "minimum" in schema and value < schema["minimum"]:
+                errors.append(f"{where}: {value} < minimum {schema['minimum']}")
+            if "maximum" in schema and value > schema["maximum"]:
+                errors.append(f"{where}: {value} > maximum {schema['maximum']}")
+        if isinstance(value, dict):
+            errors += [f"{where}: missing {name!r}" for name in schema.get("required", []) if name not in value]
+            for name, sub in (schema.get("properties") or {}).items():
+                if name in value:
+                    errors += self.validate(value[name], sub, f"{where}.{name}", depth + 1)
+        if isinstance(value, list) and "items" in schema:
+            for i, item in enumerate(value[:60]):
+                errors += self.validate(item, schema["items"], f"{where}[{i}]", depth + 1)
+        return errors
+
+
+def _is_type(value: Any, kind: str) -> bool:
+    if kind == "null":
+        return value is None
+    if kind == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if kind == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    return isinstance(value, {"string": str, "boolean": bool, "object": dict, "array": list}[kind])
+
+
+@pytest.fixture(scope="module")
+def spec() -> Spec:
+    return Spec(json.loads(SPEC_PATH.read_text(encoding="utf-8")))
+
+
+@pytest.fixture(scope="module")
+def market() -> DemoMarket:
+    """A demo frozen at T0 (its clock never moves)."""
+    return make_market()
+
+
+@pytest.fixture(scope="module")
+def api(market: DemoMarket) -> Iterator[SuperMarketClient]:
+    client = make_client(market)
+    yield client
+    client.close()
+
+
+@pytest.fixture(scope="module")
+def raw(market: DemoMarket) -> Iterator[httpx.Client]:
+    """A plain httpx client on the demo transport, for looking at error bodies directly."""
+    client = httpx.Client(transport=market.transport(), base_url=DEMO_BASE_URL + "/", headers={"Authorization": "Bearer demo"})
+    yield client
+    client.close()
+
+
+# --------------------------------------------------------------------------- shapes vs the OpenAPI spec
+
+
+SHAPE_CASES: List[Tuple[str, str, str, Callable[[SuperMarketClient], Any]]] = [
+    ("account", "/account", "get", lambda c: c.get_account()),
+    ("tournaments", "/tournaments", "get", lambda c: c.list_tournaments()),
+    ("tournament", "/tournaments/{slug}", "get", lambda c: c.get_tournament(DEMO_SLUG)),
+    ("tournament-markets", "/tournaments/{slug}/markets", "get", lambda c: c.list_tournament_markets(DEMO_SLUG)),
+    ("tournament-market-multi", "/tournaments/{slug}/markets/{id}", "get", lambda c: c.get_tournament_market(DEMO_SLUG, "311")),
+    ("tournament-market-settled", "/tournaments/{slug}/markets/{id}", "get", lambda c: c.get_tournament_market(DEMO_SLUG, "315")),
+    ("markets", "/markets", "get", lambda c: c.list_markets(tournament_id=TID, status="any")),
+    ("market", "/markets/{id}", "get", lambda c: c.get_market("301", tournament_id=TID)),
+    ("market-settled", "/markets/{id}", "get", lambda c: c.get_market("315", tournament_id=TID)),
+    ("nodes-binary", "/markets/{id}/nodes", "get", lambda c: c.get_market_nodes("301", tournament_id=TID)),
+    ("nodes-multi", "/markets/{id}/nodes", "get", lambda c: c.get_market_nodes("311", tournament_id=TID)),
+    ("market-orderbook", "/markets/{id}/orderbook", "get", lambda c: c.get_market_orderbook("311", tournament_id=TID)),
+    ("market-orderbook-settled", "/markets/{id}/orderbook", "get", lambda c: c.get_market_orderbook("315", tournament_id=TID)),
+    ("exchanges", "/exchanges", "get", lambda c: c.list_exchanges(tournament_id=TID)),
+    ("prices", "/exchanges/prices", "get", lambda c: c.get_prices(OPEN_EXCHANGES + ["9023", "1"], tournament_id=TID)),
+    ("price", "/exchanges/{id}/price", "get", lambda c: c.get_exchange_price("9001", tournament_id=TID)),
+    ("price-settled", "/exchanges/{id}/price", "get", lambda c: c.get_exchange_price("9023", tournament_id=TID)),
+    ("orderbook", "/exchanges/{id}/orderbook", "get", lambda c: c.get_exchange_orderbook("9002", depth=20, tournament_id=TID)),
+    ("price-history-1h", "/exchanges/{id}/price-history", "get", lambda c: c.get_price_history("9001", tournament_id=TID, resolution="1h", limit=168)),
+    ("price-history-5m", "/exchanges/{id}/price-history", "get", lambda c: c.get_price_history("9002", tournament_id=TID, resolution="5m", start=iso(T0 - DAY), limit=100)),
+    ("trades", "/exchanges/{id}/trades", "get", lambda c: c.get_trades("9001", tournament_id=TID, limit=200)),
+    ("constraints", "/relationships/constraints", "get", lambda c: c.get_relationship_constraints(tournament_id=TID)),
+    ("violations", "/relationships/constraints", "get", lambda c: c.get_relationship_constraints(violations_only=True, tournament_id=TID)),
+    ("tournament-leaderboard", "/tournaments/{slug}/leaderboard", "get", lambda c: c.get_tournament_leaderboard(DEMO_SLUG, limit=100)),
+    ("leaderboards", "/leaderboards", "get", lambda c: c.get_leaderboard(tournament_slug=DEMO_SLUG, period="7d")),
+    ("positions", "/tournaments/{slug}/portfolio/positions", "get", lambda c: c.get_tournament_positions(DEMO_SLUG)),
+    ("pnl-week", "/tournaments/{slug}/portfolio/pnl", "get", lambda c: c.get_tournament_pnl(DEMO_SLUG, "week")),
+    ("pnl-all", "/tournaments/{slug}/portfolio/pnl", "get", lambda c: c.get_tournament_pnl(DEMO_SLUG, "all")),
+    ("realtime-token", "/realtime/token", "post", lambda c: c.mint_realtime_token()),
+]
+
+
+@pytest.mark.parametrize("path, method, call", [pytest.param(p, m, f, id=name) for name, p, m, f in SHAPE_CASES])
+def test_responses_match_the_openapi_spec(spec: Spec, api: SuperMarketClient, path: str, method: str, call: Callable[[SuperMarketClient], Any]) -> None:
+    body = call(api)
+    schema = spec.response_schema(path, method)
+    assert schema is not None
+    assert spec.validate(body, schema) == []
+
+
+def test_the_validator_catches_mistakes(spec: Spec, api: SuperMarketClient) -> None:
+    schema = spec.response_schema("/exchanges/{id}/price")
+    good = api.get_exchange_price("9001", tournament_id=TID)
+    assert spec.validate(good, schema) == []
+    broken = {**good, "exchangeId": 9001}
+    del broken["bestBid"]
+    errors = spec.validate(broken, schema)
+    assert any("bestBid" in e for e in errors) and any("exchangeId" in e for e in errors)
+    book = api.get_exchange_orderbook("9001", tournament_id=TID)
+    assert spec.validate({**book, "bids": [{"price": "0.5", "quantity": 1}]}, spec.response_schema("/exchanges/{id}/orderbook"))
+
+
+def test_tournament_and_account(api: SuperMarketClient) -> None:
+    t = api.get_tournament(DEMO_SLUG)
+    assert t["id"] == TID and t["slug"] == DEMO_SLUG
+    assert t["name"] == "Predictions Cup — Midterm Elections (demo)"
+    assert t["currencyName"] == "SUSQies" and t["initialBalance"] == 100_000 and t["status"] == "active"
+    assert t["endDate"] == CUP_END and t["marketCount"] == 15
+    account = api.get_account()
+    assert account["balance"] == t["myBalance"]
+    listed = api.list_tournaments()
+    assert [x["slug"] for x in listed["data"]] == [DEMO_SLUG] and listed["pagination"]["total"] == 1
+    assert api.list_tournaments(status="ended")["data"] == []
+    assert len(api.list_tournaments(market_id="301")["data"]) == 1
+    assert api.list_tournaments(market_id="999")["data"] == []
+
+
+def test_markets_and_outcomes(api: SuperMarketClient) -> None:
+    markets = api.list_markets(tournament_id=TID, status="any")["data"]
+    assert sorted(m["id"] for m in markets) == ALL_MARKETS
+    exchanges = [ex for m in markets for ex in m["exchanges"]]
+    assert sorted(ex["id"] for ex in exchanges) == OPEN_EXCHANGES + ["9023"]
+    by_id = {m["id"]: m for m in markets}
+    assert by_id["301"]["title"] == "Will Republicans keep control of the Pennsylvania Senate?"
+    assert by_id["302"]["title"] == "Will Republicans win Ohio House District 9?"
+    arizona = by_id["311"]
+    assert arizona["title"] == "Who will win the Arizona Governor race?" and arizona["isMultiOutcome"] is True
+    assert [ex["option"] for ex in arizona["exchanges"]] == ["Democratic nominee", "Republican nominee", "Any other candidate"]
+    assert {m["id"] for m in markets if m["isMultiOutcome"]} == MULTI_MARKETS
+    for m in markets:
+        assert m["categories"] == ["Election Outcome"] and m["isComposite"] is False
+        assert m["contexts"][0]["tournament"]["id"] == TID
+        for ex in m["exchanges"]:
+            assert ex["latestPrice"] is None or (0 < ex["latestPrice"] < 1 and on_tick(ex["latestPrice"]))
+    settled = by_id["315"]
+    assert settled["status"] == "settled" and settled["settledWith"] == "YES" and settled["settledOn"]
+    assert all(m["status"] == "open" for m in markets if m["id"] != "315")
+
+
+def test_prices_and_books_are_two_sided_on_the_tick(api: SuperMarketClient) -> None:
+    prices = api.get_prices(OPEN_EXCHANGES, tournament_id=TID)
+    assert [p["exchangeId"] for p in prices["data"]] == OPEN_EXCHANGES and prices["missingIds"] == []
+    for p in prices["data"]:
+        assert 0 < p["bestBid"] < p["bestAsk"] < 1
+        assert on_tick(p["bestBid"]) and on_tick(p["bestAsk"]) and on_tick(p["latestPrice"])
+        assert p["spread"] == pytest.approx(p["bestAsk"] - p["bestBid"])
+    book = api.get_exchange_orderbook("9001", depth=20, tournament_id=TID)
+    bids, asks = [lv["price"] for lv in book["bids"]], [lv["price"] for lv in book["asks"]]
+    assert bids == sorted(bids, reverse=True) and asks == sorted(asks)
+    assert len(bids) == len(asks) == 20 and bids[0] < asks[0]
+    assert all(lv["quantity"] >= 1 and isinstance(lv["quantity"], int) for lv in book["bids"] + book["asks"])
+    assert (book["bestBid"], book["bestAsk"]) == (bids[0], asks[0])
+    assert isinstance(book["asOf"]["sequence"], int) and epoch(book["asOf"]["at"]) == pytest.approx(T0, abs=0.001)
+    thin = api.get_exchange_orderbook(OH, depth=20, tournament_id=TID)
+    near = sum(lv["quantity"] for lv in thin["bids"] + thin["asks"] if abs(lv["price"] - (thin["bestBid"] + thin["bestAsk"]) / 2) <= 0.05)
+    assert near < 500  # Ohio's thin book is part of the participant-spike story
+
+
+def test_nodes(api: SuperMarketClient) -> None:
+    binary = api.get_market_nodes("301", tournament_id=TID)
+    assert binary["market_id"] == "301" and binary["root"]["node_type"] == "contract"
+    multi = api.get_market_nodes("311", tournament_id=TID)
+    assert multi["root"]["node_type"] == "operator" and multi["root"]["operator"] == "OR"
+    assert [c["contract_details"]["outcome"] for c in multi["root"]["children"]] == ["Democratic nominee", "Republican nominee", "Any other candidate"]
+
+
+def test_leaderboard_portfolio_and_token(api: SuperMarketClient) -> None:
+    board = api.get_tournament_leaderboard(DEMO_SLUG, limit=100)
+    rows = board["leaderboard"]
+    assert board["total"] == len(rows) == 48
+    pnls = [r["pnl"] for r in rows]
+    assert pnls == sorted(pnls, reverse=True) and [r["rank"] for r in rows] == sorted(r["rank"] for r in rows)
+    me = next(r for r in rows if r["username"] == "demo_trader")
+    assert board["myRank"] == me["rank"]
+    top3 = api.get_tournament_leaderboard(DEMO_SLUG, limit=3)
+    assert [r["username"] for r in top3["leaderboard"]] == [r["username"] for r in rows[:3]]
+    by_roi = api.get_leaderboard(tournament_slug=DEMO_SLUG, period="1d", sort="roi", limit=100)["leaderboard"]
+    assert [r["roi"] for r in by_roi] == sorted((r["roi"] for r in by_roi), reverse=True)
+
+    positions = api.get_tournament_positions(DEMO_SLUG)
+    summary = positions["summary"]
+    assert summary["totalMarketValue"] == pytest.approx(sum(p["marketValue"] for p in positions["positions"]))
+    assert summary["totalCostBasis"] == pytest.approx(sum(p["costBasis"] for p in positions["positions"]))
+    pnl = api.get_tournament_pnl(DEMO_SLUG, "week")
+    assert pnl["totalAccountValue"] == pytest.approx(api.get_account()["balance"] + pnl["totalHoldingsValue"])
+    assert pnl["periodEnd"] == demo_mod._iso(T0)
+    assert api.get_tournament_pnl(DEMO_SLUG, "all")["periodPnl"] is None
+
+    token = api.mint_realtime_token()
+    assert token["token"].startswith("demo.") and epoch(token["expiresAt"]) == pytest.approx(T0 + 3 * HOUR, abs=1)
+
+
+# --------------------------------------------------------------------------- pagination and filters
+
+
+def _cursor_pages(fetch: Callable[[Optional[str]], Dict[str, Any]], items_key: str = "data") -> List[Dict[str, Any]]:
+    pages, cursor = [], None
+    for _ in range(100):
+        page = fetch(cursor)
+        pages.append(page)
+        if not page["pagination"]["hasMore"]:
+            assert page["pagination"]["nextCursor"] is None
+            return pages
+        cursor = page["pagination"]["nextCursor"]
+        assert cursor
+    raise AssertionError("pagination did not end")
+
+
+def test_market_cursor_pagination(api: SuperMarketClient) -> None:
+    pages = _cursor_pages(lambda cur: api.list_markets(tournament_id=TID, status="any", limit=4, cursor=cur))
+    ids = [m["id"] for p in pages for m in p["data"]]
+    assert len(pages) == 4 and [len(p["data"]) for p in pages] == [4, 4, 4, 3]
+    assert len(ids) == len(set(ids)) and sorted(ids) == ALL_MARKETS
+    assert all(p["pagination"]["total"] == 15 and p["pagination"]["limit"] == 4 for p in pages)
+    assert [m["id"] for m in api.iter_markets(tournament_id=TID, status="any")] == [m["id"] for m in api.list_markets(tournament_id=TID, status="any")["data"]]
+
+    tm_pages = _cursor_pages(lambda cur: api.list_tournament_markets(DEMO_SLUG, limit=6, cursor=cur))
+    assert sorted(m["id"] for p in tm_pages for m in p["data"]) == ALL_MARKETS
+    assert "contexts" not in tm_pages[0]["data"][0]  # tournament rows are not the canonical shape
+
+    ex_pages = _cursor_pages(lambda cur: api.list_exchanges(tournament_id=TID, limit=10, cursor=cur))
+    assert [len(p["data"]) for p in ex_pages] == [10, 10, 3]
+    assert [e["id"] for p in ex_pages for e in p["data"]] == OPEN_EXCHANGES + ["9023"]
+
+
+def test_trade_cursor_pagination(api: SuperMarketClient) -> None:
+    since = iso(T0 - 6 * HOUR)
+    pages = _cursor_pages(lambda cur: api.get_trades(PA, tournament_id=TID, start=since, limit=25, cursor=cur))
+    trades = [t for p in pages for t in p["data"]]
+    assert len(pages) >= 3
+    ids = [int(t["id"]) for t in trades]
+    times = [epoch(t["createdAt"]) for t in trades]
+    assert ids == sorted(ids, reverse=True) and len(set(ids)) == len(ids)  # newest first, no duplicates
+    assert times == sorted(times, reverse=True)
+    assert T0 - 6 * HOUR <= min(times) and max(times) <= T0
+    single = api.get_trades(PA, tournament_id=TID, start=since, limit=200)
+    assert len(trades) < 200 and single["data"] == trades and single["pagination"]["hasMore"] is False
+    assert list(api.iter_trades(PA, tournament_id=TID, start=since)) == trades
+    for t in trades:
+        assert t["side"] in ("YES", "NO") and t["size"] >= 1 and on_tick(t["price"])
+        assert t["volume"] == pytest.approx(t["size"] * (t["price"] if t["side"] == "YES" else 1 - t["price"]))
+
+
+def test_trade_window_filters(api: SuperMarketClient) -> None:
+    lo, hi = T0 - 3 * HOUR, T0 - HOUR
+    page = api.get_trades(PA, tournament_id=TID, start=iso(lo), end=iso(hi), limit=200)
+    times = [epoch(t["createdAt"]) for t in page["data"]]
+    assert times and all(lo <= ts < hi for ts in times)
+    assert page["from"] == demo_mod._iso(lo) and page["to"] == demo_mod._iso(hi)
+    assert api.get_trades(PA, tournament_id=TID, start=iso(T0 + HOUR), limit=10)["data"] == []  # nothing from the future
+
+
+def test_price_history_window_pagination(api: SuperMarketClient) -> None:
+    start = T0 - 48 * HOUR
+    candles: List[Dict[str, Any]] = []
+    cursor = iso(start)
+    for _ in range(20):
+        page = api.get_price_history(PA, tournament_id=TID, resolution="1h", start=cursor, limit=10)
+        candles += page["candles"]
+        if page["coverage"]["complete"]:
+            break
+        assert len(page["candles"]) == 10
+        cursor = page["to"]  # the exclusive continuation boundary
+    else:
+        raise AssertionError("price history did not complete")
+    whole = api.get_price_history(PA, tournament_id=TID, resolution="1h", start=iso(start), limit=1000)
+    assert whole["coverage"]["complete"] is True and candles == whole["candles"]
+    times = [epoch(c["time"]) for c in candles]
+    assert times == sorted(times) and len(set(times)) == len(times)
+    assert all(ts % 3600 == 0 and math.floor(start / HOUR) * HOUR <= ts <= T0 for ts in times)  # `from` is floored
+    for c in candles:
+        assert c["low"] <= min(c["open"], c["close"]) <= max(c["open"], c["close"]) <= c["high"]
+        assert c["low"] - 1e-9 <= c["vwap"] <= c["high"] + 1e-9 and c["volume"] > 0 and c["tradeCount"] >= 1
+    newest = api.get_price_history(PA, tournament_id=TID, resolution="1h", limit=5)
+    assert len(newest["candles"]) == 5 and newest["candles"] == whole["candles"][-5:]
+    assert newest["from"] == newest["candles"][0]["time"]
+
+
+def test_market_filters_and_sorting(api: SuperMarketClient, raw: httpx.Client) -> None:
+    def ids(**kw: Any) -> List[str]:
+        return [m["id"] for m in api.list_markets(tournament_id=TID, **kw)["data"]]
+
+    assert sorted(ids(status="open")) == ALL_MARKETS[:-1] and ids(status="settled") == ["315"]
+    assert ids(status="resolved") == ["315"]
+    senate = ids(status="any", search="SENATE")
+    assert senate and all("senate" in m["title"].lower() for m in api.list_markets(tournament_id=TID, status="any", search="senate")["data"])
+    assert "301" in senate and "311" not in senate
+    assert set(ids(status="any", is_multi_outcome=True)) == MULTI_MARKETS
+    assert set(ids(status="any", is_multi_outcome=False)) == set(ALL_MARKETS) - MULTI_MARKETS
+    assert sorted(ids(status="any", ids=["301", "311", "999"])) == ["301", "311"]
+    assert ids(status="any", category="sports-outcome") == [] and len(ids(status="any", category="election-outcome")) == 15
+    assert ids(status="any", is_composite=True) == []
+    assert ids(status="any", sort="oldest") == ALL_MARKETS and ids(status="any", sort="recent") == ALL_MARKETS[::-1]
+    closing = api.list_markets(tournament_id=TID, status="any", sort="closing")["data"]
+    dates = [m["settlementDate"] for m in closing]
+    assert dates == sorted(dates)
+    assert sorted(ids(status="any", sort="trending")) == ALL_MARKETS
+    assert [e["id"] for e in api.list_exchanges(market_id="311", tournament_id=TID)["data"]] == ["9011", "9012", "9013"]
+    assert [e["id"] for e in api.list_exchanges(ids=["9002", "9001", "777"], tournament_id=TID)["data"]] == ["9002", "9001"]
+    prices = api.request("GET", "/exchanges/prices", params={"ids": "9001,9001,999,9002", "tournamentId": TID})
+    assert [p["exchangeId"] for p in prices["data"]] == ["9001", "9002"] and prices["missingIds"] == ["999"]
+    book = api.get_exchange_orderbook(PA, depth=3, tournament_id=TID)
+    assert book["depth"] == 3 and len(book["bids"]) == len(book["asks"]) == 3
+
+
+def test_constraint_filters(api: SuperMarketClient, market: DemoMarket) -> None:
+    every = api.get_relationship_constraints(tournament_id=TID)
+    assert len(every["data"]) == 3 and every["violationsCount"] == 1
+    assert {r["evaluationStatus"] for r in every["data"]} == {"violated", "satisfied"}
+    senate = api.get_relationship_constraints(market_id="313", tournament_id=TID)["data"]
+    assert [r["evaluationStatus"] for r in senate] == ["violated"]
+    house = api.get_relationship_constraints(market_id="312", tournament_id=TID)["data"]
+    assert [r["evaluationStatus"] for r in house] == ["satisfied"]
+    rid = market.scenario["violation_relationship_id"]
+    assert [r["relationshipId"] for r in api.get_relationship_constraints(relationship_id=rid, tournament_id=TID)["data"]] == [rid]
+    assert api.get_relationship_constraints(violations_only=True, min_violation=0.05, tournament_id=TID)["data"] == []
+    assert epoch(every["computedAt"]) == pytest.approx(T0, abs=0.001)
+
+
+# --------------------------------------------------------------------------- error envelopes
+
+
+ERROR_CASES: List[Tuple[str, str, str, Dict[str, str], int, str, Optional[str]]] = [
+    # (method, url path, spec path or "", params, status, code, field named in details.fieldErrors)
+    ("GET", "markets", "/markets", {"tournamentId": "not-a-uuid"}, 400, "VALIDATION_ERROR", "tournamentId"),
+    ("GET", "markets", "/markets", {"tournamentId": OTHER_UUID}, 404, "NOT_FOUND", None),
+    ("GET", "exchanges/prices", "/exchanges/prices", {"ids": ",".join(str(9001 + i) for i in range(101))}, 400, "VALIDATION_ERROR", "ids"),
+    ("GET", "exchanges/prices", "/exchanges/prices", {}, 400, "VALIDATION_ERROR", "ids"),
+    ("GET", "exchanges/prices", "/exchanges/prices", {"ids": "abc"}, 400, "VALIDATION_ERROR", "ids"),
+    ("GET", "exchanges/prices", "/exchanges/prices", {"ids": "9001", "tournamentId": "bad"}, 400, "VALIDATION_ERROR", "tournamentId"),
+    ("GET", "exchanges/9001/price", "/exchanges/{id}/price", {"tournamentId": "123"}, 400, "VALIDATION_ERROR", "tournamentId"),
+    ("GET", "exchanges/9999/price", "/exchanges/{id}/price", {}, 404, "NOT_FOUND", None),
+    ("GET", "exchanges/abc/price", "/exchanges/{id}/price", {}, 400, "INVALID_ID", None),
+    ("GET", "markets/999", "/markets/{id}", {}, 404, "NOT_FOUND", None),
+    ("GET", "markets/abc", "/markets/{id}", {}, 400, "INVALID_ID", None),
+    ("GET", "markets/301/orderbook", "/markets/{id}/orderbook", {"depth": "0"}, 400, "VALIDATION_ERROR", "depth"),
+    ("GET", "tournaments/nope", "/tournaments/{slug}", {}, 404, "NOT_FOUND", None),
+    ("GET", "tournaments/nope/leaderboard", "/tournaments/{slug}/leaderboard", {}, 404, "NOT_FOUND", None),
+    ("GET", f"tournaments/{DEMO_SLUG}/leaderboard", "/tournaments/{slug}/leaderboard", {"period": "decade"}, 400, "VALIDATION_ERROR", "period"),
+    ("GET", "leaderboards", "/leaderboards", {"sort": "luck"}, 400, "VALIDATION_ERROR", "sort"),
+    ("GET", "exchanges/9001/price-history", "/exchanges/{id}/price-history", {"resolution": "2m"}, 400, "VALIDATION_ERROR", "resolution"),
+    ("GET", "exchanges/9001/price-history", "/exchanges/{id}/price-history", {"limit": "0"}, 400, "VALIDATION_ERROR", "limit"),
+    ("GET", "exchanges/9001/price-history", "/exchanges/{id}/price-history", {"limit": "1001"}, 400, "VALIDATION_ERROR", "limit"),
+    ("GET", "exchanges/9001/price-history", "/exchanges/{id}/price-history", {"from": "yesterday"}, 400, "VALIDATION_ERROR", "from"),
+    ("GET", "exchanges/9001/price-history", "/exchanges/{id}/price-history", {"from": "2026-10-01T00:00:00Z", "to": "2026-10-01T00:30:00Z"}, 400, "VALIDATION_ERROR", "to"),
+    ("GET", "exchanges/9001/trades", "/exchanges/{id}/trades", {"limit": "201"}, 400, "VALIDATION_ERROR", "limit"),
+    ("GET", "exchanges/9001/trades", "/exchanges/{id}/trades", {"from": "2026-10-01T02:00:00Z", "to": "2026-10-01T01:00:00Z"}, 400, "VALIDATION_ERROR", "to"),
+    ("GET", "exchanges/9001/trades", "/exchanges/{id}/trades", {"cursor": "not*a*cursor"}, 400, "INVALID_CURSOR", None),
+    ("GET", "exchanges/9001/trades", "/exchanges/{id}/trades", {"cursor": base64.urlsafe_b64encode(b"mk:4").decode()}, 400, "INVALID_CURSOR", None),
+    ("GET", "markets", "/markets", {"cursor": base64.urlsafe_b64encode(b"tr:4").decode()}, 400, "INVALID_CURSOR", None),
+    ("GET", "markets", "/markets", {"limit": "101"}, 400, "VALIDATION_ERROR", "limit"),
+    ("GET", "markets", "/markets", {"sort": "random"}, 400, "VALIDATION_ERROR", "sort"),
+    ("GET", "exchanges/9001/orderbook", "/exchanges/{id}/orderbook", {"depth": "201"}, 400, "VALIDATION_ERROR", "depth"),
+    ("GET", "exchanges", "/exchanges", {"marketId": "311", "ids": "9011"}, 400, "VALIDATION_ERROR", "marketId"),
+    ("GET", "relationships/constraints", "/relationships/constraints", {"minViolation": "2"}, 400, "VALIDATION_ERROR", "minViolation"),
+    ("GET", "relationships/constraints", "/relationships/constraints", {"marketId": "abc"}, 400, "VALIDATION_ERROR", "marketId"),
+    ("GET", "relationships/constraints", "/relationships/constraints", {"marketId": "999"}, 404, "NOT_FOUND", None),
+    ("GET", "relationships/constraints", "/relationships/constraints", {"violationsOnly": "yes"}, 400, "VALIDATION_ERROR", "violationsOnly"),
+    ("GET", "nope", "", {}, 404, "NOT_FOUND", None),
+    ("GET", "orders", "", {}, 404, "NOT_FOUND", None),  # read-only: no order endpoints at all
+    ("POST", "orders", "", {}, 404, "NOT_FOUND", None),
+    ("DELETE", "orders/1", "", {}, 404, "NOT_FOUND", None),
+    ("POST", "orders/cancel-all", "", {}, 404, "NOT_FOUND", None),
+    ("PUT", "markets/301", "", {}, 404, "NOT_FOUND", None),
+]
+
+
+@pytest.mark.parametrize(
+    "method, url, spec_path, params, status, code, field",
+    [pytest.param(*case, id=f"{case[0]} {case[1]} {case[4]} {case[5]} {'&'.join(case[3])}"[:90]) for case in ERROR_CASES],
+)
+def test_error_envelopes(spec: Spec, raw: httpx.Client, method: str, url: str, spec_path: str, params: Dict[str, str], status: int, code: str, field: Optional[str]) -> None:
+    resp = raw.request(method, url, params=params)
+    assert resp.status_code == status
+    body = resp.json()
+    assert set(body) == {"error"}
+    err = body["error"]
+    assert err["code"] == code and isinstance(err["message"], str) and err["message"]
+    assert set(err) <= {"code", "message", "details"}
+    if field is not None:
+        assert field in err["details"]["fieldErrors"]
+    if spec_path:
+        schema = spec.response_schema(spec_path, method.lower(), str(status))
+        if schema is not None:
+            assert spec.validate(body, schema) == []
+
+
+def test_missing_api_key_is_401(market: DemoMarket) -> None:
+    with httpx.Client(transport=market.transport(), base_url=DEMO_BASE_URL + "/") as plain:
+        for headers in ({}, {"Authorization": "Bearer "}, {"Authorization": "Basic abc"}):
+            resp = plain.get("markets", headers=headers)
+            assert resp.status_code == 401 and resp.json()["error"]["code"] == "MISSING_API_KEY"
+
+
+def test_the_client_maps_demo_errors(api: SuperMarketClient) -> None:
+    ids = [str(9001 + i) for i in range(101)]
+    with pytest.raises(ApiError) as caught:
+        api.request("GET", "/exchanges/prices", params={"ids": ids, "tournamentId": TID})
+    assert (caught.value.status, caught.value.code) == (400, "VALIDATION_ERROR")
+    assert "ids" in caught.value.details["fieldErrors"]
+    with pytest.raises(ApiError) as caught:
+        api.get_market("301", tournament_id="not-a-uuid")
+    assert (caught.value.status, caught.value.code) == (400, "VALIDATION_ERROR")
+    with pytest.raises(ApiError) as caught:
+        api.get_exchange_price("424242", tournament_id=TID)
+    assert (caught.value.status, caught.value.code) == (404, "NOT_FOUND")
+    # get_prices chunks large requests to 100 ids, so a long list works through the client
+    bulk = api.get_prices(ids, tournament_id=TID)
+    assert len(bulk["data"]) == 23 and len(bulk["missingIds"]) == 101 - 23
+
+
+# --------------------------------------------------------------------------- determinism and time consistency
+
+
+def _snapshot(client: SuperMarketClient) -> Dict[str, Any]:
+    return {
+        "prices": client.get_prices(OPEN_EXCHANGES, tournament_id=TID),
+        "book": client.get_exchange_orderbook(PA, depth=20, tournament_id=TID),
+        "trades": client.get_trades(OH, tournament_id=TID, limit=200),
+        "history_1h": client.get_price_history(PA, tournament_id=TID, resolution="1h", limit=168),
+        "history_5m": client.get_price_history(MI, tournament_id=TID, resolution="5m", limit=288),
+        "constraints": client.get_relationship_constraints(tournament_id=TID),
+        "leaderboard": client.get_tournament_leaderboard(DEMO_SLUG, limit=100),
+        "markets": client.list_markets(tournament_id=TID, status="any"),
+        "arizona": client.get_market_orderbook("311", tournament_id=TID),
+    }
+
+
+def test_same_seed_same_market() -> None:
+    first, second = make_market(), make_market()
+    with make_client(first) as a, make_client(second) as b:
+        snap_a, snap_b = _snapshot(a), _snapshot(b)
+        assert snap_a == snap_b
+        assert _snapshot(a) == snap_a  # repeat reads (warm caches) agree too
+
+
+def test_different_seed_different_prices_same_story() -> None:
+    with make_client(make_market(seed=7)) as a, make_client(make_market(seed=8)) as b:
+        ha = {e: a.get_price_history(e, tournament_id=TID, resolution="1h", limit=168)["candles"] for e in OPEN_EXCHANGES[:6]}
+        hb = {e: b.get_price_history(e, tournament_id=TID, resolution="1h", limit=168)["candles"] for e in OPEN_EXCHANGES[:6]}
+        assert ha != hb
+        titles = lambda c: [m["title"] for m in c.list_markets(tournament_id=TID, status="any")["data"]]  # noqa: E731
+        assert titles(a) == titles(b)
+
+
+def test_history_agrees_with_later_queries() -> None:
+    offset = Offset()
+    demo = make_market(offset=offset)
+    with make_client(demo) as client:
+        window = {"start": iso(T0 - 30 * HOUR), "end": iso(T0 - 2 * HOUR)}
+        before_1h = client.get_price_history(OH, tournament_id=TID, resolution="1h", limit=1000, **window)["candles"]
+        before_5m = client.get_price_history(PA, tournament_id=TID, resolution="5m", limit=1000, **window)["candles"]
+        before_trades = client.get_trades(PA, tournament_id=TID, limit=200, **window)["data"]
+        offset.now = 3 * HOUR  # three simulated hours later
+        assert client.get_price_history(OH, tournament_id=TID, resolution="1h", limit=1000, **window)["candles"] == before_1h
+        assert client.get_price_history(PA, tournament_id=TID, resolution="5m", limit=1000, **window)["candles"] == before_5m
+        assert client.get_trades(PA, tournament_id=TID, limit=200, **window)["data"] == before_trades
+        later = client.get_price_history(PA, tournament_id=TID, resolution="1h", limit=1000, start=iso(T0 - HOUR))["candles"]
+        assert max(epoch(c["time"]) for c in later) > T0  # and new candles appear as time passes
+
+
+def _consistency(client: SuperMarketClient, demo: DemoMarket) -> float:
+    now = demo.now()
+    worst = 0.0
+    prices = {p["exchangeId"]: p for p in client.get_prices(OPEN_EXCHANGES, tournament_id=TID)["data"]}
+    for eid in OPEN_EXCHANGES:
+        snap = prices[eid]
+        close_5m = client.get_price_history(eid, tournament_id=TID, resolution="5m", limit=12)["candles"][-1]
+        close_1h = client.get_price_history(eid, tournament_id=TID, resolution="1h", limit=2)["candles"][-1]
+        last_trade = client.get_trades(eid, tournament_id=TID, limit=1)["data"][0]
+        # latestPrice is the last trade, and both candle resolutions close on it
+        assert close_5m["close"] == close_1h["close"] == snap["latestPrice"] == last_trade["price"], eid
+        assert epoch(last_trade["createdAt"]) <= now
+        assert demo.last_trade_at(eid, now) == snap["latestPrice"]
+        mid = (snap["bestBid"] + snap["bestAsk"]) / 2
+        assert demo.mid_at(eid, now) == pytest.approx(mid)
+        book = client.get_exchange_orderbook(eid, depth=1, tournament_id=TID)
+        assert (book["bestBid"], book["bestAsk"]) == (snap["bestBid"], snap["bestAsk"])
+        worst = max(worst, abs(mid - snap["latestPrice"]))
+    return worst
+
+
+def test_snapshots_agree_with_price_history_and_the_tape() -> None:
+    offset = Offset()
+    demo = make_market(offset=offset)
+    with make_client(demo) as client:
+        assert _consistency(client, demo) <= 0.05  # the last print sits within a few ticks of the mid
+        offset.now = 10 * MIN + 7.5  # later, between two scripted trades
+        assert _consistency(client, demo) <= 0.05
+
+
+@pytest.mark.xfail(strict=True, reason="BUG: price-history drops a trade printed exactly at `now` (hi = min(now, nextafter(now)) = now) while /price latestPrice and /trades include it")
+def test_price_history_includes_a_trade_printed_exactly_now() -> None:
+    offset = Offset()
+    demo = make_market(offset=offset)
+    offset.now = 10 * MIN  # a scripted Ohio NO trade prints at exactly T0 + 10 min
+    with make_client(demo) as client:
+        latest = client.get_exchange_price(OH, tournament_id=TID)["latestPrice"]
+        assert client.get_trades(OH, tournament_id=TID, limit=1)["data"][0]["price"] == latest
+        assert client.get_price_history(OH, tournament_id=TID, resolution="5m", limit=3)["candles"][-1]["close"] == latest
+
+
+def test_settled_market_has_no_book(api: SuperMarketClient) -> None:
+    price = api.get_exchange_price("9023", tournament_id=TID)
+    assert price["bestBid"] is None and price["bestAsk"] is None and price["spread"] is None
+    assert price["latestPrice"] == pytest.approx(0.99, abs=0.02)  # it drifted up before settling YES
+    book = api.get_exchange_orderbook("9023", tournament_id=TID)
+    assert book["bids"] == [] and book["asks"] == [] and book["spread"] is None
+    assert api.list_markets(tournament_id=TID, status="open", ids=["315"])["data"] == []
+
+
+# --------------------------------------------------------------------------- scripted events (static checks)
+
+
+def test_scenario_description(market: DemoMarket) -> None:
+    sc = market.scenario
+    assert sc["t0"] == T0 and sc["tournament_id"] == TID and sc["slug"] == DEMO_SLUG
+    assert (sc["news_surge"]["exchange_id"], sc["participant_spike"]["exchange_id"], sc["live_surge"]["exchange_id"]) == (PA, OH, MI)
+    assert sc["news_surge"]["news_at"] < sc["news_surge"]["start"] < T0
+    assert sc["live_surge"]["start"] == T0 + 90
+    assert sc["arbitrage_market_id"] == "311" and sc["settled_market_id"] == "315"
+    bands = {b["exchange_id"]: b for b in sc["high_band"]}
+    assert set(bands) == BAND_BEFORE_CUP_END | BAND_AFTER_CUP_END
+    assert {e for e, b in bands.items() if b["settles_before_cup_end"]} == BAND_BEFORE_CUP_END
+    assert bands["9010"]["favorite"] == "NO"
+
+
+def test_high_band_outcomes_hover_in_the_high_90s(api: SuperMarketClient) -> None:
+    cup_end = epoch(CUP_END)
+    markets = {m["id"]: m for m in api.list_markets(tournament_id=TID, status="open")["data"]}
+    favourites = {}
+    for eid in OPEN_EXCHANGES:
+        candles = api.get_price_history(eid, tournament_id=TID, resolution="5m", start=iso(T0 - 6 * HOUR), limit=1000)["candles"]
+        closes = [c["close"] for c in candles]
+        fav = [max(p, 1 - p) for p in closes]
+        if closes and min(fav) >= 0.95:
+            favourites[eid] = (min(fav), max(fav), closes[-1])
+    assert BAND_BEFORE_CUP_END | BAND_AFTER_CUP_END <= set(favourites)
+    assert 4 <= len(favourites) <= 5
+    for eid in BAND_BEFORE_CUP_END | BAND_AFTER_CUP_END:
+        low, high, _ = favourites[eid]
+        assert 0.95 <= low and high <= 0.99
+    settles = {ex["id"]: epoch(m["settlementDate"]) for m in markets.values() for ex in m["exchanges"]}
+    assert all(settles[e] < cup_end for e in BAND_BEFORE_CUP_END)
+    assert all(settles[e] > cup_end for e in BAND_AFTER_CUP_END)
+    assert favourites["9010"][2] < 0.5  # the Libertarian long shot: NO is the favourite
+
+
+def test_arbitrage_flag_on_the_multi_outcome_market(api: SuperMarketClient) -> None:
+    arizona = api.get_market_orderbook("311", tournament_id=TID)
+    assert arizona["hasArbitrageOpportunity"] is True
+    asks = [row["asks"][0]["price"] for row in arizona["exchanges"]]
+    assert len(asks) == 3 and sum(asks) < 1.0 and arizona["overround"] == pytest.approx(sum(asks))
+    assert arizona["contexts"][0]["orderbook"]["hasArbitrageOpportunity"] is True
+    for mid in sorted(MULTI_MARKETS - {"311"}):
+        assert api.get_market_orderbook(mid, tournament_id=TID)["hasArbitrageOpportunity"] is False
+    single = api.get_market_orderbook("301", tournament_id=TID)
+    assert single["hasArbitrageOpportunity"] is False  # binary markets never flag
+    tm = api.get_tournament_market(DEMO_SLUG, "311")
+    assert tm["hasArbitrageOpportunity"] is True and tm["overround"] == arizona["overround"]
+
+
+def test_exactly_one_constraint_violation(api: SuperMarketClient, market: DemoMarket) -> None:
+    violations = api.get_relationship_constraints(violations_only=True, tournament_id=TID)
+    assert violations["violationsCount"] == 1 and len(violations["data"]) == 1
+    row = violations["data"][0]
+    assert row["relationshipId"] == market.scenario["violation_relationship_id"]
+    assert row["evaluationStatus"] == "violated" and row["type"] == "complementary"
+    assert row["violationAmount"] >= 0.01 and row["currentValue"] == pytest.approx(1.0 + row["violationAmount"])
+    assert {o["marketId"] for o in row["observedPrices"]} == {"313"}
+    assert [t["exchangeId"] for t in row["suggestedCorrectiveTrades"]] == ["9016", "9017"]
+    assert {t["action"] for t in row["suggestedCorrectiveTrades"]} == {"sell"}  # the legs sum above 1
+
+
+# --------------------------------------------------------------------------- scripted events through the real pipeline
+
+
+@pytest.fixture(scope="module")
+def timeline() -> Iterator[SimpleNamespace]:
+    """Tracker + attribution + news on the demo, stepping a fake clock from T0 to T0 + 45 min."""
+    offset = Offset()
+    demo = make_market(offset=offset)
+    client = make_client(demo)
+    context = resolve_context(client, slug=DEMO_SLUG)
+    store = TrackerStore(":memory:")
+    provider = DemoNewsProvider(demo)
+    news = NewsSearcher([provider], store=store, clock=demo.now)
+    attributor = Attributor(client, context, store, news, clock=demo.now)
+    tracker = Tracker(
+        client, context, store, interval=30, attributor=attributor,
+        backfill_reads_per_min=10_000, analyze_reads_per_min=10_000, clock=demo.now,
+    )
+    try:
+        first = tracker.run_once()
+        backfill_reads = 0
+        for _ in range(100):
+            reads = tracker.backfill_step(50)
+            if not reads:
+                break
+            backfill_reads += reads
+        second = tracker.run_once()
+        tracker.analyze_pending(20)
+        at_t0 = {s.exchange_id: s for s in store.surges()}
+        view_t0 = tracker.view()
+        detections: List[Tuple[float, str, int]] = []
+        while offset.now < 45 * MIN:
+            offset.now += 30 if offset.now < 10 * MIN else 120
+            summary = tracker.run_once()
+            for sid in summary["new_surges"]:
+                detections.append((offset.now, store.get_surge(sid).exchange_id, sid))
+            tracker.analyze_pending(20)
+        yield SimpleNamespace(
+            market=demo, offset=offset, client=client, store=store, tracker=tracker, provider=provider,
+            first=first, second=second, backfill_reads=backfill_reads, at_t0=at_t0, view_t0=view_t0,
+            detections=detections, end={s.exchange_id: s for s in store.surges()}, view_end=tracker.view(),
+        )
+    finally:
+        client.close()
+        store.close()
+
+
+def test_pipeline_start_up(timeline: SimpleNamespace) -> None:
+    assert (timeline.first["markets"], timeline.first["exchanges"], timeline.first["ticks"]) == (14, 22, 22)
+    assert timeline.backfill_reads == 44  # 22 outcomes x (7 days of 1h + 24 hours of 5m)
+    assert len(timeline.second["new_surges"]) == 2 and timeline.second["errors"] == 0
+    assert timeline.tracker.status()["errors"] == 0
+
+
+def test_news_surge_on_pennsylvania_is_attributed_to_news(timeline: SimpleNamespace) -> None:
+    surge = timeline.at_t0[PA]
+    assert surge.direction == "up" and surge.change >= 0.10  # the scripted +0.14 ramp
+    assert surge.start_ts <= T0 - 50 * MIN <= surge.end_ts
+    att = surge.attribution
+    assert att is not None and att.verdict == "news"
+    assert att.confidence >= 0.5 and att.reversion_odds == pytest.approx(0.2)
+    assert att.articles and all("Pennsylvania" in a.title for a in att.articles)
+    assert all(T0 - 55 * MIN - 1 <= a.published_at <= T0 for a in att.articles)
+    assert all(a.url.startswith("https://example.com/news/") and a.provider == "demo-news" for a in att.articles)
+    assert att.flow is not None and att.flow.n_trades > 10  # many small trades, not a few big ones
+    end = timeline.end[PA]
+    assert end.id == surge.id and end.status == "open" and (end.reverted_fraction or 0.0) < 0.5  # news moves hold
+
+
+def test_participant_spike_on_ohio_is_attributed_to_participants(timeline: SimpleNamespace) -> None:
+    surge = timeline.at_t0[OH]
+    assert surge.direction == "up" and surge.change >= 0.15  # the scripted +0.18
+    att = surge.attribution
+    assert att is not None and att.verdict == "participants"
+    assert att.articles == []  # no news for this market
+    assert att.flow.n_trades <= 5 and att.flow.max_trade_size == 520 and att.flow.yes_share == 1.0
+    assert att.book_depth is not None and att.book_depth < 500
+    assert att.reversion_odds > 0.5
+    end = timeline.end[OH]
+    assert end.id == surge.id
+    assert end.status == "reverted" and end.reverted_fraction >= 0.5  # about 60% given back by T0 + 40 min
+
+
+def test_live_surge_on_michigan_appears_about_90s_after_start(timeline: SimpleNamespace) -> None:
+    assert MI not in timeline.at_t0
+    live = [(at, sid) for at, eid, sid in timeline.detections if eid == MI]
+    assert len(live) == 1
+    at, sid = live[0]
+    assert 90 < at <= 300
+    surge = timeline.store.get_surge(sid)
+    assert surge.direction == "up" and surge.change >= 0.05
+    assert surge.detected_at == pytest.approx(T0 + at)
+    assert surge.attribution is not None and surge.attribution.articles == []
+    assert timeline.end[MI].status == "reverted"  # 60% of the move reverts within 40 minutes
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="BUG: the scripted 'participant-style' live surge (f) is attributed 'unclear' for many demo start times: "
+    "its quiet period is only 6 min, so background trades from the 1h window dilute the two scripted trades "
+    "below the crowd thresholds (top share 0.45 < 0.5, HHI 0.34 < 0.35, YES share 0.846 < 0.85)",
+)
+def test_live_surge_on_michigan_is_attributed_to_participants(timeline: SimpleNamespace) -> None:
+    sid = next(sid for _, eid, sid in timeline.detections if eid == MI)
+    assert timeline.store.get_surge(sid).attribution.verdict == "participants"
+
+
+def test_background_noise_never_trips_a_surge(timeline: SimpleNamespace) -> None:
+    assert set(timeline.end) == {PA, OH, MI}
+    assert [eid for _, eid, _ in timeline.detections] == [MI]
+
+
+def test_tracker_sees_the_high_band_outcomes(timeline: SimpleNamespace) -> None:
+    bands = {b["exchange_id"]: b for b in timeline.view_t0["high_band"]}
+    assert BAND_BEFORE_CUP_END | BAND_AFTER_CUP_END <= set(bands) and 4 <= len(bands) <= 5
+    cup_end = epoch(CUP_END)
+    for eid in BAND_BEFORE_CUP_END | BAND_AFTER_CUP_END:
+        band = bands[eid]
+        assert band["stable"] is True and band["favorite_price"] >= 0.95 and band["time_in_band"] >= 0.8
+        assert (epoch(band["settlement_date"]) < cup_end) == (eid in BAND_BEFORE_CUP_END)
+    assert bands["9010"]["side"] == "NO" and bands["9007"]["side"] == "YES"
+
+
+def test_tracker_context_has_the_arbitrage_and_violation(timeline: SimpleNamespace) -> None:
+    ctx = timeline.view_t0["context"]
+    overround = {row["market_id"]: row for row in ctx["overround"]}
+    assert set(overround) == MULTI_MARKETS
+    assert [m for m, row in overround.items() if row["arbitrage"]] == ["311"]
+    assert overround["311"]["overround"] < 1.0 and overround["311"]["outcomes"] == 3
+    assert ctx["constraints"]["violationsCount"] == 1
+    assert ctx["balance"] == timeline.client.get_account()["balance"] and ctx["initial_balance"] == 100_000
+    assert ctx["leaderboard"]["my_rank"] == timeline.client.get_tournament_leaderboard(DEMO_SLUG)["myRank"]
+
+
+def test_settled_market_is_not_tracked(timeline: SimpleNamespace) -> None:
+    rows = timeline.view_end["exchanges"]
+    assert len(rows) == 22 and "9023" not in {r["exchange_id"] for r in rows}
+
+
+def test_news_queries_came_from_market_titles(timeline: SimpleNamespace) -> None:
+    queries = " ".join(timeline.provider.queries).lower()
+    assert "pennsylvania" in queries and "ohio" in queries and "michigan" in queries
+
+
+# --------------------------------------------------------------------------- DemoNewsProvider
+
+
+PA_TITLES = [
+    "What the withdrawal means for Republicans and the Pennsylvania Senate map",
+    "Forecasters move the Pennsylvania Senate toward Republicans after candidate exit",
+    "Pennsylvania Senate: surprise withdrawal leaves Republicans favored to keep majority",
+    "Republicans' hold on the Pennsylvania Senate firms up as Democratic recruit quits key race",
+]
+
+
+def test_news_provider_matches_the_scripted_story(market: DemoMarket) -> None:
+    provider = DemoNewsProvider(market)
+    assert isinstance(provider, NewsProvider) and provider.name == "demo-news"
+    articles = provider.search('"Pennsylvania" Senate Republicans', None, None)
+    assert [a.title for a in articles] == PA_TITLES  # newest first
+    published = [a.published_at for a in articles]
+    assert published == sorted(published, reverse=True)
+    assert published[-1] == T0 - 55 * MIN and published[0] == T0 - 31 * MIN
+    for a in articles:
+        assert isinstance(a, Article) and a.provider == "demo-news" and a.source
+        assert a.url.startswith("https://example.com/news/") and a.summary
+    assert provider.queries == ['"Pennsylvania" Senate Republicans']
+
+
+def test_news_provider_window_limit_and_copies(market: DemoMarket) -> None:
+    provider = DemoNewsProvider(market)
+    assert [a.published_at for a in provider.search("pennsylvania", T0 - 50 * MIN, None)] == [T0 - 31 * MIN, T0 - 46 * MIN]
+    assert [a.published_at for a in provider.search("pennsylvania", None, T0 - 50 * MIN)] == [T0 - 52 * MIN, T0 - 55 * MIN]
+    assert len(provider.search("pennsylvania", None, None, limit=2)) == 2
+    assert provider.search("pennsylvania", None, None, limit=0) == []
+    assert provider.search("pennsylvania", None, None, limit=-3) == []
+    first = provider.search("pennsylvania", None, None)
+    first[0].title = "mutated"
+    assert provider.search("pennsylvania", None, None)[0].title == PA_TITLES[0]  # callers get copies
+
+
+def test_news_provider_never_publishes_the_future() -> None:
+    offset = Offset()
+    provider = DemoNewsProvider(make_market(offset=offset))
+    offset.now = -40 * MIN  # the demo clock runs relative to its value at construction
+    assert [a.published_at for a in provider.search("pennsylvania", None, None)] == [T0 - 46 * MIN, T0 - 52 * MIN, T0 - 55 * MIN]
+    offset.now = 0.0
+    assert len(provider.search("pennsylvania", None, None)) == 4
+
+
+def test_news_provider_noise_for_unrelated_queries(market: DemoMarket) -> None:
+    provider = DemoNewsProvider(market)
+    for query in ("Ohio House District 9", "", "zzz"):
+        articles = provider.search(query, None, None)
+        assert len(articles) == 3, query
+        assert not any("Pennsylvania" in a.title for a in articles)
+        assert all(a.published_at <= T0 for a in articles)
+    georgia = provider.search("Georgia Senate", None, None)
+    assert [a.title for a in georgia] == ["Georgia Senate race: Democrats outraise rivals in third quarter"]
+
+
+@pytest.mark.parametrize("args", [(None, None, None), ("pennsylvania", "soon", None), ("pennsylvania", None, None, "many"), (42, None, None)])
+def test_news_provider_never_raises(market: DemoMarket, args: Tuple[Any, ...]) -> None:
+    out = DemoNewsProvider(market).search(*args)
+    assert isinstance(out, list)
+    DemoNewsProvider(market).close()
+
+
+def test_news_searcher_ranks_demo_headlines(market: DemoMarket) -> None:
+    searcher = NewsSearcher([DemoNewsProvider(market)], clock=market.now)
+    pa = searcher.search_for_market("Will Republicans keep control of the Pennsylvania Senate?", "YES", T0 - 6 * HOUR, T0)
+    assert pa and all("Pennsylvania" in a.title for a in pa)
+    assert pa[0].relevance >= 0.5
+    ohio = searcher.search_for_market("Will Republicans win Ohio House District 9?", "YES", T0 - 6 * HOUR, T0)
+    assert all(a.relevance < 0.5 for a in ohio)  # only unrelated noise

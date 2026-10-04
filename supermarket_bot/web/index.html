@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="referrer" content="no-referrer">
+<title>Super Market dashboard</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%232a78d6'/%3E%3Cpath d='M3 11l3-3 2 2 5-5' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="styles.css">
+<!-- Loaded in <head> (not deferred) so the saved colour theme applies before the first paint. -->
+<script src="app.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to main content</a>
+
+<header class="app-header">
+  <div class="header-top">
+    <div class="brand">
+      <h1 class="brand-title" id="tournament-name">Super Market dashboard</h1>
+      <p class="brand-sub">
+        <span id="currency-note">Currency: SUSQies</span>
+        <span class="dot-sep" aria-hidden="true">·</span>
+        <span class="readonly-note" id="readonly-note">
+          <svg class="icon" aria-hidden="true" viewBox="0 0 16 16"><rect x="3" y="7" width="10" height="7" rx="1.5"/><path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2"/></svg>
+          Read-only: this dashboard never places orders
+        </span>
+      </p>
+    </div>
+    <div class="header-status">
+      <span class="badge badge-demo" id="demo-badge" hidden title="Simulated market data: no API key or internet used">DEMO</span>
+      <span class="live" id="live" data-state="loading">
+        <span class="live-dot" aria-hidden="true"></span>
+        <span id="live-label">Connecting…</span>
+      </span>
+      <span class="updated">Updated <time id="updated" aria-live="polite">—</time></span>
+      <div class="budget" id="budget">
+        <span class="budget-label" id="budget-label">Read budget</span>
+        <span class="meter" id="budget-meter" role="meter" aria-labelledby="budget-label" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+          <span class="meter-fill" id="budget-fill"></span>
+        </span>
+        <span class="budget-text" id="budget-text">—</span>
+      </div>
+      <div class="theme-toggle" role="group" aria-label="Colour theme">
+        <button type="button" class="seg" data-theme-choice="light" aria-pressed="false">Light</button>
+        <button type="button" class="seg" data-theme-choice="dark" aria-pressed="false">Dark</button>
+        <button type="button" class="seg" data-theme-choice="system" aria-pressed="true">System</button>
+      </div>
+    </div>
+  </div>
+  <nav class="app-nav" aria-label="Views">
+    <ul>
+      <li><a href="#overview" data-view="overview">Overview</a></li>
+      <li><a href="#markets" data-view="markets">Markets <span class="nav-count" id="nav-count-markets"></span></a></li>
+      <li><a href="#surges" data-view="surges">Surges <span class="nav-count" id="nav-count-surges"></span></a></li>
+      <li><a href="#high" data-view="high">High 90s <span class="nav-count" id="nav-count-high"></span></a></li>
+      <li><a href="#strategy" data-view="strategy">Strategy</a></li>
+    </ul>
+  </nav>
+</header>
+
+<div class="banners" id="banners">
+  <section class="banner banner-critical" id="fatal-banner" aria-labelledby="fatal-title" hidden>
+    <svg class="icon icon-lg" aria-hidden="true" viewBox="0 0 16 16"><circle cx="8" cy="8" r="7"/><path d="M8 4.5v4.5M8 11.2v.3"/></svg>
+    <div class="banner-body">
+      <h2 class="banner-title" id="fatal-title">The tracker has stopped</h2>
+      <p id="fatal-message"></p>
+      <p class="banner-hint" id="fatal-hint"></p>
+    </div>
+  </section>
+  <section class="banner banner-warning" id="offline-banner" aria-labelledby="offline-title" hidden>
+    <svg class="icon icon-lg" aria-hidden="true" viewBox="0 0 16 16"><path d="M8 1.5l7 13H1z"/><path d="M8 6v4M8 12v.3"/></svg>
+    <div class="banner-body">
+      <h2 class="banner-title" id="offline-title">Can't reach the bot</h2>
+      <p id="offline-message">The dashboard server is not answering. Is it still running in your terminal?</p>
+    </div>
+    <div class="banner-actions">
+      <button type="button" class="btn" id="offline-retry">Retry now</button>
+      <button type="button" class="btn btn-ghost btn-icon" id="offline-dismiss" aria-label="Dismiss this message">
+        <svg class="icon" aria-hidden="true" viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8"/></svg>
+      </button>
+    </div>
+  </section>
+  <section class="banner banner-warning" id="view-error-banner" aria-labelledby="view-error-title" hidden>
+    <svg class="icon icon-lg" aria-hidden="true" viewBox="0 0 16 16"><path d="M8 1.5l7 13H1z"/><path d="M8 6v4M8 12v.3"/></svg>
+    <div class="banner-body">
+      <h2 class="banner-title" id="view-error-title">Live data is temporarily unavailable</h2>
+      <p id="view-error-message"></p>
+    </div>
+  </section>
+  <section class="banner banner-info" id="startup-banner" aria-labelledby="startup-title" hidden>
+    <svg class="icon icon-lg" aria-hidden="true" viewBox="0 0 16 16"><circle cx="8" cy="8" r="7"/><path d="M8 7v4.5M8 4.5v.3"/></svg>
+    <div class="banner-body">
+      <h2 class="banner-title" id="startup-title">Getting ready</h2>
+      <p id="startup-message"></p>
+      <span class="meter meter-wide" id="startup-meter" role="meter" aria-labelledby="startup-title" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" hidden>
+        <span class="meter-fill" id="startup-fill"></span>
+      </span>
+    </div>
+  </section>
+</div>
+
+<main id="main" tabindex="-1">
+
+  <section class="view" id="view-overview" data-view="overview" aria-labelledby="h-overview" hidden>
+    <div class="view-head">
+      <h2 id="h-overview">Overview</h2>
+      <p class="view-sub" id="overview-sub">What the bot is watching right now.</p>
+    </div>
+    <div class="tiles" id="tiles">
+      <article class="tile" data-tile="outcomes">
+        <h3 class="tile-label">Outcomes tracked</h3>
+        <p class="tile-value" id="tile-outcomes">—</p>
+        <p class="tile-sub" id="tile-outcomes-sub">&nbsp;</p>
+      </article>
+      <article class="tile" data-tile="surges">
+        <h3 class="tile-label">Surges in the last hour</h3>
+        <p class="tile-value" id="tile-surges">—</p>
+        <p class="tile-sub" id="tile-surges-sub">&nbsp;</p>
+      </article>
+      <article class="tile" data-tile="participants">
+        <h3 class="tile-label">Participant-driven, still open</h3>
+        <p class="tile-value" id="tile-participants">—</p>
+        <p class="tile-sub" id="tile-participants-sub">&nbsp;</p>
+      </article>
+      <article class="tile" data-tile="high">
+        <h3 class="tile-label">Hovering in the high 90s</h3>
+        <p class="tile-value" id="tile-high">—</p>
+        <p class="tile-sub" id="tile-high-sub">&nbsp;</p>
+      </article>
+      <article class="tile" data-tile="balance">
+        <h3 class="tile-label">Your balance</h3>
+        <p class="tile-value" id="tile-balance">—</p>
+        <p class="tile-sub" id="tile-balance-sub">&nbsp;</p>
+      </article>
+    </div>
+    <section class="panel" aria-labelledby="h-look">
+      <h3 class="panel-title" id="h-look">Look at now</h3>
+      <div class="look-grid">
+        <section class="look-col" aria-labelledby="h-look-ideas">
+          <h4 class="col-title" id="h-look-ideas">Top strategy ideas</h4>
+          <ol class="look-list" id="look-ideas"></ol>
+          <p class="empty" id="look-ideas-empty" hidden></p>
+          <a class="more-link" href="#strategy">All ideas and the reasoning</a>
+        </section>
+        <section class="look-col" aria-labelledby="h-look-surges">
+          <h4 class="col-title" id="h-look-surges">Newest surges</h4>
+          <ul class="look-list" id="look-surges"></ul>
+          <p class="empty" id="look-surges-empty" hidden></p>
+          <a class="more-link" href="#surges">All surges with headlines</a>
+        </section>
+      </div>
+    </section>
+  </section>
+
+  <section class="view" id="view-markets" data-view="markets" aria-labelledby="h-markets" hidden>
+    <div class="view-head">
+      <h2 id="h-markets">Markets</h2>
+      <p class="view-sub" id="markets-sub">Every open outcome with its latest prices and moves.</p>
+    </div>
+    <div class="filter-row">
+      <div class="search">
+        <label for="market-search">Search markets</label>
+        <input type="search" id="market-search" placeholder="e.g. Ohio, Senate, Democrats" autocomplete="off" spellcheck="false">
+      </div>
+      <div class="chips" role="group" aria-label="Show">
+        <button type="button" class="chip" data-filter="all" aria-pressed="true">All <span class="chip-count" id="chip-count-all"></span></button>
+        <button type="button" class="chip" data-filter="surging" aria-pressed="false">
+          <svg class="icon" aria-hidden="true" viewBox="0 0 16 16"><path class="f" d="M9.5 1.5L3.5 9h4l-1 5.5 6-7.5h-4z"/></svg>
+          Surging <span class="chip-count" id="chip-count-surging"></span>
+        </button>
+        <button type="button" class="chip" data-filter="high" aria-pressed="false">
+          <svg class="icon" aria-hidden="true" viewBox="0 0 16 16"><path d="M2.5 12.5h11M4 9.5l4-6 4 6z"/></svg>
+          High 90s <span class="chip-count" id="chip-count-high"></span>
+        </button>
+      </div>
+      <p class="result-count" id="markets-count"></p>
+    </div>
+    <div class="table-wrap" id="markets-wrap" tabindex="0" role="region" aria-labelledby="h-markets">
+      <table class="data-table markets-table" id="markets-table">
+        <caption class="sr-only">Markets. Select a column heading to sort. Select a market to open its details.</caption>
+        <thead>
+          <tr>
+            <th scope="col" data-sort="title"><button type="button" class="sort-btn">Market<span class="sort-ind" aria-hidden="true"></span></button></th>
+            <th scope="col" data-sort="option"><button type="button" class="sort-btn">Outcome<span class="sort-ind" aria-hidden="true"></span></button></th>
+            <th scope="col" class="num" data-sort="last"><button type="button" class="sort-btn">Last<span class="sort-ind" aria-hidden="true"></span></button></th>
+            <th scope="col" class="num" data-sort="bid"><button type="button" class="sort-btn">Bid<span class="sort-ind" aria-hidden="true"></span></button></th>
+            <th scope="col" class="num" data-sort="ask"><button type="button" class="sort-btn">Ask<span class="sort-ind" aria-hidden="true"></span></button></th>
+            <th scope="col" class="num" data-sort="spread"><button type="button" class="sort-btn">Spread<span class="sort-ind" aria-hidden="true"></span></button></th>
+            <th scope="col" class="num" data-sort="change_5m"><button type="button" class="sort-btn"><span aria-hidden="true">Δ</span><span class="sr-only">Change over </span>5m<span class="sort-ind" aria-hidden="true"></span></button></th>
+            <th scope="col" class="num" data-sort="change_1h"><button type="button" class="sort-btn"><span aria-hidden="true">Δ</span><span class="sr-only">Change over </span>1h<span class="sort-ind" aria-hidden="true"></span></button></th>
+            <th scope="col" class="num" data-sort="change_24h"><button type="button" class="sort-btn"><span aria-hidden="true">Δ</span><span class="sr-only">Change over </span>24h<span class="sort-ind" aria-hidden="true"></span></button></th>
+            <th scope="col" class="spark-col">24h</th>
+            <th scope="col" data-sort="settles"><button type="button" class="sort-btn">Settles<span class="sort-ind" aria-hidden="true"></span></button></th>
+            <th scope="col" data-sort="flags"><button type="button" class="sort-btn">Flags<span class="sort-ind" aria-hidden="true"></span></button></th>
+          </tr>
+        </thead>
+        <tbody id="markets-body"></tbody>
+      </table>
+    </div>
+    <p class="empty" id="markets-empty" hidden></p>
+  </section>
+
+  <section class="view" id="view-surges" data-view="surges" aria-labelledby="h-surges" hidden>
+    <div class="view-head">
+      <h2 id="h-surges">Surges</h2>
+      <p class="view-sub" id="surges-sub">Sudden price moves, newest first, with the bot's verdict on what caused them.</p>
+    </div>
+    <div class="legend-note" id="verdict-legend">
+      <span class="legend-title">Verdicts:</span>
+      <span class="verdict-key"><span class="verdict verdict-news"><svg class="icon" aria-hidden="true" viewBox="0 0 16 16"><rect x="2" y="2.5" width="12" height="11" rx="1.5"/><path d="M4.5 5.5h7M4.5 8h7M4.5 10.5h4"/></svg>News</span> a matching headline explains the move</span>
+      <span class="verdict-key"><span class="verdict verdict-participants"><svg class="icon" aria-hidden="true" viewBox="0 0 16 16"><circle class="f" cx="5.5" cy="5" r="2.2"/><circle class="f" cx="11" cy="5.5" r="1.8"/><path class="f" d="M1.5 13.5c0-2.6 1.8-4.3 4-4.3s4 1.7 4 4.3zM10 13.5c0-1.5-.4-2.7-1.2-3.6.6-.4 1.3-.6 2.2-.6 1.9 0 3.5 1.5 3.5 4.2z"/></svg>Participants</span> a few Cup traders moved it</span>
+      <span class="verdict-key"><span class="verdict verdict-unclear"><svg class="icon" aria-hidden="true" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6.5"/><path d="M6 6.2a2 2 0 1 1 2.8 1.8c-.6.3-.8.7-.8 1.3v.4M8 11.6v.3"/></svg>Unclear</span> mixed or weak evidence</span>
+    </div>
+    <div class="cards" id="surge-cards"></div>
+    <p class="empty" id="surges-empty" hidden></p>
+  </section>
+
+  <section class="view" id="view-high" data-view="high" aria-labelledby="h-high" hidden>
+    <div class="view-head">
+      <h2 id="h-high">High 90s</h2>
+      <p class="view-sub" id="high-sub">Outcomes whose favourite side has sat at 0.95 or more. Buying the favourite pays a little if it wins, and loses the whole stake on an upset.</p>
+    </div>
+    <div class="table-wrap" id="high-wrap" tabindex="0" role="region" aria-labelledby="h-high">
+      <table class="data-table high-table" id="high-table">
+        <caption class="sr-only">Outcomes in the high 90s. Select a market to open its details.</caption>
+        <thead>
+          <tr>
+            <th scope="col">Market</th>
+            <th scope="col">Outcome</th>
+            <th scope="col">Favourite</th>
+            <th scope="col" class="num">Price</th>
+            <th scope="col" class="num">Time in band</th>
+            <th scope="col">Stable</th>
+            <th scope="col">Settles</th>
+            <th scope="col">Before Cup end</th>
+            <th scope="col" class="num">Payout if held to 1</th>
+          </tr>
+        </thead>
+        <tbody id="high-body"></tbody>
+      </table>
+    </div>
+    <p class="empty" id="high-empty" hidden></p>
+  </section>
+
+  <section class="view" id="view-strategy" data-view="strategy" aria-labelledby="h-strategy" hidden>
+    <div class="view-head">
+      <h2 id="h-strategy">Strategy</h2>
+      <p class="view-sub">Ranked, read-only trade ideas. Nothing is traded for you.</p>
+    </div>
+    <div id="strategy-body"></div>
+  </section>
+
+</main>
+
+<footer class="app-footer">
+  <p>Read-only market data from the Super Market API. Nothing on this page places, changes or cancels orders. Estimates are heuristics, not guarantees.</p>
+</footer>
+
+<dialog class="drawer" id="drawer" aria-labelledby="drawer-title">
+  <div class="drawer-inner" id="drawer-inner">
+    <header class="drawer-head">
+      <div class="drawer-titles">
+        <p class="drawer-kicker" id="drawer-kicker">Market detail</p>
+        <h2 id="drawer-title" tabindex="-1">Loading…</h2>
+        <p class="drawer-sub" id="drawer-sub"></p>
+      </div>
+      <button type="button" class="btn btn-ghost btn-icon drawer-close" id="drawer-close" aria-label="Close details">
+        <svg class="icon" aria-hidden="true" viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8"/></svg>
+      </button>
+    </header>
+    <div class="drawer-body" id="drawer-body"></div>
+  </div>
+</dialog>
+
+</body>
+</html>

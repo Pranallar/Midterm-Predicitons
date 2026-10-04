@@ -269,9 +269,14 @@ def context_summary(raw: Any) -> Dict[str, Any]:
         ctx = {}
     tournament = ctx.get("tournament") if isinstance(ctx.get("tournament"), Mapping) else {}
     board_raw = ctx.get("leaderboard")
+    board_leader_value: Optional[float] = None
     if isinstance(board_raw, Mapping):
-        entries = board_raw.get("leaderboard") or board_raw.get("entries") or board_raw.get("data") or []
+        # The tracker stores {"top": [...], "my_rank", "leader_value"}; the raw API uses "leaderboard".
+        entries = (
+            board_raw.get("top") or board_raw.get("leaderboard") or board_raw.get("entries") or board_raw.get("data") or []
+        )
         board_rank = board_raw.get("myRank", board_raw.get("my_rank"))
+        board_leader_value = _finite(board_raw.get("leader_value"))
     elif isinstance(board_raw, list):
         entries, board_rank = board_raw, None
     else:
@@ -298,6 +303,8 @@ def context_summary(raw: Any) -> Dict[str, Any]:
         my_rank = board_rank
     my_rank = int(my_rank) if isinstance(my_rank, (int, float)) and not isinstance(my_rank, bool) else None
     leader_value = _finite(ctx.get("leader_value"))
+    if leader_value is None:
+        leader_value = board_leader_value
     if leader_value is None and leaders:
         top = leaders[0]
         if top["value"] is not None:
