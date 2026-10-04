@@ -28,6 +28,7 @@ SURGE_WINDOWS: Dict[str, Tuple[float, float]] = {
     "24h": (86400.0, 0.12),
 }
 Z_THRESHOLD = 3.0
+SHORTEST_SHARE = 0.5  # pick the shortest qualifying window holding >= half of the largest move
 MAX_STALENESS_S = 900.0
 
 VOL_STEP_S = 300.0  # volatility resampling grid
@@ -224,7 +225,7 @@ def _detect(
         return []
     prices = series.prices
     p_now = prices[i_now]
-    best: Optional[Tuple[Tuple[bool, float, float], str, float, int, float, Optional[float]]] = None
+    candidates: List[Tuple[str, float, int, float, Optional[float]]] = []
     for name, (window_s, min_change) in sorted(windows.items(), key=lambda kv: kv[1][0]):
         i_then = series.value_idx(now - window_s, window_tolerance(window_s))
         if i_then is None:
@@ -236,12 +237,13 @@ def _detect(
         z = change / (sigma * math.sqrt(window_s / VOL_STEP_S)) if sigma is not None and sigma > 0 else None
         if z is not None and abs(z) + _EPS < z_threshold:
             continue
-        key = (z is not None, abs(z) if z is not None else abs(change), abs(change))
-        if best is None or key > best[0]:  # strict: ties keep the shorter window
-            best = (key, name, window_s, i_then, change, z)
-    if best is None:
+        candidates.append((name, window_s, i_then, change, z))
+    if not candidates:
         return []
-    _, name, window_s, i_then, change, z = best
+    # Describe the move by the SHORTEST window that still captures most of it: a 20-minute
+    # spike is a 1h surge, not a 24h one, so attribution looks at the trades that moved it.
+    biggest = max(abs(c[3]) for c in candidates)
+    name, window_s, i_then, change, z = next(c for c in candidates if abs(c[3]) + _EPS >= SHORTEST_SHARE * biggest)
     span = prices[i_then : i_now + 1]
     up = change > 0
     surge = Surge(
@@ -274,8 +276,8 @@ def detect_surges(
 
     A window qualifies when ``|change| >= min_change`` and (``z`` is None or ``|z| >= 3``),
     where ``z = change / (sigma * sqrt(window / 300))`` with ``sigma`` the volatility of the
-    24 h *before* the window. Windows with a z-score outrank windows without one (largest
-    ``|z|``); without any z-score the largest ``|change|`` wins. The current mark must be
+    24 h *before* the window. Among qualifying windows the shortest one whose ``|change|`` is at
+    least half of the largest qualifying ``|change|`` is reported. The current mark must be
     no older than 15 minutes. Only points with ``ts <= now`` are used (no look-ahead).
     """
     series = _Series(points)

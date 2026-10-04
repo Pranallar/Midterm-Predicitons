@@ -917,7 +917,7 @@ class NewsSearcher:
 
         raw, any_ok = self._query_all(query, since, until, limit)
         ranked = self._rank(self._dedup(raw), words, strong)
-        if not ranked and self.relax and len(terms) > 3:
+        if not ranked and any_ok and self.relax and len(terms) > 3:
             # An over-specified query can miss real coverage: retry once with the top terms.
             top = sorted(terms, key=lambda t: (_PRIORITY[t.kind], t.pos))[:3]
             relaxed = " ".join(_quote(t.text) for t in sorted(top, key=lambda t: (t.kind != "option", t.pos)))

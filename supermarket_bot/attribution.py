@@ -46,6 +46,7 @@ log = logging.getLogger("supermarket_bot")
 DEFAULT_LLM_MODEL = "claude-opus-5-5"
 LLM_MAX_TOKENS = 16000
 LLM_BETAS = ("server-side-fallback-2026-07-01",)
+LLM_TIMEOUT_S = 120.0
 
 # News timing windows relative to the surge (seconds).
 NEWS_LEAD_FULL_S = 6 * 3600.0  # published up to 6 h before the move started: full weight
@@ -376,8 +377,11 @@ def build_judge_prompt(
 class LLMJudge:
     """Optional Claude second opinion (``--llm`` / ``SUPERMARKET_LLM=1``)."""
 
-    def __init__(self, model: Optional[str] = None, client: Any = None) -> None:
+    def __init__(self, model: Optional[str] = None, client: Any = None, *, timeout: float = LLM_TIMEOUT_S,
+                 max_retries: int = 2) -> None:
         self.model = model or os.environ.get("SUPERMARKET_LLM_MODEL") or DEFAULT_LLM_MODEL
+        self.timeout = timeout
+        self.max_retries = max_retries
         self._client = client
         self._explicit_client = client is not None
         self.calls = 0
@@ -393,7 +397,9 @@ class LLMJudge:
 
     def _get_client(self, sdk: Any) -> Any:
         if self._client is None:
-            self._client = sdk.Anthropic()
+            # Credentials come from the environment (ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN).
+            # Bound the wait: the SDK default (10 minutes) would stall the analysis worker.
+            self._client = sdk.Anthropic(timeout=self.timeout, max_retries=self.max_retries)
         return self._client
 
     def judge(self, surge: Surge, flow: Optional[TradeFlow], articles: Sequence[Article], book_depth: Optional[float],

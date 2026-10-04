@@ -28,7 +28,7 @@ import sqlite3
 import threading
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Set, Tuple, Union
 
 from .books import parse_time
 from .models import SURGE_OPEN, Article, Attribution, ExchangeInfo, MarketInfo, PricePoint, Surge, TradeFlow, TradeRecord
@@ -41,6 +41,7 @@ PRUNE_EVERY = 500  # tick inserts between prunes
 NEWS_RETENTION_S = 7 * 86400.0
 RESOLUTION_SECONDS: Dict[str, float] = {"1m": 60.0, "5m": 300.0, "1h": 3600.0, "1d": 86400.0, "1w": 604800.0}
 _MAX_RESOLUTION_S = max(RESOLUTION_SECONDS.values())
+_LENGTH_SQL = "(CASE resolution " + " ".join(f"WHEN '{r}' THEN {s:g}" for r, s in RESOLUTION_SECONDS.items()) + " ELSE 0 END)"
 
 _SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS markets (
@@ -294,6 +295,8 @@ class TrackerStore:
         self._lock = threading.RLock()
         self._depth = 0  # nesting level of _write() so inner writes join the outer transaction
         self._since_prune = PRUNE_EVERY  # prune on the first insert after opening
+        self._pruned_once = False
+        self._tick_ids: Set[str] = set()  # exchanges that received ticks through this store object
         self._closed = False
         self._conn = sqlite3.connect(
             self.path,
@@ -455,16 +458,21 @@ class TrackerStore:
             return 0
         with self._write() as conn:
             conn.executemany("INSERT OR REPLACE INTO ticks VALUES (?, ?, ?, ?, ?)", records)
+            self._tick_ids.update(r[0] for r in records)
             self._since_prune += len(records)
             if self._since_prune >= PRUNE_EVERY:
                 self._since_prune = 0
-                self._prune_ticks(conn, stamp - TICK_RETENTION_S, {r[0] for r in records})
+                self._prune_ticks(conn, stamp - TICK_RETENTION_S)
         return len(records)
 
-    @staticmethod
-    def _prune_ticks(conn: sqlite3.Connection, cutoff: float, extra_ids: Any) -> None:
-        # Per-exchange range deletes use the primary key, so no extra ts index is needed.
-        ids = {r[0] for r in conn.execute("SELECT exchange_id FROM exchanges")} | set(extra_ids)
+    def _prune_ticks(self, conn: sqlite3.Connection, cutoff: float) -> None:
+        if not self._pruned_once:
+            # The first prune after opening scans the whole table once (catches every old id).
+            conn.execute("DELETE FROM ticks WHERE ts < ?", (cutoff,))
+            self._pruned_once = True
+            return
+        # Afterwards, per-exchange range deletes on the primary key: no extra ts index needed.
+        ids = {r[0] for r in conn.execute("SELECT exchange_id FROM exchanges")} | self._tick_ids
         conn.executemany("DELETE FROM ticks WHERE exchange_id = ? AND ts < ?", [(eid, cutoff) for eid in ids])
 
     def add_candles(self, exchange_id: str, resolution: str, candles: Sequence[Mapping[str, Any]]) -> int:
@@ -508,14 +516,14 @@ class TrackerStore:
         )
         return bool(rows)
 
-    def series(self, exchange_id: str, since: float, until: Optional[float] = None) -> List[PricePoint]:
+    def series(self, exchange_id: str, since: float, until: Optional[float] = None, *, include_candles: bool = True) -> List[PricePoint]:
         """Merged, time-ordered points: candle closes (``source="candle"``, at candle end time)
         for the period before the first tick, then ticks. Marks via ``analytics.mark_price``.
 
         "The first tick" is the first tick inside ``[since, until]``, so candles also fill a
         window that starts before tracking did. Where 5m and 1h candles overlap, the finer
         5m candles win (generally: a finer resolution hides coarser closes inside its span).
-        Candles with a null close are skipped.
+        Candles with a null close are skipped. ``include_candles=False`` returns ticks only.
         """
         eid = str(exchange_id)
         mark = _mark_function()
@@ -530,13 +538,19 @@ class TrackerStore:
                     "SELECT ts, last, bid, ask FROM ticks WHERE exchange_id = ? AND ts >= ? AND ts <= ? ORDER BY ts",
                     (eid, since, until),
                 ).fetchall()
-            boundary = tick_rows[0]["ts"] if tick_rows else upper
-            params: List[Any] = [eid, since - _MAX_RESOLUTION_S]
-            sql = "SELECT resolution, ts, close FROM candles WHERE exchange_id = ? AND ts >= ?"
-            if math.isfinite(boundary):
-                sql += " AND ts < ?"
-                params.append(boundary)
-            candle_rows = self._conn.execute(sql + " ORDER BY ts", params).fetchall()
+            boundary = tick_rows[0]["ts"] if tick_rows else float("inf")
+            candle_rows: List[sqlite3.Row] = []
+            if include_candles and boundary > since:
+                # close time = start + length: bound it in SQL so only usable rows come back
+                params: List[Any] = [eid, since - _MAX_RESOLUTION_S, since]
+                sql = (
+                    "SELECT resolution, ts, close FROM candles WHERE exchange_id = ? AND ts >= ? "
+                    f"AND ts + {_LENGTH_SQL} >= ?"
+                )
+                if math.isfinite(boundary):
+                    sql += " AND ts < ?"
+                    params.append(boundary)
+                candle_rows = self._conn.execute(sql + " ORDER BY ts", params).fetchall()
 
         by_res: Dict[str, List[Tuple[float, Optional[float]]]] = {}
         for row in candle_rows:

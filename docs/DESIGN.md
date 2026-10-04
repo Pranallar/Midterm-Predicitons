@@ -69,8 +69,10 @@ for 20 minutes per query.
   be from a point no older than 15 minutes. `change = p_now - p_then`.
   `z = change / (sigma * sqrt(window / 300))` when sigma > 0, else None. A window qualifies if
   `|change| >= min_change` and (`z is None` or `|z| >= 3`). Return **at most one Surge per
-  exchange**: the qualifying window with the largest `|z|`, or the largest `|change|` when
-  z is None. Set `start_ts`/`start_price` from the `p_then` point and `end_ts`/`end_price` from
+  exchange**: the *shortest* qualifying window whose `|change|` is at least half of the
+  largest qualifying `|change|`. A 20-minute spike is then reported as a 1h surge, so
+  attribution looks at the trades that caused it, while a slow day-long drift is still
+  reported over 24h. Set `start_ts`/`start_price` from the `p_then` point and `end_ts`/`end_price` from
   the latest point. `peak_price` is the max (up) or min (down) mark in `[start_ts, end_ts]`.
 * **Surge lifecycle**: `update_surge_status(surge, current_price, now)` sets
   `reverted_fraction = (peak - current) / (peak - start)` for up-moves (mirrored for down,
