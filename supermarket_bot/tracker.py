@@ -20,20 +20,37 @@ are single attempts: a failure is retried by the worker later, never inline by t
 Non-fatal failures are reported in ``status()["problems"]`` (one entry per failing source,
 cleared when it works again) and ``status()["detection"]`` says whether surge detection is
 waiting for history or running on live prices only. Read-only: nothing here places orders.
+
+Paper trading and outside fair values (docs/PAPER_TRADING.md §7.2):
+
+* a **read reserve** (D44) keeps 12 of the client's slots for the snapshot loop: every background read
+  (context, backfill, analysis, paper) waits, or is skipped, while fewer are free;
+* ``fair_values`` (a :class:`~supermarket_bot.fairvalue.FairValueService`) refreshes in its own
+  ``tracker-fairvalue`` worker, ``paper`` (a :class:`~supermarket_bot.paper.PaperEngine`) steps in its
+  own ``tracker-paper`` worker after each cycle, within :class:`PaperBudget` (20 reads/min, 6 while the
+  backfill runs); its reads go through :class:`TrackerMarketReader` (GET only, stored for replays);
+* settlements of resolved markets are read every 600 s (or when outcomes go missing) and stored;
+* a store **lease** (D46) refuses a second tracker on the same database;
+* **lock rule** (D43): nothing calls the paper runner, the engine or the fair-value service while holding
+  ``self._lock``.
 """
 
 from __future__ import annotations
 
 import copy
+import itertools
 import logging
+import math
+import os
+import socket
 import sqlite3
 import threading
 import time
 from collections import deque
 from typing import Any, Callable, Deque, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
-from . import analytics
-from .books import books_from_market_orderbook
+from . import analytics, pipeline
+from .books import Book, books_from_market_orderbook, parse_time
 from .bot import Context, MarketDataBot, is_fatal
 from .client import SuperMarketClient
 from .errors import ApiError, NetworkError, RequestCancelled, SuperMarketError, redact
@@ -45,9 +62,14 @@ from .models import (
     SURGE_OPEN,
     SURGE_REVERTED,
     VERDICT_PARTICIPANTS,
+    BookObservation,
     ExchangeInfo,
     PricePoint,
+    SettlementInfo,
+    StrategyParams,
     Surge,
+    TradeRecord,
+    iso_ts,
 )
 from .ratelimit import SlidingWindowLimiter
 from .store import TrackerStore
@@ -83,6 +105,16 @@ MISSING_REFRESH_MIN_S = 30.0  # outcomes missing from the bulk prices: re-read t
 IDEA_BOOK_DEPTH = 20  # order-book levels read to size trade ideas
 IDEA_BOOKS_PER_REFRESH = 12  # single-exchange order books read per context refresh for trade ideas
 IDEA_BOOK_MAX_AGE_S = 900.0  # a stored idea book younger than this is not re-read for another candidate
+READ_RESERVE = 12  # client slots kept for the snapshot loop: background reads wait (or skip) below this (D44)
+RESERVE_POLL_S = 1.0  # a background read waiting for room above the reserve re-checks this often
+SETTLEMENT_PAGES_MAX = 5  # GET /tournaments/{slug}/markets?status=settled pages per read (100 markets each)
+TAPE_PAGE_LIMIT = 200  # trades per tape page (the API maximum)
+LEASE_NAME = "tracker"
+PROJECTED_WARN_PER_MIN = 75.0  # warn above this projected read rate (the account allows 100/min across all keys)
+ACCOUNT_READS_PER_MIN = 100  # the Super Market account limit, shared by every key
+DRAWER_READS_PER_MIN = 4.0  # one open exchange drawer re-reads its book every 15 s
+ANALYSIS_READS_PER_MIN = 2.0  # ~2 reads per new or grown surge (bursts up to the analysis budget)
+_OWNER_SEQ = itertools.count(1)
 # status()["problems"] sources and how bad a current failure of each is
 PROBLEM_SEVERITY: Dict[str, str] = {
     "markets": "error",
@@ -97,6 +129,10 @@ PROBLEM_SEVERITY: Dict[str, str] = {
     "order books": "warning",
     "attribution": "warning",
     "news": "warning",
+    "paper": "warning",
+    "fair value": "warning",
+    "settlements": "warning",
+    "read budget": "warning",
 }
 _EPS = 1e-9
 
@@ -166,20 +202,144 @@ def _storage_error(exc: BaseException) -> bool:
     return isinstance(exc, (sqlite3.Error, OSError)) and not isinstance(exc, SuperMarketError)
 
 
+class TrackerBusy(RuntimeError):
+    """Another live process holds this store's tracker lease (D46): running two would double the reads."""
+
+    def __init__(self, holder: Mapping[str, Any], path: str = "") -> None:
+        self.holder = dict(holder or {})
+        self.path = str(path or "")
+        pid = self.holder.get("pid") if self.holder.get("pid") is not None else "?"
+        host = self.holder.get("host") or "another machine"
+        where = self.path or "this database"
+        super().__init__(
+            f"Another process (pid {pid} on {host}) is already running the tracker on {where}: stop it, or use "
+            "--data-dir for a separate copy. Running two would double the API reads; the account allows 100 per "
+            "minute across all keys."
+        )
+
+
+class ReadReserve:
+    """Keeps ``reserve`` slots of the shared client limiter free for the snapshot loop (D44).
+
+    ``room() = shared.limit - reserve - shared.used``. Background readers call :meth:`wait` (blocks, polling
+    every ``poll_s`` with the stop-aware ``sleep``) or check :meth:`room` and skip; the snapshot loop's own
+    reads never look at it."""
+
+    def __init__(self, shared: Any, reserve: int = READ_RESERVE, *, sleep: Optional[Callable[[float], None]] = None,
+                 poll_s: float = RESERVE_POLL_S) -> None:
+        self.shared = shared
+        self.reserve = max(0, int(reserve))
+        self._sleep = sleep or time.sleep
+        self.poll_s = float(poll_s)
+
+    @property
+    def limit(self) -> int:
+        return int(getattr(self.shared, "limit", 0) or 0)
+
+    def room(self) -> int:
+        if self.shared is None:
+            return 1_000_000
+        try:
+            return int(self.shared.limit) - self.reserve - int(self.shared.used)
+        except Exception:  # a limiter without the usual attributes: never gate
+            return 1_000_000
+
+    def wait(self) -> float:
+        """Block until there is room above the reserve. Returns the seconds waited."""
+        waited = 0.0
+        while self.room() <= 0:
+            self._sleep(self.poll_s)
+            waited += self.poll_s
+        return waited
+
+
+class _GatedLimiter:
+    """A worker's own budget behind the read reserve: ``acquire`` waits for room above the reserve, then
+    takes its own slot. Exposes the limiter attributes the status and the attributor use."""
+
+    def __init__(self, own: SlidingWindowLimiter, reserve: ReadReserve) -> None:
+        self.own = own
+        self.reserve = reserve
+
+    def acquire(self) -> float:
+        waited = self.reserve.wait()
+        return waited + self.own.acquire()
+
+    def pause(self, seconds: float) -> None:
+        self.own.pause(seconds)
+
+    @property
+    def limit(self) -> int:
+        return self.own.limit
+
+    @property
+    def used(self) -> int:
+        return self.own.used
+
+    @property
+    def window(self) -> float:
+        return self.own.window
+
+    @property
+    def _paused_until(self) -> float:
+        return self.own._paused_until
+
+    @property
+    def _clock(self) -> Callable[[], float]:
+        return self.own._clock
+
+
+class PaperBudget:
+    """The paper worker's read budget (§7.2): its own sliding window (``reads_per_min``, or
+    ``during_backfill`` while the tracker's backfill queue is not empty) AND room above the read reserve.
+    The runner reads only while ``room() > 0``, so :meth:`acquire` never needs to wait."""
+
+    def __init__(self, own: SlidingWindowLimiter, reserve: ReadReserve, backfill_pending: Callable[[], bool],
+                 during_backfill: int) -> None:
+        self.own = own
+        self.reserve = reserve
+        self._backfill_pending = backfill_pending
+        self.during_backfill = max(1, int(during_backfill))
+
+    @property
+    def limit(self) -> int:
+        try:
+            pending = bool(self._backfill_pending())
+        except Exception:
+            pending = False
+        return min(self.own.limit, self.during_backfill) if pending else self.own.limit
+
+    @property
+    def used(self) -> int:
+        return self.own.used
+
+    def room(self) -> int:
+        return min(self.limit - self.own.used, self.reserve.room())
+
+    def acquire(self) -> float:
+        return self.own.acquire()
+
+    def status(self) -> Dict[str, int]:
+        return {"used": int(self.used), "limit": int(self.limit), "room": max(0, int(self.room()))}
+
+
 class _WorkerReadLimiter:
     """The client's read limiter as seen by a worker's single-attempt reads.
 
-    Every request still takes a slot from the shared per-account budget. A server-requested
-    wait is *not* applied to every caller here (the client would pause snapshots too for an
-    optional read's ``503 Retry-After``); the tracker forwards 429 waits to the shared limiter
-    itself and keeps 503 waits local to the worker that hit them.
+    Every request still takes a slot from the shared per-account budget, after waiting for room above
+    the snapshot loop's read reserve (when one is set). A server-requested wait is *not* applied to
+    every caller here (the client would pause snapshots too for an optional read's ``503 Retry-After``);
+    the tracker forwards 429 waits to the shared limiter itself and keeps 503 waits local to the worker
+    that hit them.
     """
 
-    def __init__(self, shared: Any) -> None:
+    def __init__(self, shared: Any, reserve: Optional[ReadReserve] = None) -> None:
         self.shared = shared
+        self.reserve = reserve
 
     def acquire(self) -> float:
-        return self.shared.acquire()
+        waited = self.reserve.wait() if self.reserve is not None else 0.0
+        return waited + self.shared.acquire()
 
     def pause(self, seconds: float) -> None:
         pass
@@ -242,7 +402,27 @@ class Tracker:
         context_refresh: float = 300.0,
         clock: Callable[[], float] = time.time,
         max_overround_markets: int = MAX_OVERROUND_MARKETS,
+        fair_values: Any = None,
+        paper: Any = None,
+        paper_reads_per_min: int = 20,
+        paper_reads_per_min_during_backfill: int = 6,
+        settlement_refresh: float = 600.0,
+        leaderboard_limit: int = 100,
+        regime: str = "unknown",
+        strategy_params: Optional[StrategyParams] = None,
+        read_reserve: int = READ_RESERVE,
+        limiter_clock: Optional[Callable[[], float]] = None,
+        limiter_sleep: Optional[Callable[[float], None]] = None,
+        lease: bool = False,
     ) -> None:
+        """New in docs/PAPER_TRADING.md §7.2 (the defaults keep the old behaviour): ``fair_values`` (a
+        FairValueService, refreshed in its own worker), ``paper`` (a PaperEngine, stepped after each cycle
+        within ``paper_reads_per_min``, ``paper_reads_per_min_during_backfill`` while the backfill queue is not
+        empty), ``settlement_refresh`` (seconds between reads of settled markets), ``leaderboard_limit``
+        (rows read per context refresh), ``regime`` / ``strategy_params`` (the paper trader's inputs),
+        ``read_reserve`` (client slots kept for the snapshot loop), ``limiter_clock`` / ``limiter_sleep``
+        (used by every limiter the tracker builds; the fast demo passes its SimClock and ``demo.no_wait``)
+        and ``lease`` (one tracker per store)."""
         if interval <= 0:
             raise ValueError("interval must be > 0")
         self.client = client
@@ -259,14 +439,26 @@ class Tracker:
         # The client's API key: masked in every problem message before it is cut to length.
         self._secrets: Tuple[str, ...] = tuple(s for s in getattr(client, "_secrets", ()) or () if isinstance(s, str))
         self._bot = MarketDataBot(client, context)  # snapshots keep the client's retries
-        self._quick = single_attempt_client(client)  # backfill and context: one attempt per read
-
         self._stop = threading.Event()
         self._backfill_wake = threading.Event()
         self._analysis_wake = threading.Event()
+        self._paper_wake = threading.Event()  # set at the end of every cycle: the paper worker steps once per cycle
         self._first_cycle = threading.Event()  # the context worker starts after the first cycle
-        self.backfill_limiter = SlidingWindowLimiter(max(1, int(backfill_reads_per_min)), sleep=self._wait_or_stop)
-        self.analyze_limiter = SlidingWindowLimiter(max(1, int(analyze_reads_per_min)), sleep=self._wait_or_stop)
+        self._limiter_clock: Callable[[], float] = limiter_clock or time.monotonic
+        self._limiter_sleep: Callable[[float], None] = limiter_sleep or self._wait_or_stop
+        # The snapshot loop's reserve on the shared client budget (D44): background reads wait for room above it.
+        self.read_reserve = ReadReserve(getattr(client, "read_limiter", None), read_reserve, sleep=self._limiter_sleep)
+        self._quick = single_attempt_client(client)  # backfill and context: one attempt per read
+        if isinstance(getattr(self._quick, "read_limiter", None), _WorkerReadLimiter):
+            self._quick.read_limiter.reserve = self.read_reserve
+        self.backfill_limiter = _GatedLimiter(
+            SlidingWindowLimiter(max(1, int(backfill_reads_per_min)), clock=self._limiter_clock, sleep=self._limiter_sleep),
+            self.read_reserve,
+        )
+        self.analyze_limiter = _GatedLimiter(
+            SlidingWindowLimiter(max(1, int(analyze_reads_per_min)), clock=self._limiter_clock, sleep=self._limiter_sleep),
+            self.read_reserve,
+        )
         if attributor is not None and getattr(attributor, "limiter", None) is None:
             # Share the analysis budget with the attributor, which makes the client calls.
             try:
@@ -279,6 +471,35 @@ class Tracker:
         self._threads: List[threading.Thread] = []
         self._session_start = clock()  # backfills older than this belong to an earlier run
         self._started_at: Optional[float] = None
+
+        # paper trading, fair values, settlements (docs/PAPER_TRADING.md §7.2)
+        self.fair_values = fair_values
+        self.regime = str(regime or "unknown")
+        self.strategy_params = strategy_params
+        self.settlement_refresh = float(settlement_refresh)
+        self.leaderboard_limit = max(1, min(100, int(leaderboard_limit)))
+        self._settlements_at = float("-inf")
+        self._settled_missing: Set[str] = set()  # the missing set the last settlement read covered
+        self.paper_limiter = PaperBudget(
+            SlidingWindowLimiter(max(1, int(paper_reads_per_min)), clock=self._limiter_clock, sleep=self._limiter_sleep),
+            self.read_reserve,
+            backfill_pending=self._backfill_pending,
+            during_backfill=paper_reads_per_min_during_backfill,
+        )
+        self.paper = paper
+        self.paper_runner: Any = None
+        self._paper_error: Optional[str] = None
+        self._paper_read_failures = 0  # reads that failed during the current paper step
+        self._projected: Dict[str, Any] = {"per_min": 0.0, "warning": None}
+        self.lease_enabled = bool(lease)
+        self._lease_held = False
+        self._lease_ttl = 3.0 * self.interval
+        self._owner: Dict[str, Any] = {
+            "owner_id": f"{socket.gethostname()}:{os.getpid()}:{time.time():.6f}:{next(_OWNER_SEQ)}",
+            "pid": os.getpid(),
+            "host": socket.gethostname(),
+        }
+        self._published: Dict[str, Any] = {"mids": {}, "recent": {}, "at": None}  # replaced, never mutated
 
         # markets and prices
         self._markets: Optional[List[Dict[str, Any]]] = None
@@ -357,6 +578,10 @@ class Tracker:
         self._problems: Dict[str, Dict[str, Any]] = {}  # source -> current non-fatal failure
         self._detection: Dict[str, Any] = {"enabled": True, "waiting_for_history": 0, "live_only": 0, "reason": None}
 
+        if paper is not None:
+            self._make_paper_runner(paper)
+        self._update_projection()
+
     # ------------------------------------------------------------------ plumbing
 
     def _wait_or_stop(self, seconds: float) -> None:
@@ -419,6 +644,7 @@ class Tracker:
         self._stop.set()
         self._backfill_wake.set()
         self._analysis_wake.set()
+        self._paper_wake.set()
         self._first_cycle.set()  # ends the context worker's wait for the first cycle
 
     def _api_error(self, where: str, exc: SuperMarketError, source: Optional[str] = None) -> None:
@@ -455,6 +681,183 @@ class Tracker:
                     continue
         return out
 
+    # ------------------------------------------------------------------ paper trading / fair values plumbing
+
+    def _make_paper_runner(self, engine: Any) -> None:
+        """``PaperRunner(engine, TrackerMarketReader(self), self._paper_inputs, ...)`` (§7.2). A paper module
+        that is not available in this build turns the paper trader off with a plain reason (never a crash)."""
+        from . import paper as paper_mod
+
+        try:
+            self.paper_runner = paper_mod.PaperRunner(
+                engine, TrackerMarketReader(self), self._paper_inputs, limiter=self.paper_limiter, clock=self._clock,
+                interval=self.interval, extras_fn=self._paper_extras,
+            )
+        except NotImplementedError:
+            self.paper_runner = None
+            self._paper_error = "The paper trader is not available in this build."
+            log.warning("paper trading disabled: %s", self._paper_error)
+
+    @property
+    def paper_error(self) -> Optional[str]:
+        """Why a configured paper trader is not running (None when it runs, or when none was configured)."""
+        return self._paper_error
+
+    def _backfill_pending(self) -> bool:
+        with self._lock:
+            return any(len(q) for q in self._bf_queues.values())
+
+    def _paper_extras(self) -> Dict[str, Any]:
+        """Keys the runner adds to its published summary (it calls this under the runner lock: no tracker lock)."""
+        return {"fair_value": self._fair_value_compact()}
+
+    def _fair_value_compact(self) -> Optional[Dict[str, Any]]:
+        if self.fair_values is None:
+            return None
+        try:
+            st = self.fair_values.status()
+        except Exception as exc:
+            log.debug("fair value status failed: %s", exc)
+            return None
+        return {"mode": st.get("mode"), "enabled": bool(st.get("enabled")), "usable": int(st.get("usable") or 0),
+                "total": int(st.get("total") or 0)}
+
+    def _view_copy(self) -> Dict[str, Any]:
+        """What the paper inputs need from the cached view (takes the lock briefly). Rows are copied shallowly
+        (each cycle publishes new row dicts; only the surge rows are patched in place, and they are left out),
+        without their sparklines; the context is copied deeply."""
+        with self._lock:
+            if self._view is not None:
+                view = {
+                    "exchanges": [{k: v for k, v in r.items() if k != "sparkline"} for r in self._view.get("exchanges") or []],
+                    "high_band": [dict(b) for b in self._view.get("high_band") or []],
+                    "surges": [],
+                    "context": _copy_json(self._context),
+                }
+            else:
+                view = {"exchanges": [], "surges": [], "high_band": [], "context": _copy_json(self._context), "status": {}}
+            markets_at = self._markets_at if self._markets is not None else None
+        view["status"] = {"markets_updated_at": markets_at}
+        return view
+
+    def _paper_inputs(self, now: float) -> Tuple[Any, Any]:
+        """``pipeline.assemble_inputs`` + ``pipeline.observation`` from the cached view and the store (no reads)."""
+        view = self._view_copy()
+        inputs = pipeline.assemble_inputs(
+            now=now, view=view, store=self.store, fair_values=self.fair_values, regime=self.regime,
+            params=self.strategy_params, recent_mids=self.recent_mids(pipeline.RECENT_MIDS_S),
+        )
+        obs = pipeline.observation(now=now, inputs=inputs, view=view, store=self.store, open_ids=sorted(self._open_ids()))
+        return inputs, obs
+
+    def recent_mids(self, seconds: float = pipeline.RECENT_MIDS_S) -> Dict[str, List[Tuple[float, float]]]:
+        """exchange id -> [(ts, YES mid)] over the last ``seconds`` before the latest cycle, oldest first, from the
+        in-memory series cache (no SQL). Lock-free: reads the snapshot the loop published at its last cycle."""
+        published = self._published
+        at = published.get("at")
+        if at is None:
+            return {}
+        cutoff = float(at) - float(seconds)
+        return {eid: [p for p in pts if p[0] >= cutoff - 1e-9] for eid, pts in published.get("recent", {}).items()}
+
+    def cup_mids(self) -> Dict[str, float]:
+        """exchange id -> the Cup's current YES mid from the last published view rows (lock-free)."""
+        return dict(self._published.get("mids") or {})
+
+    def _publish(self, now: float, rows: Sequence[Mapping[str, Any]]) -> None:
+        """Replace the lock-free snapshot behind :meth:`cup_mids` and :meth:`recent_mids` (end of each cycle)."""
+        mids: Dict[str, float] = {}
+        for row in rows:
+            bid, ask, mark = _num(row.get("bid")), _num(row.get("ask")), _num(row.get("mark"))
+            mid = round((bid + ask) / 2, 6) if bid is not None and ask is not None else mark
+            if mid is not None and not row.get("stale"):
+                mids[str(row["exchange_id"])] = mid
+        recent: Dict[str, List[Tuple[float, float]]] = {}
+        cutoff = now - pipeline.RECENT_MIDS_S
+        for eid in mids:
+            pts = self._series.get(eid) or []
+            out: List[Tuple[float, float]] = []
+            for p in reversed(pts):
+                if p.ts < cutoff:
+                    break
+                if p.ts > now or p.source != "tick":
+                    continue
+                mid = round((p.bid + p.ask) / 2, 6) if p.bid is not None and p.ask is not None else p.price
+                if mid is not None:
+                    out.append((p.ts, float(mid)))
+            recent[eid] = list(reversed(out))
+        self._published = {"mids": mids, "recent": recent, "at": now}
+
+    def _update_projection(self) -> None:
+        """The §9 read projection from the live outcome count (start-up and after each market-list refresh)."""
+        with self._lock:
+            n = len(self._infos)
+            markets = list(self._markets or [])
+            backfill_pending = any(len(q) for q in self._bf_queues.values())
+        m = len(markets)
+        multi = sum(1 for mk in markets if isinstance(mk, Mapping) and mk.get("isMultiOutcome"))
+        bulk = math.ceil(n / 100) * 60.0 / self.interval if n else 0.0
+        lists = math.ceil(m / 100) * 60.0 / max(1.0, self.market_refresh) if m else 0.0
+        context = (4 + IDEA_BOOKS_PER_REFRESH + min(self.max_overround_markets, multi)) * 60.0 / max(1.0, self.context_refresh)
+        settlements = 60.0 / max(1.0, self.settlement_refresh)
+        backfill = float(self.backfill_limiter.limit) if self.backfill_enabled and backfill_pending else 0.0
+        analysis = ANALYSIS_READS_PER_MIN if self.analyze_enabled and self.attributor is not None else 0.0
+        paper = float(self.paper_limiter.limit) if self.paper_runner is not None else 0.0
+        total = round(bulk + lists + context + settlements + backfill + analysis + paper + DRAWER_READS_PER_MIN, 1)
+        warning = None
+        # Only a client capped like a real account (<= 100/min) shares the account limit; the demo's simulated
+        # API has budgets far above it, and warning about the account there would be wrong.
+        client_limit = getattr(getattr(self.client, "read_limiter", None), "limit", None)
+        real_account = not isinstance(client_limit, (int, float)) or client_limit <= ACCOUNT_READS_PER_MIN
+        if real_account and total > PROJECTED_WARN_PER_MIN:
+            warning = (f"Projected reads ({total:.0f}/min) are close to the account limit of 100 per minute shared by all "
+                       "your keys: do not run other scripts on this account.")
+        with self._lock:
+            self._projected = {"per_min": total, "warning": warning}
+        if warning:
+            self._problem("read budget", warning)
+        else:
+            self._resolve("read budget")
+
+    # ------------------------------------------------------------------ lease (one tracker per store, D46)
+
+    def _ensure_lease(self) -> None:
+        """Take or renew the store lease; raise TrackerBusy when another live process holds it."""
+        if not self.lease_enabled:
+            return
+        acquire = getattr(self.store, "acquire_lease", None)
+        if not callable(acquire):
+            return
+        holder = acquire(LEASE_NAME, self._owner, self._clock(), ttl_s=self._lease_ttl)
+        if holder is not None:
+            raise TrackerBusy(holder, getattr(self.store, "path", ""))
+        self._lease_held = True
+
+    def _renew_lease(self) -> None:
+        if not self.lease_enabled or not self._lease_held:
+            return
+        try:
+            ok = self.store.renew_lease(LEASE_NAME, self._owner["owner_id"], self._clock())
+        except Exception as exc:
+            if not _storage_error(exc):
+                raise
+            self._storage_failed("renewing the tracker lease", exc)
+            return
+        if not ok:
+            try:
+                self._ensure_lease()  # our heartbeat lapsed (the machine slept): take it back if nobody else did
+            except TrackerBusy as exc:
+                self._set_fatal("tracker lease", exc)
+
+    def _release_lease(self) -> None:
+        if not self._lease_held:
+            return
+        try:
+            self.store.release_lease(LEASE_NAME, self._owner["owner_id"])
+        except Exception as exc:
+            log.debug("could not release the tracker lease: %s", exc)
+        self._lease_held = False
+
     # ------------------------------------------------------------------ cycle
 
     def run_once(self) -> Dict[str, Any]:
@@ -469,6 +872,7 @@ class Tracker:
         ``status()["fatal_error"]``, stop the tracker and are re-raised. Everything else is
         counted and reported in ``status()["problems"]``.
         """
+        self._ensure_lease()
         try:
             return self._run_once()
         except _Stopping:
@@ -541,6 +945,8 @@ class Tracker:
             if refresh_context and self._context_due(now):
                 self._refresh_context(now)
                 summary["context_refreshed"] = True
+            if refresh_context and self._settlements_due(now):
+                self._refresh_settlements(now)
 
             self._build_view(now, results)
             with self._lock:
@@ -550,6 +956,7 @@ class Tracker:
                 summary["errors"] = self._errors - errors_before
             self._resolve("tracker")  # a whole cycle ran: an earlier crash is over
             self._first_cycle.set()
+            self._paper_wake.set()
             summary.update(at=now, markets=len(self._markets or []), exchanges=len(self._infos))
             summary["high_band"] = sum(1 for r in results.values() if r.get("band") is not None)
             return summary
@@ -601,6 +1008,13 @@ class Tracker:
                     self._series_loaded.pop(eid, None)
         if self.backfill_enabled:
             self._plan_backfill(list(infos))
+        # Lock rule (D43): the fair-value service is called only after the tracker's lock is released.
+        if self.fair_values is not None:
+            try:
+                self.fair_values.set_targets(list(infos.values()))
+            except Exception as exc:
+                self._record_error("fair value targets", repr(exc), "fair value")
+        self._update_projection()
 
     # ------------------------------------------------------------------ analytics
 
@@ -1332,9 +1746,11 @@ class Tracker:
                     if start is not None:
                         updates["initial_balance"] = initial = start
                     updates.update(self._account_value(slug, balance))
-                board = self._call("leaderboard", lambda: quick.get_tournament_leaderboard(slug, limit=3), "leaderboard")
+                limit = self.leaderboard_limit
+                board = self._call("leaderboard", lambda: quick.get_tournament_leaderboard(slug, limit=limit), "leaderboard")
                 if isinstance(board, Mapping):
                     updates["leaderboard"] = self._leaderboard(board, initial)
+                    self._store_leaderboard(updates["leaderboard"], initial, now)
 
             book_failures: List[str] = []
             book_reads = 0
@@ -1469,8 +1885,9 @@ class Tracker:
 
     @staticmethod
     def _leaderboard(board: Mapping[str, Any], initial: Optional[float]) -> Dict[str, Any]:
+        rows = [e for e in board.get("leaderboard") or [] if isinstance(e, Mapping)]
         top = []
-        for entry in [e for e in board.get("leaderboard") or [] if isinstance(e, Mapping)][:3]:
+        for entry in rows[:3]:
             top.append(
                 {
                     "rank": entry.get("rank"),
@@ -1481,6 +1898,12 @@ class Tracker:
                     "value": leaderboard_value(entry, initial),
                 }
             )
+        # Up to 100 compact rows for the top-3 bar estimate (sizing.estimate_bar).
+        entries = [
+            {"rank": entry.get("rank"), "username": entry.get("username"), "pnl": _num(entry.get("pnl")),
+             "value": leaderboard_value(entry, initial)}
+            for entry in rows[:100]
+        ]
         rank = board.get("myRank")
         return {
             "my_rank": rank if isinstance(rank, int) and not isinstance(rank, bool) else None,
@@ -1489,7 +1912,80 @@ class Tracker:
             "total": board.get("total"),
             "period": board.get("period"),
             "value_assumption": "value = initialBalance + pnl (the leaderboard reports PnL only)",
+            "entries": entries,
         }
+
+    def _store_leaderboard(self, board: Mapping[str, Any], initial: Optional[float], now: float) -> None:
+        snap = pipeline.leaderboard_snapshot({"leaderboard": board, "initial_balance": initial}, now)
+        if snap is None:
+            return
+        try:
+            self.store.add_leaderboard_snapshot(snap)
+        except Exception as exc:
+            if not _storage_error(exc):
+                raise
+            self._storage_failed("saving the leaderboard", exc)
+
+    # ------------------------------------------------------------------ settlements
+
+    def _settlements_due(self, now: float) -> bool:
+        """Settled markets are read every ``settlement_refresh`` s, and early (at most every
+        ``MISSING_REFRESH_MIN_S``) when outcomes went missing from the bulk prices since the last read."""
+        if not self.context.slug:
+            return False
+        with self._lock:
+            if now - self._settlements_at >= self.settlement_refresh:
+                return True
+            new_missing = bool(self._missing - self._settled_missing)
+            return new_missing and now - self._settlements_at >= MISSING_REFRESH_MIN_S
+
+    def _refresh_settlements(self, now: float) -> int:
+        """``GET /tournaments/{slug}/markets?status=settled`` (cursor pages, at most 5), stored with
+        ``detected_at = now`` (the first detection is kept). Returns the outcomes recorded."""
+        slug = self.context.slug
+        with self._lock:
+            missing = set(self._missing)
+        if not slug:
+            return 0
+        rows: List[SettlementInfo] = []
+        cursor: Optional[str] = None
+        failed = False
+        for _ in range(SETTLEMENT_PAGES_MAX):
+            page_cursor = cursor
+            try:
+                resp = self._quick.list_tournament_markets(slug, status="settled", limit=100, cursor=page_cursor)
+            except SuperMarketError as exc:
+                self._api_error("settled markets", exc, "settlements")
+                failed = True
+                break
+            data = resp.get("data") if isinstance(resp, Mapping) else None
+            for market in data or []:
+                if isinstance(market, Mapping):
+                    rows.extend(pipeline.settlements_from_market(market, self._clock()))
+            pagination = resp.get("pagination") if isinstance(resp, Mapping) else None
+            cursor = pagination.get("nextCursor") if isinstance(pagination, Mapping) else None
+            if not cursor or not (isinstance(pagination, Mapping) and pagination.get("hasMore", True)):
+                break
+        with self._lock:
+            self._settlements_at = now
+            self._settled_missing = missing
+        if failed:
+            return 0
+        self._resolve("settlements")
+        if not rows:
+            return 0
+        try:
+            return int(self.store.record_settlements(rows))
+        except Exception as exc:
+            if not _storage_error(exc):
+                raise
+            self._storage_failed("saving settlements", exc)
+            return 0
+
+    def settlements(self) -> Dict[str, SettlementInfo]:
+        """Every settlement the tracker has read (from the store)."""
+        getter = getattr(self.store, "settlements", None)
+        return dict(getter()) if callable(getter) else {}
 
     def _overround_rows(self, now: Optional[float] = None) -> Tuple[Optional[List[Dict[str, Any]]], int, List[str]]:
         """Up to ``max_overround_markets`` multi-outcome books per refresh: the markets flagged
@@ -1637,6 +2133,7 @@ class Tracker:
         }
         with self._lock:
             self._view = view
+        self._publish(now, exchanges)
 
     def view(self) -> Dict[str, Any]:
         """Thread-safe snapshot for the dashboard (a copy; safe to mutate or ``json.dumps``).
@@ -1700,6 +2197,7 @@ class Tracker:
                 # waiting for price history, outcomes detected from live prices only, and why.
                 "detection": dict(self._detection),
             }
+            projected = dict(self._projected)
         client_limiter = getattr(self.client, "read_limiter", None)
         sent = getattr(self.client, "requests_sent", None)
         if isinstance(sent, int) and self._quick is not self.client:
@@ -1709,8 +2207,117 @@ class Tracker:
             "backfill": {"used": self.backfill_limiter.used, "limit": self.backfill_limiter.limit},
             "analysis": {"used": self.analyze_limiter.used, "limit": self.analyze_limiter.limit},
             "requests_sent": sent,
+            "paper": self.paper_limiter.status() if self.paper_runner is not None else None,
+            "reserve": self.read_reserve.reserve,
+            "projected_per_min": projected.get("per_min"),
+            "warning": projected.get("warning"),
         }
+        # Outside self._lock (lock rule, D43): the runner's published summary and the fair-value service.
+        status["paper"] = self._paper_status()
+        status["fair_value"] = self._fair_value_status()
         return status
+
+    def _paper_status(self) -> Optional[Dict[str, Any]]:
+        if self.paper_runner is None:
+            return None
+        try:
+            summary = self.paper_runner.summary() or {}
+        except Exception as exc:
+            log.debug("paper summary failed: %s", exc)
+            summary = {}
+        run = summary.get("run") if isinstance(summary, Mapping) else None
+        run = run if isinstance(run, Mapping) else {}
+        return {"enabled": True, "run_id": run.get("run_id"), "steps": run.get("steps"),
+                "last_step_at": run.get("last_step_at"), "last_step_seconds": run.get("last_step_seconds")}
+
+    def _fair_value_status(self) -> Optional[Dict[str, Any]]:
+        if self.fair_values is None:
+            return None
+        try:
+            return _copy_json(dict(self.fair_values.status()))
+        except Exception as exc:
+            log.debug("fair value status failed: %s", exc)
+            return None
+
+    # ------------------------------------------------------------------ paper / fair value (synchronous)
+
+    def fair_value_step(self, now: Optional[float] = None) -> bool:
+        """One fair-value refresh (the worker calls this every FV_REFRESH_S). False without a service."""
+        if self.fair_values is None:
+            return False
+        when = self._clock() if now is None else float(now)
+        self.fair_values.refresh(when)
+        self._update_fair_value_problem()
+        return True
+
+    def _update_fair_value_problem(self) -> None:
+        try:
+            st = self.fair_values.status() if self.fair_values is not None else {}
+        except Exception:
+            return
+        messages: List[str] = []
+        for name, info in sorted((st.get("providers") or {}).items()):
+            if not isinstance(info, Mapping):
+                continue
+            if info.get("status") in ("offline", "error", "backoff") and info.get("last_error"):
+                text = str(info["last_error"])
+                if text not in messages:
+                    messages.append(text)
+        if messages:
+            self._problem("fair value", " ".join(messages))
+        else:
+            self._resolve("fair value")
+
+    def paper_step(self, now: Optional[float] = None) -> Any:
+        """One paper step (the worker calls this after each cycle). None without a paper trader."""
+        if self.paper_runner is None:
+            return None
+        self._ensure_lease()
+        with self._lock:
+            self._paper_read_failures = 0
+        report = self.paper_runner.step(now)
+        errors = list(getattr(report, "errors", None) or [])
+        with self._lock:
+            failures = self._paper_read_failures
+        if errors:
+            self._problem("paper", f"The paper step reported a problem: {errors[0]}")
+        elif not failures:
+            self._resolve("paper")
+        return report
+
+    def paper_view(self, run: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """The runner's published ``/api/paper`` body (a shallow copy, ``run.interval`` set), or for
+        ``run="previous"`` the newest ended run's final snapshot. None without a paper trader."""
+        if self.paper_runner is None:
+            return None
+        if run == "previous":
+            prev = self.paper_runner.previous()
+            return dict(prev) if isinstance(prev, Mapping) else None
+        summary = self.paper_runner.summary()
+        if not isinstance(summary, Mapping):
+            return None
+        out = dict(summary)
+        run_info = out.get("run")
+        if isinstance(run_info, Mapping):
+            run_info = dict(run_info)
+            run_info["interval"] = self.interval
+            out["run"] = run_info
+        return out
+
+    def paper_reset(self, start_capital: Optional[float] = None, target_hours: Optional[float] = None) -> Optional[str]:
+        """End the current run (reason "reset", final snapshot kept) and start a new one. Returns its id."""
+        if self.paper_runner is None:
+            return None
+        self._ensure_lease()  # a second process must not end this store's run (D46)
+        source = "set by you" if start_capital is not None else ""
+        return self.paper_runner.reset(self._clock(), start_capital=start_capital, target_hours=target_hours,
+                                       capital_source=source)
+
+    def paper_end(self, reason: str = "completed") -> Optional[Dict[str, Any]]:
+        """End the current run with ``reason`` (``paper --hours N`` when done) and keep its final snapshot."""
+        if self.paper_runner is None:
+            return None
+        return self.paper_runner.end_run(self._clock(), reason)
 
     # ------------------------------------------------------------------ threads
 
@@ -1729,9 +2336,11 @@ class Tracker:
             if not self._cycles:
                 self._first_cycle.clear()
             self._fatal_error = None
+            self._ensure_lease()  # raises TrackerBusy when another live process tracks this store
             if getattr(self.client, "cancelled", False):
                 self.client.reset_cancel()  # a previous stop() cancelled the client
             self._started_at = self._clock()
+            self._paper_wake.clear()
             threads = [
                 threading.Thread(target=self._loop, name="tracker-loop", daemon=True),
                 threading.Thread(target=self._context_worker, name="tracker-context", daemon=True),
@@ -1740,6 +2349,10 @@ class Tracker:
                 threads.append(threading.Thread(target=self._backfill_worker, name="tracker-backfill", daemon=True))
             if self.attributor is not None:
                 threads.append(threading.Thread(target=self._analysis_worker, name="tracker-analysis", daemon=True))
+            if self.fair_values is not None:
+                threads.append(threading.Thread(target=self._fair_value_worker, name="tracker-fairvalue", daemon=True))
+            if self.paper_runner is not None:
+                threads.append(threading.Thread(target=self._paper_worker, name="tracker-paper", daemon=True))
             self._threads = threads
         for thread in threads:
             thread.start()
@@ -1761,6 +2374,7 @@ class Tracker:
         alive = [t.name for t in threads if t.is_alive() and t is not current]
         if alive:
             log.warning("tracker threads still running after %.1fs: %s", timeout, ", ".join(alive))
+        self._release_lease()
 
     def _loop(self) -> None:
         next_at = time.monotonic()
@@ -1774,6 +2388,10 @@ class Tracker:
                     break  # fatal: already recorded in status
             except Exception as exc:  # a bug in one cycle should not end tracking
                 self._cycle_failed("cycle", exc, label="tracker cycle")
+            try:
+                self._renew_lease()
+            except Exception as exc:
+                self._cycle_failed("lease renewal", exc, label="tracker lease renewal")
             next_at += self.interval
             now = time.monotonic()
             if next_at <= now:  # fell behind: skip the missed slots instead of bursting
@@ -1830,6 +2448,8 @@ class Tracker:
                 if self._context_due(now):
                     self._refresh_context(now)
                     self._resolve("context worker")
+                if self._settlements_due(now):
+                    self._refresh_settlements(now)
             except _Stopping:
                 break
             except SuperMarketError:
@@ -1844,3 +2464,142 @@ class Tracker:
 
     def _analysis_worker(self) -> None:
         self._worker(self.analyze_pending, self._analysis_wake, "analysis")
+
+    def _fair_value_worker(self) -> None:
+        """Refresh outside fair values every FV_REFRESH_S (its own HTTP budget: never the snapshot loop's)."""
+        from .fairvalue import FV_REFRESH_S
+
+        while not self._stop.is_set():
+            try:
+                self.fair_value_step()
+                self._resolve("fair value worker")
+            except _Stopping:
+                break
+            except Exception as exc:
+                self._cycle_failed("fair value refresh", exc, "fair value worker")
+            if self._stop.wait(FV_REFRESH_S):
+                break
+
+    def _paper_worker(self) -> None:
+        """One paper step per tracker cycle (woken at the end of each cycle)."""
+        while not self._stop.is_set():
+            if not self._paper_wake.wait(max(WORKER_IDLE_S, self.interval)):
+                continue
+            self._paper_wake.clear()
+            if self._stop.is_set():
+                break
+            try:
+                self.paper_step()
+                self._resolve("paper worker")
+            except _Stopping:
+                break
+            except TrackerBusy as exc:
+                self._set_fatal("paper step", exc)
+                break
+            except SuperMarketError:
+                if self._stop.is_set():
+                    break
+            except Exception as exc:
+                self._cycle_failed("paper step", exc, "paper")
+
+
+class TrackerMarketReader:
+    """The paper runner's only way to read the market (``paper.MarketReader``): GET reads through the
+    tracker's single-attempt client inside its paper budget, stored for replays (books in ``book_snapshots``
+    and as the idea book, prints with ``fetched_at``). Returns None on any failure (reported as the
+    "paper" problem)."""
+
+    def __init__(self, tracker: Tracker) -> None:
+        self.tracker = tracker
+
+    def _failed(self) -> None:
+        with self.tracker._lock:
+            self.tracker._paper_read_failures += 1
+
+    def book(self, exchange_id: str, depth: int) -> Optional[BookObservation]:
+        t = self.tracker
+        eid = str(exchange_id)
+        try:
+            t.paper_limiter.acquire()
+            payload = t._quick.get_exchange_orderbook(eid, depth=int(depth), tournament_id=t.context.tournament_id)
+        except SuperMarketError as exc:
+            self._failed()
+            t._api_error(f"paper order book for exchange {eid}", exc, "paper")
+            return None
+        if not isinstance(payload, Mapping):
+            self._failed()
+            return None
+        try:
+            parsed = Book.from_payload(payload)
+        except Exception as exc:
+            self._failed()
+            t._record_error(f"paper order book for exchange {eid}", repr(exc), "paper")
+            return None
+        observed = t._clock()
+        bids = [(float(lv.price), float(lv.quantity)) for lv in parsed.bids]
+        asks = [(float(lv.price), float(lv.quantity)) for lv in parsed.asks]
+        sequence = parsed.as_of.sequence if parsed.as_of is not None else None
+        obs = BookObservation(exchange_id=eid, observed_at=observed, bids=bids, asks=asks, source="paper",
+                              sequence=sequence if isinstance(sequence, int) else None)
+        try:
+            t.store.put_book(eid, observed, bids, asks)  # the strategy sizes ideas by it
+            t.store.add_book_snapshots([obs])  # replays and audits
+        except Exception as exc:
+            if not _storage_error(exc):
+                raise
+            t._storage_failed("saving a paper order book", exc)
+        return obs
+
+    def trades(self, exchange_id: str, since: float, max_pages: int = 3) -> Any:
+        """Prints after ``since`` (oldest first), following the cursor while a page is full (200) and pages
+        remain in the budget; ``truncated`` when the last page read was still full."""
+        from .paper import TapeRead
+
+        t = self.tracker
+        eid = str(exchange_id)
+        start = iso_ts(float(since))
+        cursor: Optional[str] = None
+        pages = 0
+        truncated = False
+        seen: Set[str] = set()
+        records: List[TradeRecord] = []
+        while pages < max(1, int(max_pages)):
+            if pages and t.paper_limiter.room() <= 0:
+                truncated = True  # more prints exist but the budget is spent: say so (D40)
+                break
+            try:
+                t.paper_limiter.acquire()
+                resp = t._quick.get_trades(eid, tournament_id=t.context.tournament_id, start=start, limit=TAPE_PAGE_LIMIT,
+                                           cursor=cursor)
+            except SuperMarketError as exc:
+                self._failed()
+                t._api_error(f"paper trade tape for exchange {eid}", exc, "paper")
+                return None
+            pages += 1
+            data = [d for d in (resp.get("data") if isinstance(resp, Mapping) else None) or [] if isinstance(d, Mapping)]
+            fetched = t._clock()
+            try:
+                t.store.add_trades(eid, data, fetched_at=fetched)
+            except Exception as exc:
+                if not _storage_error(exc):
+                    raise
+                t._storage_failed("saving paper trades", exc)
+            for raw in data:
+                tid = raw.get("id")
+                when = parse_time(raw.get("createdAt"))
+                if tid is None or when is None or str(tid) in seen:
+                    continue
+                seen.add(str(tid))
+                side = raw.get("side")
+                records.append(TradeRecord(trade_id=str(tid), exchange_id=eid, ts=when.timestamp(), price=_num(raw.get("price")),
+                                           size=_num(raw.get("size")) or 0.0, side=side.upper() if isinstance(side, str) else None,
+                                           fetched_at=fetched))
+            pagination = resp.get("pagination") if isinstance(resp, Mapping) else None
+            nxt = pagination.get("nextCursor") if isinstance(pagination, Mapping) else None
+            full = len(data) >= TAPE_PAGE_LIMIT
+            truncated = bool(full and nxt)
+            if not truncated:
+                break
+            cursor = str(nxt)
+        records.sort(key=lambda r: (r.ts, len(r.trade_id), r.trade_id))
+        return TapeRead(trades=records, truncated=truncated, pages=pages)

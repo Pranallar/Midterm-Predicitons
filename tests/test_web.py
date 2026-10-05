@@ -84,6 +84,7 @@ STRATEGY_KEYS = {f.name for f in fields(StrategyReport)} | {"now", "backtest_sta
 GET_ENDPOINTS = (
     "/api/health", "/api/status", "/api/markets", "/api/markets?q=arizona", "/api/surges", "/api/highband",
     "/api/exchange/9001", "/api/exchange/9002", "/api/strategy",
+    "/api/paper", "/api/backtest", "/api/fairvalue",  # docs/PAPER_TRADING.md §7.4
 )
 
 # Demo scenario ids (docs/DESIGN.md, Demo section; seed 7).
@@ -360,6 +361,7 @@ def pipe(tmp_path_factory: Any) -> Iterator[SimpleNamespace]:
         )
     finally:
         runtime.app.wait_backtest(10)
+        runtime.app.wait_paper_backtest(60)
         runtime.close()
 
 
@@ -434,12 +436,16 @@ def test_status_shape_and_counts(pipe: SimpleNamespace) -> None:
         "status": "active",
         "label": demo_mod.DEMO_SLUG,
     }
-    assert status["features"] == {"analysis": True, "news": True, "llm": False}
+    # docs/PAPER_TRADING.md §10.5: the paper trader, fair-value mode, sizing and regime were added.
+    assert status["features"] == {
+        "analysis": True, "news": True, "llm": False, "paper": True, "fair_value": "auto", "sizing": "conservative",
+        "regime": "unknown",
+    }
 
     counts = status["counts"]
     assert COUNT_KEYS <= set(counts)
-    assert counts["outcomes"] == 22  # 23 demo outcomes, one market already settled
-    assert counts["markets"] == 14
+    assert counts["outcomes"] == 33  # 34 demo outcomes (11 added for the paper trader), one market already settled
+    assert counts["markets"] == 25
     assert counts["surges"] == 2 and counts["surges_last_hour"] == 2
     assert counts["open_participant_surges"] == 1
     assert counts["high_band"] == len(pipe.app.highband()["bands"])
@@ -451,7 +457,7 @@ def test_status_shape_and_counts(pipe: SimpleNamespace) -> None:
     assert tracker["fatal_error"] is None and tracker["errors"] == 0 and tracker["last_error"] is None
     assert tracker["last_snapshot_at"] == T0 + 30  # the fixture's last cycle
     backfill = tracker["backfill"]
-    assert (backfill["done"], backfill["total"], backfill["complete"]) == (44.0, 44.0, True)  # 22 outcomes x (1h, 5m)
+    assert (backfill["done"], backfill["total"], backfill["complete"]) == (66.0, 66.0, True)  # 33 outcomes x (1h, 5m)
     assert isinstance(tracker["queues"], dict)
     budget = tracker["read_budget"]
     assert isinstance(budget, dict) and budget
@@ -480,7 +486,7 @@ def test_status_account_and_leaders(pipe: SimpleNamespace) -> None:
 
 def test_markets_rows(pipe: SimpleNamespace) -> None:
     data = pipe.app.markets()
-    assert data["total"] == data["count"] == 22 and data["q"] == "" and data["now"] == pipe.clock.now
+    assert data["total"] == data["count"] == 33 and data["q"] == "" and data["now"] == pipe.clock.now
     rows = data["rows"]
     assert [r["exchange_id"] for r in rows][:3] == ["9001", "9002", "9003"]
     titles = {ex.id: ex.market.title for ex in pipe.market.exchanges}
@@ -530,7 +536,7 @@ def _search_text(row: Mapping[str, Any]) -> str:
 )
 def test_markets_filter(pipe: SimpleNamespace, q: str, expected: set) -> None:
     data = pipe.app.markets(q)
-    assert data["q"] == q and data["total"] == 22
+    assert data["q"] == q and data["total"] == 33
     assert {r["exchange_id"] for r in data["rows"]} == expected
     assert data["count"] == len(data["rows"])
 
@@ -538,7 +544,7 @@ def test_markets_filter(pipe: SimpleNamespace, q: str, expected: set) -> None:
 @pytest.mark.parametrize("q", [None, "", "   "])
 def test_markets_blank_query_returns_everything(pipe: SimpleNamespace, q: Optional[str]) -> None:
     data = pipe.app.markets(q)
-    assert data["count"] == data["total"] == 22
+    assert data["count"] == data["total"] == 33
 
 
 def test_markets_filter_matches_title_option_and_ids(pipe: SimpleNamespace) -> None:
@@ -601,7 +607,7 @@ def test_highband(pipe: SimpleNamespace) -> None:
     assert data["count"] == len(bands) and data["cup_end"] == CUP_END_TS
     ids = {b["exchange_id"] for b in bands}
     assert BAND_BEFORE_CUP_END | BAND_AFTER_CUP_END <= ids
-    assert 4 <= len(bands) <= 5
+    assert 4 <= len(bands) <= 6  # + the Nebraska Democratic long shot (NO near 0.97) added for the paper trader
     favs = [b["favorite_price"] for b in bands]
     assert favs == sorted(favs, reverse=True)
     rows = {r["exchange_id"]: r for r in pipe.app.markets()["rows"]}
@@ -698,7 +704,8 @@ def test_strategy_report(pipe: SimpleNamespace, surges_by_eid: Dict[str, Dict[st
     scores = [o["score"] for o in opps]
     assert scores == sorted(scores, reverse=True)
     for opp in opps:
-        assert opp["kind"] in ("fade", "carry", "arbitrage", "watch")
+        # docs/PAPER_TRADING.md §5: value, basket and hole ideas were added
+        assert opp["kind"] in ("fade", "carry", "arbitrage", "watch", "value", "basket", "hole")
         assert opp["side"] in ("yes", "no")
         assert opp["exchange_id"] is None or isinstance(opp["exchange_id"], str)
         assert isinstance(opp["suggested_shares"], int) and opp["suggested_shares"] >= 0
@@ -708,7 +715,12 @@ def test_strategy_report(pipe: SimpleNamespace, surges_by_eid: Dict[str, Dict[st
         (PARTICIPANT_EID, "no", surges_by_eid[PARTICIPANT_EID]["id"])  # fade the up-spike: buy NO
     ]
     arbitrage = {o["market_id"] for o in opps if o["kind"] == "arbitrage"}
-    assert {"311", "313"} <= arbitrage  # Arizona asks sum below 1; the Senate-control violation
+    sets = arbitrage | {o["market_id"] for o in opps if o["kind"] == "basket"}
+    # Arizona asks sum below 1; the Senate-control violation (YES bids above 1) is now its NO basket (§5.3)
+    assert "311" in arbitrage and "313" in sets
+    assert report["sizing_policy"] == "conservative" and isinstance(report["sizing"], dict)
+    assert report["settlement_regime"] == "unknown"
+    assert report["fair_value"] is None or report["fair_value"]["mode"] == "auto"
     bands = {b["exchange_id"]: b for b in pipe.app.highband()["bands"]}
     carries = [o for o in opps if o["kind"] == "carry"]
     assert carries and all(o["exchange_id"] in bands for o in carries)
@@ -730,11 +742,29 @@ def test_strategy_uses_the_trackers_leader_for_the_risk_mode(pipe: SimpleNamespa
 
 
 def test_strategy_is_cached_and_picks_up_the_backtest(pipe: SimpleNamespace) -> None:
+    pipe.app.ensure_backtest()  # [integration] also when this test runs on its own (-k): start it if no earlier test did
     pipe.app.wait_backtest(10)
     first = pipe.app.strategy()
     assert pipe.app.strategy() is first  # cached for 30 s of (frozen) time
     assert first["backtest_status"] == "ready" and first["backtest_error"] is None
     assert isinstance(first["backtest"], dict) and isinstance(first["backtest"]["n_surges"], int)
+
+
+def test_fade_backtest_gets_the_stored_surges(pipe: SimpleNamespace, monkeypatch: pytest.MonkeyPatch) -> None:
+    """[integration, B -> E] the dashboard's fade backtest passes the stored, attributed surges, so the
+    participant-only reversion rate that caps a fade's win chance is measured (§5.5)."""
+    seen: Dict[str, Any] = {}
+    real = strategy_mod.backtest_fade
+
+    def spy(series: Any, *args: Any, **kwargs: Any) -> Any:
+        seen.update(kwargs)
+        return real(series, *args, **kwargs)
+
+    monkeypatch.setattr(strategy_mod, "backtest_fade", spy)
+    pipe.app._run_backtest()
+    surges = seen.get("surges")
+    assert surges is not None and len(surges) >= 1
+    assert {s.exchange_id for s in surges} <= {e.exchange_id for e in pipe.store.exchanges()}
 
 
 def test_analyze_queues_and_reanalyzes(pipe: SimpleNamespace, surges_by_eid: Dict[str, Dict[str, Any]]) -> None:
@@ -1151,9 +1181,9 @@ def test_http_payloads_match_the_app(client: HTTP, pipe: SimpleNamespace) -> Non
 def test_http_markets_query(client: HTTP, query: str, expected: Optional[set]) -> None:
     data = client.get("/api/markets?" + query).json()
     ids = {r["exchange_id"] for r in data["rows"]}
-    assert data["total"] == 22
+    assert data["total"] == 33
     if expected is None:
-        assert len(ids) == 22
+        assert len(ids) == 33
     else:
         assert ids == expected
 
@@ -1223,7 +1253,7 @@ def test_http_concurrent_gets(server: web.DashboardServer) -> None:
     assert [status for _, status, _ in results] == [200] * len(paths)
     for path, _, data in results:
         if path == "/api/markets":
-            assert data["count"] == 22
+            assert data["count"] == 33
         if path.startswith("/api/exchange/"):
             assert data["exchange"]["exchange_id"] == path.rsplit("/", 1)[1]
 
@@ -1567,15 +1597,17 @@ def test_build_live_masks_the_settings_key(tmp_path: Path, monkeypatch: pytest.M
             http_client = HTTP(srv.port)
             bodies = [http_client.get(p).body for p in GET_ENDPOINTS]
             runtime.app.wait_backtest(10)
+            runtime.app.wait_paper_backtest(60)
         for body in bodies:
             assert FAKE_KEY.encode() not in body
             assert b"Bearer" not in body
         status = json.loads(bodies[1])
-        assert status["demo"] is False and status["counts"]["outcomes"] == 22
+        assert status["demo"] is False and status["counts"]["outcomes"] == 33
         assert "***" in status["tracker"]["last_error"]
         assert (tmp_path / demo_mod.DEMO_SLUG / "tracker.sqlite3").exists()
     finally:
         runtime.app.wait_backtest(10)
+        runtime.app.wait_paper_backtest(60)
         runtime.close()
 
 
@@ -1642,7 +1674,7 @@ def test_build_demo_runtime_start_and_stop(tmp_path: Path) -> None:
         assert _wait_for(caught_up, timeout=10.0), runtime.app.status()["tracker"]
         status = runtime.app.status()
         assert status["tracker"]["running"] is True and status["tracker"]["fatal_error"] is None
-        assert status["counts"]["outcomes"] == 22
+        assert status["counts"]["outcomes"] == 33
     finally:
         runtime.app.wait_backtest(10)
         runtime.close()
@@ -1658,7 +1690,7 @@ def test_surges_seen_before_the_backfill_finishes_are_not_misattributed(tmp_path
     try:
         tracker = runtime.tracker
         tracker.run_once()
-        assert tracker.backfill_step(22) == 22  # the hourly pass for every outcome; the 5-minute pass is still pending
+        assert tracker.backfill_step(33) == 33  # the hourly pass for every outcome; the 5-minute pass is still pending
         clock.advance(1)
         tracker.run_once()  # what the loop thread does while the backfill worker keeps going
         tracker.analyze_pending(20)
@@ -2116,7 +2148,8 @@ def test_functional_4_multi_leg_arbitrage_keeps_its_legs(
                  entry_price=0.97, legs=None),
         ],
     }
-    monkeypatch.setattr(strategy_mod, "build_report", lambda **kwargs: copy.deepcopy(report))
+    # web builds the report with strategy.report_from_inputs since docs/PAPER_TRADING.md §7.4.
+    monkeypatch.setattr(strategy_mod, "report_from_inputs", lambda inputs, **kwargs: copy.deepcopy(report))
     data = assert_json_safe(make_app(FakeTracker({})).strategy())
     arb, carry = data["opportunities"]
     assert arb["exchange_id"] is None and arb["market_id"] == "313"
@@ -2131,7 +2164,8 @@ def test_functional_4_multi_leg_arbitrage_keeps_its_legs(
 def test_functional_4_demo_constraint_arbitrage_is_served_as_legs(client: HTTP, pipe: SimpleNamespace) -> None:
     pipe.app.wait_backtest(10)
     report = client.get("/api/strategy").json()
-    senate = [o for o in report["opportunities"] if o["kind"] == "arbitrage" and o["market_id"] == "313"]
+    # The Senate-control violation is served as a set idea: engine arbitrage, or its NO basket (§5.3).
+    senate = [o for o in report["opportunities"] if o["kind"] in ("arbitrage", "basket") and o["market_id"] == "313"]
     assert senate, [o["market_id"] for o in report["opportunities"]]
     legs = senate[0]["legs"]
     assert len(legs) >= 2  # buy NO on Republicans AND on Democrats, each at its own price
@@ -2468,7 +2502,7 @@ def test_r2_live_api_14_a_later_start_uses_the_saved_tournament_while_the_lookup
         assert "using the details saved for" in out.getvalue() and "balance will show once the API answers" in out.getvalue()
         runtime.tracker.run_once()  # market data works; only the balance is missing
         status = runtime.app.status()
-        assert status["counts"]["outcomes"] == 22 and status["account"]["balance"] is None
+        assert status["counts"]["outcomes"] == 33 and status["account"]["balance"] is None
         assert status["tracker"]["fatal_error"] is None
     finally:
         runtime.app.wait_backtest(10)
@@ -2503,3 +2537,337 @@ def test_r2_live_api_14_gives_up_after_the_retries_and_never_retries_a_rejected_
     assert web.is_transient_error(ApiError(502, "BAD_GATEWAY", "x"))
     assert not web.is_transient_error(ApiError(404, "NOT_FOUND", "no such tournament"))
     assert not web.is_transient_error(ApiError(403, "FORBIDDEN", "not visible"))
+
+
+# --------------------------------------------------------------------------- simulation endpoints (docs/PAPER_TRADING.md §7.4, §10)
+
+PAPER_KEYS = {
+    "now", "enabled", "available", "error", "demo", "run", "has_previous", "headline", "table_warning", "model_label",
+    "portfolios", "equity", "positions", "baskets", "orders", "fills", "trades", "signals", "study", "budget",
+    "fair_value", "caveats", "last_step",
+}
+RUN_KEYS = {
+    "run_id", "started_at", "hours_run", "wall_hours", "gaps", "target_hours", "progress", "complete", "steps",
+    "last_step_at", "last_step_seconds", "interval", "regime", "all_collateral", "sizing", "start_capital",
+    "capital_source", "fingerprint", "code_version", "settings", "ended_at", "end_reason", "final",
+}
+HEADLINE_KEYS = {
+    "portfolio_id", "label", "latency_s", "pnl_liq", "pnl_liq_pct", "pnl_mark", "equity_liq", "unvalued",
+    "depth_unknown_share", "verdict", "verdict_caveats",
+}
+BUDGET_KEYS = {
+    "reads_used", "reads_limit", "reads_room", "book_reads_last_step", "trade_reads_last_step", "reads_skipped_last_step",
+    "max_book_reads_per_step", "max_trade_reads_per_step", "sets_deferred_last_step", "tape_gaps_last_step",
+}
+FAIRVALUE_KEYS = {"now", "enabled", "mode", "last_refresh_at", "providers", "manual", "map", "history", "counts", "rows", "caveats"}
+FV_ROW_KEYS = {
+    "exchange_id", "market_id", "title", "option", "race_key", "party", "sm_bid", "sm_ask", "sm_mid", "fair", "matches",
+    "gap", "edge_yes", "edge_no", "near", "suspect", "snippets", "unmatched_reason",
+}
+SIM_HOURS = 1.05  # past the scripted NV basket (T0+4..30 min), WY hole (20 min), ME settlement (40 min) and NE triple (60 min)
+
+
+def fast_demo(data_dir: Path, **kwargs: Any) -> Tuple[web.Runtime, Any]:
+    clock = demo_mod.SimClock(demo_mod.SIM_T0)
+    kwargs.setdefault("news", False)
+    return web.build_demo(data_dir, 30.0, out=io.StringIO(), clock=clock, **kwargs), clock
+
+
+@pytest.fixture(scope="module")
+def sim(tmp_path_factory: Any) -> Iterator[SimpleNamespace]:
+    """A fast demo (SimClock) simulated for SIM_HOURS with the paper trader and the demo's outside prices."""
+    from supermarket_bot import pipeline
+
+    runtime, clock = fast_demo(tmp_path_factory.mktemp("sim-dashboard"))
+    try:
+        pipeline.run_simulation(runtime, clock, hours=SIM_HOURS, step_s=30.0, end_run=False)
+        yield SimpleNamespace(runtime=runtime, app=runtime.app, tracker=runtime.tracker, store=runtime.store, clock=clock)
+    finally:
+        runtime.app.wait_backtest(10)
+        runtime.app.wait_paper_backtest(120)
+        runtime.close()
+
+
+@pytest.fixture
+def small(tmp_path: Path) -> Iterator[SimpleNamespace]:
+    """A fast demo run for 10 steps, served over HTTP (for the reset flow, which changes the run)."""
+    from supermarket_bot import pipeline
+
+    runtime, clock = fast_demo(tmp_path)
+    try:
+        pipeline.run_simulation(runtime, clock, hours=9 * 30 / 3600, step_s=30.0, end_run=False)
+        with serve(runtime.app) as srv:
+            yield SimpleNamespace(runtime=runtime, app=runtime.app, tracker=runtime.tracker, http=HTTP(srv.port), clock=clock)
+    finally:
+        runtime.app.wait_backtest(10)
+        runtime.app.wait_paper_backtest(120)
+        runtime.close()
+
+
+def test_paper_endpoint_shape(sim: SimpleNamespace) -> None:
+    from supermarket_bot.paper import CAVEATS, DEMO_CAVEAT, FV_MODEL_LABEL, TABLE_WARNING, VERDICT_CAVEATS
+
+    body = assert_json_safe(sim.app.paper())
+    assert PAPER_KEYS <= set(body)
+    assert body["now"] == sim.clock() and body["enabled"] is True and body["available"] is True and body["error"] is None
+    assert body["demo"] is True and body["has_previous"] is False
+    run = body["run"]
+    assert RUN_KEYS <= set(run)
+    assert run["interval"] == 30.0 and run["steps"] == int(round(SIM_HOURS * 120)) + 1
+    assert run["hours_run"] == pytest.approx(SIM_HOURS, abs=0.01) and run["progress"] == pytest.approx(SIM_HOURS / 24, abs=0.001)
+    assert run["complete"] is False and run["final"] is None and run["ended_at"] is None and run["gaps"] == []
+    assert (run["regime"], run["sizing"], run["all_collateral"]) == ("unknown", "conservative", False)
+    assert set(run["settings"]) >= {"sizing", "regime", "all_collateral", "start_capital", "params_changed"}
+    assert run["capital_source"] in ("account value", "cash", "initial balance", "default 100,000", "set by you")
+    headline = body["headline"]
+    assert HEADLINE_KEYS <= set(headline)
+    assert headline["portfolio_id"] == demo_mod.DEMO_HEADLINE and headline["latency_s"] == 240.0
+    assert headline["verdict"]["level"] == "insufficient"  # one simulated hour can never be evidence
+    assert headline["verdict_caveats"] == [CAVEATS[i] for i in VERDICT_CAVEATS]
+    assert body["table_warning"] == TABLE_WARNING.format(n=9) and body["model_label"] == FV_MODEL_LABEL
+    assert [p["portfolio_id"] for p in body["portfolios"]] == list(demo_mod.DEMO_PORTFOLIO_IDS)  # headline first
+    for p in body["portfolios"]:
+        assert {"sizing", "verdict", "execution", "no_trade_reason", "pnl_liq", "equity_liq"} <= set(p)
+    assert set(body["equity"]) == set(demo_mod.DEMO_PORTFOLIO_IDS)
+    for points in body["equity"].values():
+        assert 0 < len(points) <= 300 and [pt[0] for pt in points] == sorted(pt[0] for pt in points)
+    assert len(body["positions"]) <= 200 and all({"unrealized_liq", "exit_note", "age_hours"} <= set(x) for x in body["positions"])
+    for key in ("orders", "fills", "trades"):
+        assert len(body[key]) <= 100
+    fill_ts = [f["ts"] for f in body["fills"]]
+    assert fill_ts and fill_ts == sorted(fill_ts, reverse=True)  # newest first
+    assert set(body["signals"]) == {"count", "by_kind", "at"} and body["signals"]["count"] > 0
+    assert BUDGET_KEYS <= set(body["budget"])
+    assert body["fair_value"] == {"mode": "auto", "enabled": True, "usable": body["fair_value"]["usable"],
+                                  "total": body["fair_value"]["total"]}
+    assert body["fair_value"]["usable"] > 0
+    assert body["caveats"] == list(CAVEATS) + [DEMO_CAVEAT]
+    assert isinstance(body["last_step"], dict) and isinstance(body["study"], dict)
+    for b in body["baskets"]:
+        assert {"portfolio_id", "basket_id", "idea_id", "sets", "cost", "floor_value", "liq_value", "legs"} <= set(b)
+
+
+def test_paper_endpoint_has_fills_where_the_scripts_put_them(sim: SimpleNamespace) -> None:
+    body = sim.app.paper()
+    fills = {p["portfolio_id"]: p["fills"] for p in body["portfolios"]}
+    for pid in (demo_mod.DEMO_HEADLINE, "kind:basket", "kind:value", "kind:hole"):
+        assert fills[pid] > 0, (pid, fills)
+    settled = [f for f in sim.store.paper_fills(body["run"]["run_id"], limit=None) if f["purpose"] == "settlement"]
+    assert settled and {f["exchange_id"] for f in settled} == {"9034"}  # the Maine debate settled at T0 + 40 min
+
+
+def test_paper_endpoint_over_http_and_the_previous_run(small: SimpleNamespace) -> None:
+    http = small.http
+    resp = http.get("/api/paper")
+    assert resp.status == 200 and resp.headers["cache-control"] == "no-store"
+    assert_security_headers(resp)
+    before = resp.json()
+    assert before["run"]["steps"] == 10 and before["has_previous"] is False
+    missing = assert_json_error(http.get("/api/paper?run=previous"), 404)
+    assert missing == {"error": "No earlier simulation run has ended yet."}
+    resp = http.post("/api/paper/reset", json.dumps({"confirm": True, "start_capital": 100_000, "target_hours": 24}).encode())
+    assert resp.status == 200, resp.body
+    data = resp.json()
+    assert data["reset"] is True and data["previous_run_id"] == before["run"]["run_id"] and data["run_id"] != data["previous_run_id"]
+    assert data["message"] == ("Started a new 24-hour simulation with 100,000 SUSQies per portfolio. "
+                               "The previous run's result is kept under Previous run.")
+    after = http.get("/api/paper").json()
+    assert after["run"]["run_id"] == data["run_id"] and after["run"]["steps"] == 0 and after["has_previous"] is True
+    assert after["run"]["start_capital"] == 100_000 and after["run"]["capital_source"] == "set by you"
+    previous = http.get("/api/paper?run=previous").json()
+    assert PAPER_KEYS <= set(previous)
+    run = previous["run"]
+    assert run["run_id"] == before["run"]["run_id"] and run["end_reason"] == "reset" and run["ended_at"] is not None
+    assert run["final"]["reason"] == "reset" and set(run["final"]["verdicts"]) == set(demo_mod.DEMO_PORTFOLIO_IDS)
+    assert [p["portfolio_id"] for p in previous["portfolios"]] == list(demo_mod.DEMO_PORTFOLIO_IDS)
+    assert previous == small.app.paper(run="previous") | {"now": previous["now"]}
+
+
+def test_paper_reset_security_and_validation(small: SimpleNamespace) -> None:
+    http = small.http
+    run_id = http.get("/api/paper").json()["run"]["run_id"]
+    ok = json.dumps({"confirm": True}).encode()
+    assert_json_error(http.post("/api/paper/reset", ok, Origin="http://evil.example"), 403)
+    assert_json_error(http.post("/api/paper/reset", ok, Content_Type="text/plain"), 403)
+    assert_json_error(http.post("/api/paper/reset", b"[1, 2]"), 400)
+    assert_json_error(http.post("/api/paper/reset", b"{not json"), 400)
+    cases = [
+        ({}, 'Send {"confirm": true} to reset the simulation.'),
+        ({"confirm": "yes"}, 'Send {"confirm": true} to reset the simulation.'),
+        ({"confirm": True, "start_capital": 0}, "start_capital must be a number between 1 and 10,000,000."),
+        ({"confirm": True, "start_capital": "lots"}, "start_capital must be a number between 1 and 10,000,000."),
+        ({"confirm": True, "start_capital": 20_000_000}, "start_capital must be a number between 1 and 10,000,000."),
+        ({"confirm": True, "target_hours": 0.5}, "target_hours must be a number between 1 and 720."),
+        ({"confirm": True, "target_hours": 1000}, "target_hours must be a number between 1 and 720."),
+    ]
+    for body, error in cases:
+        resp = http.post("/api/paper/reset", json.dumps(body).encode())
+        assert resp.status == 400 and resp.json() == {"reset": False, "error": error}, body
+    assert http.post("/api/paper/reset", b"").status == 400  # an empty body is {}: no confirmation
+    for method in ("GET", "HEAD"):
+        resp = http.request(method, "/api/paper/reset")
+        assert resp.status == 405 and resp.headers["allow"] == "POST", method
+    resp = http.post("/api/paper", ok)
+    assert resp.status == 405 and resp.headers["allow"] == "GET, HEAD"
+    assert http.get("/api/paper").json()["run"]["run_id"] == run_id  # nothing above reset anything
+    resp = http.post("/api/paper/reset", ok)
+    assert resp.status == 200 and resp.json()["previous_run_id"] == run_id
+
+
+def test_paper_off(tmp_path: Path) -> None:
+    runtime, clock = fast_demo(tmp_path, paper=False)
+    try:
+        runtime.tracker.run_once()
+        app = runtime.app
+        body = assert_json_safe(app.paper())
+        assert body == {
+            "now": clock(), "enabled": False, "available": False, "error": "The paper trader is off (started with --no-paper).",
+            "demo": True, "run": None, "has_previous": False, "headline": None, "table_warning": "", "model_label": "",
+            "portfolios": [], "equity": {}, "positions": [], "baskets": [], "orders": [], "fills": [], "trades": [],
+            "signals": None, "study": None, "budget": None, "fair_value": None, "caveats": [], "last_step": None,
+        }
+        assert app.paper(run="previous") is None
+        assert app.paper_reset({"confirm": True}) == (409, {"reset": False, "error": "The paper trader is off (started with --no-paper)."})
+        status = app.status()
+        assert status["features"]["paper"] is False and status["tracker"]["read_budget"]["paper"] is None
+        with serve(app) as srv:
+            http = HTTP(srv.port)
+            assert http.get("/api/paper").json()["enabled"] is False
+            assert_json_error(http.get("/api/paper?run=previous"), 404)
+            assert http.post("/api/paper/reset", b'{"confirm": true}').status == 409
+    finally:
+        runtime.app.wait_paper_backtest(60)
+        runtime.close()
+
+
+def test_status_features_and_read_budget_keys(sim: SimpleNamespace) -> None:
+    status = assert_json_safe(sim.app.status())
+    assert status["features"]["paper"] is True and status["features"]["fair_value"] == "auto"
+    assert status["features"]["sizing"] == "conservative" and status["features"]["regime"] == "unknown"
+    budget = status["tracker"]["read_budget"]
+    assert set(budget["paper"]) == {"used", "limit", "room"} and budget["paper"]["limit"] == 600  # fast demo: 600/min
+    assert budget["reserve"] == 12 and isinstance(budget["projected_per_min"], float)
+    assert budget["warning"] is None  # the demo's simulated API is not an account with a 100/min limit
+    assert status["tracker"]["paper"]["enabled"] is True and status["tracker"]["paper"]["steps"] == int(round(SIM_HOURS * 120)) + 1
+    assert status["tracker"]["fair_value"]["mode"] == "auto"
+
+
+def test_strategy_report_has_the_new_kinds_and_sizing(sim: SimpleNamespace) -> None:
+    report = assert_json_safe(sim.app.strategy())
+    kinds = {o["kind"] for o in report["opportunities"]}
+    assert {"value", "basket"} <= kinds, kinds  # the TX/IA gaps to the outside price; the Nebraska NO basket
+    assert report["sizing_policy"] == "conservative" and "alternative" in report["sizing"]
+    assert report["settlement_regime"] == "unknown"
+    assert report["fair_value"]["mode"] == "auto" and report["fair_value"]["usable"] > 0
+    assert set(report["fair_value"]) >= {"mode", "usable", "total", "providers"}
+    value = next(o for o in report["opportunities"] if o["kind"] == "value")
+    assert value["fair_value"] is not None and value["fair_source"] == "demo"
+
+
+def test_fairvalue_endpoint_shape(sim: SimpleNamespace) -> None:
+    from supermarket_bot.fairvalue import FV_CAVEATS
+
+    data = assert_json_safe(sim.app.fairvalue())
+    assert set(data) == FAIRVALUE_KEYS
+    assert data["enabled"] is True and data["mode"] == "auto" and data["caveats"] == list(FV_CAVEATS)
+    assert [p["name"] for p in data["providers"]] == ["demo"] and data["providers"][0]["status"] == "ok"
+    assert set(data["providers"][0]) == {"name", "status", "last_ok_at", "last_error", "requests", "matched", "quoted", "next_try_at"}
+    assert set(data["counts"]) == {"outcomes", "matched", "usable", "manual", "no_external", "suspect", "near"}
+    rows = data["rows"]
+    assert len(rows) == data["counts"]["outcomes"] and data["counts"]["usable"] > 0
+    for r in rows:
+        assert set(r) == FV_ROW_KEYS
+        assert set(r["snippets"]) == {"disable", "pin", "confirm", "trade_near"}
+    gaps = [abs(r["gap"]) for r in rows if r["gap"] is not None]
+    assert gaps == sorted(gaps, reverse=True)
+    seen_null = False
+    for r in rows:  # nulls last
+        seen_null = seen_null or r["gap"] is None
+        assert not (seen_null and r["gap"] is not None)
+    tx = next(r for r in rows if r["exchange_id"] == "9026")
+    assert tx["race_key"] == "2026:SENATE:TX" and tx["party"] == "D" and tx["fair"]["value"] == pytest.approx(0.58)
+    assert tx["gap"] == pytest.approx(tx["fair"]["value"] - tx["sm_mid"]) and "age_s" in tx["fair"]
+    assert tx["edge_yes"] == pytest.approx(tx["fair"]["value"] - tx["sm_ask"])
+    assert {m["venue"] for m in tx["matches"]} == {"demo"}
+    with serve(sim.app) as srv:
+        assert HTTP(srv.port).get("/api/fairvalue").json()["rows"] == json.loads(web.encode_json(sim.app.fairvalue()))["rows"]
+
+
+def test_fairvalue_off(tmp_path: Path) -> None:
+    from supermarket_bot.fairvalue import FV_CAVEATS
+
+    runtime, _ = fast_demo(tmp_path, fair_value="off", paper=False)
+    try:
+        data = runtime.app.fairvalue()
+        assert data["enabled"] is False and data["mode"] == "off" and data["rows"] == [] and data["providers"] == []
+        assert data["caveats"] == list(FV_CAVEATS)
+        assert runtime.app.status()["features"]["fair_value"] == "off"
+    finally:
+        runtime.close()
+
+
+def test_backtest_endpoint_runs_on_a_read_only_connection(sim: SimpleNamespace, monkeypatch: pytest.MonkeyPatch) -> None:
+    import statistics
+
+    import supermarket_bot.backtest as backtest_mod
+
+    sources: List[Any] = []
+    real = backtest_mod.run_backtest
+
+    def spy(source: Any, config: Any, *args: Any, **kwargs: Any) -> Any:
+        sources.append((source, config))
+        return real(source, config, *args, **kwargs)
+
+    monkeypatch.setattr(backtest_mod, "run_backtest", spy)
+    app, tracker, clock = sim.app, sim.tracker, sim.clock
+
+    def cycle() -> float:
+        clock.advance(30)
+        started = time.perf_counter()
+        tracker.run_once()
+        return time.perf_counter() - started
+
+    before = [cycle() for _ in range(6)]
+    first = assert_json_safe(app.backtest())
+    assert first["status"] == "pending" and first["report"] is None and first["started_at"] == clock()
+    during: List[float] = []
+    deadline = time.monotonic() + 120
+    while app._pbt_thread is not None and app._pbt_thread.is_alive() and time.monotonic() < deadline:
+        during.append(cycle())
+    app.wait_paper_backtest(120)
+    data = assert_json_safe(app.backtest())
+    assert data["status"] == "ready", data["error"]
+    assert set(data) == {"now", "status", "error", "started_at", "generated_at", "report"}
+    report = data["report"]
+    assert {"testability", "study", "overlap_hours", "stopped_early", "portfolios", "verdicts", "assumptions"} <= set(report)
+    assert report["overlap_hours"] > 0  # the window overlaps the live run: not an independent check
+    [(source, config)] = sources
+    assert isinstance(source, TrackerStore) and source is not sim.store and str(source.path) == str(sim.store.path)
+    assert config.hours == 24 and config.paper.sizing == "conservative" and config.live_run_started_at is not None
+    with pytest.raises(Exception):
+        TrackerStore.open_read_only(sim.store.path).set_state("x", 1)  # that connection refuses writes
+    if during:  # the replay never holds the live store: snapshot cycles keep their pace (median within 2x)
+        assert statistics.median(during) <= 2 * statistics.median(before) + 0.05, (before, during)
+    assert app.backtest()["generated_at"] == data["generated_at"]  # cached: not re-run within 30 minutes
+
+
+def test_backtest_endpoint_without_enough_data_or_a_backtest(small: SimpleNamespace, monkeypatch: pytest.MonkeyPatch) -> None:
+    import supermarket_bot.backtest as backtest_mod
+
+    app = small.app
+    app.backtest()
+    app.wait_paper_backtest(60)
+    data = app.backtest()
+    assert data["status"] == "no_data" and data["report"] is None and isinstance(data["error"], str)
+
+    def missing(*args: Any, **kwargs: Any) -> Any:
+        raise NotImplementedError
+
+    monkeypatch.setattr(backtest_mod, "run_backtest", missing)
+    small.clock.advance(3 * 3600)  # a later retry, with enough ticks stored meanwhile
+    tick = {"exchange_id": "9001", "latest_price": 0.5, "best_bid": 0.49, "best_ask": 0.51}
+    small.runtime.store.add_ticks(small.clock() - 2 * 3600, [tick])
+    small.runtime.store.add_ticks(small.clock(), [tick])
+    app.backtest()
+    app.wait_paper_backtest(60)
+    assert app.backtest()["status"] == "unavailable"

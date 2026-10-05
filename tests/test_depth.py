@@ -80,3 +80,35 @@ def test_walk_set_matches_legacy_strategy_walk() -> None:
             legs.append(lv)
         limit = sum(lv[0][0] for lv in legs) + rng.uniform(0.0, 0.08)
         assert D.walk_set(legs, limit) == pytest.approx(S._walk_set(legs, limit))
+
+
+def test_ticks_survive_float_noise() -> None:
+    assert D.floor_tick(0.60 - 0.01 - 0.005) == 0.585  # 0.5849999999999999
+    assert D.ceil_tick(0.1 + 0.2) == 0.3  # 0.30000000000000004
+    assert D.floor_tick(0.995) == 0.995 and D.ceil_tick(0.0050000001) == 0.01
+    assert D.floor_tick(0.5466 - 0.0) == 0.545 and D.ceil_tick(0.5401) == 0.545
+
+
+def test_sell_walk_and_liquidation_with_fractional_levels() -> None:
+    bids = [(0.60, 2.5), (0.59, 2.5), (0.50, 100.0)]
+    r = D.walk(bids, 4.9, 0.59, buy=False)
+    assert r.filled == 4 and r.levels == [(0.60, 2.5), (0.59, 1.5)]
+    assert r.avg_price == pytest.approx((0.60 * 2.5 + 0.59 * 1.5) / 4)
+    assert D.walk(bids, 10, 0.70, buy=False).filled == 0  # nothing at or above the limit
+    cash, sold = D.liquidation_proceeds(bids, 3.0)
+    assert sold == 3.0 and cash == pytest.approx(0.60 * 2.5 + 0.59 * 0.5)
+    assert D.liquidation_proceeds([], 10) == (0.0, 0.0)
+
+
+def test_shift_levels_clips_outside_the_price_range() -> None:
+    assert D.shift_levels([(0.02, 5.0), (0.01, 3.0)], 0.005) == [(0.005, 5.0)]
+    assert D.shift_levels([(0.97, 5.0), (0.96, 3.0)], 0.995) == [(0.995, 5.0), (0.985, 3.0)]
+    assert D.shift_levels([], 0.5) == []
+
+
+def test_book_sides_accepts_size_and_qty_keys_and_merges_no_levels() -> None:
+    book = {"bids": [{"price": 0.4, "size": 3}, {"price": 0.4, "qty": 2}], "asks": [{"price": 0.6, "quantity": 1}]}
+    bids, asks = D.book_sides(book)
+    assert bids == [(0.4, 3.0), (0.4, 2.0)] and asks == [(0.6, 1.0)]
+    assert D.contract_levels(bids, asks, "no", "buy") == [(0.6, 5.0)]
+    assert D.contract_levels(bids, asks, "no", "sell") == [(0.4, 1.0)]

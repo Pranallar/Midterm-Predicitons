@@ -322,6 +322,12 @@ def make_tracker(client: Any, world: World, data_clock: FakeClock) -> Callable[.
         tracker.stop(timeout=2)
 
 
+def list_calls(fake: Any) -> List[Any]:
+    """Market-list reads (status=open). Since schema v2 the context refresh also reads settled markets
+    (status=settled) on the same path (docs/PAPER_TRADING.md §7.2): those are not market-list reads."""
+    return [c for c in fake.calls_to(f"/tournaments/{SLUG}/markets") if c.params.get("status") == "open"]
+
+
 def step(tracker: Tracker, clock: FakeClock, seconds: float = 60.0) -> Dict[str, Any]:
     clock.now += seconds
     return tracker.run_once()
@@ -417,11 +423,11 @@ def test_market_list_refreshes_only_when_due(make_tracker: Any, world: World, fa
     world.markets.append(market("m4", "Will Democrats win the Maine Governor race?", [("e4", None, 0.62)]))
     world.set("e4", 0.62)
     step(tracker, data_clock, 120)
-    assert len(fake.calls_to(f"/tournaments/{SLUG}/markets")) == 1
+    assert len(list_calls(fake)) == 1
     assert "e4" not in [r["exchange_id"] for r in tracker.view()["exchanges"]]
     summary = step(tracker, data_clock, 180)  # 300 s since the first refresh
     assert summary["markets_refreshed"] and summary["exchanges"] == 6
-    assert len(fake.calls_to(f"/tournaments/{SLUG}/markets")) == 2
+    assert len(list_calls(fake)) == 2
     assert row(tracker.view(), "e4")["mark"] == 0.62
     assert len(fake.calls_to("/exchanges/prices")) == 3
 
@@ -725,7 +731,7 @@ def test_context_refresh(make_tracker: Any, fake: Any) -> None:
     assert (ctx["account_value"], ctx["positions_value"]) == (103_750.5, 2_500.0)  # cash 101,250.5 + positions
     assert ctx["updated_at"] == T0
     assert fake.calls_to("/relationships/constraints")[0].params == {"violationsOnly": "true", "tournamentId": TOURNAMENT_ID}
-    assert fake.calls_to(f"/tournaments/{SLUG}/leaderboard")[0].params["limit"] == "3"
+    assert fake.calls_to(f"/tournaments/{SLUG}/leaderboard")[0].params["limit"] == "100"  # §7.2: 100 rows for the bar
     assert fake.calls_to("/markets/m3/orderbook")[0].params == {"tournamentId": TOURNAMENT_ID, "depth": "20"}
     assert len(fake.calls_to("/markets/m1/orderbook")) == 0  # binary markets are not read
 
@@ -1412,7 +1418,7 @@ def test_r2_live_api_1_a_missing_quote_records_no_tick_and_closes_the_surge(make
 
     tracker = make_tracker()
     [sid] = jump_scenario(tracker, world, data_clock)["new_surges"]  # 0.40 -> 0.60; the market list says 0.40
-    lists = len(fake.calls_to(f"/tournaments/{SLUG}/markets"))
+    lists = len(list_calls(fake))
     world.quotes.pop("e1")  # m1 settles: the bulk read lists e1 in missingIds
     summary = step(tracker, data_clock, 5)
     assert summary["ticks"] == 4  # nothing stored for e1 (no stale 0.40 from the market list)
@@ -1425,7 +1431,7 @@ def test_r2_live_api_1_a_missing_quote_records_no_tick_and_closes_the_surge(make
     # the next cycle re-reads the market list early (the outcome may have settled)
     world.markets = [m for m in world.markets if m["id"] != "m1"]
     summary = step(tracker, data_clock, 40)
-    assert summary["markets_refreshed"] and len(fake.calls_to(f"/tournaments/{SLUG}/markets")) == lists + 1
+    assert summary["markets_refreshed"] and len(list_calls(fake)) == lists + 1
     assert all(r["exchange_id"] != "e1" for r in tracker.view()["exchanges"])
     assert tracker.store.get_surge(sid).status == SURGE_CLOSED
     # a persistently missing outcome does not re-read the list every cycle
@@ -1433,7 +1439,7 @@ def test_r2_live_api_1_a_missing_quote_records_no_tick_and_closes_the_surge(make
     step(tracker, data_clock, 40)
     step(tracker, data_clock, 40)
     step(tracker, data_clock, 40)
-    assert len(fake.calls_to(f"/tournaments/{SLUG}/markets")) == lists + 2
+    assert len(list_calls(fake)) == lists + 2
 
 
 def test_r2_live_api_9_news_is_rechecked_until_it_works_again(make_tracker: Any, world: World, data_clock: FakeClock) -> None:
@@ -1619,3 +1625,446 @@ class TestRound2RealAnalytics:
             step(tracker, data_clock, 5)
         view = tracker.view()
         assert view["high_band"] == [] and row(view, "e2")["stale"] is False
+
+
+# --------------------------------------------------------------------------- paper trading and fair values (§7.2)
+
+
+class StubRunner:
+    """Stands in for paper.PaperRunner (package C): records what the tracker hands it and how it is called."""
+
+    def __init__(self, engine: Any, reader: Any, inputs_fn: Callable[[float], Any], *, limiter: Any = None,
+                 clock: Any = None, interval: Any = None, extras_fn: Any = None, **kwargs: Any) -> None:
+        self.engine, self.reader, self.inputs_fn, self.limiter = engine, reader, inputs_fn, limiter
+        self.clock, self.interval, self.extras_fn = clock, interval, extras_fn
+        self.steps: List[Optional[float]] = []
+        self.calls: List[Any] = []
+        self.inputs: List[Any] = []
+        self.errors: List[str] = []
+        self.lock_held: List[bool] = []
+        self.tracker: Any = None
+        self._summary: Dict[str, Any] = {"run": {"run_id": "run-1", "steps": 0, "last_step_at": None,
+                                                 "last_step_seconds": None, "interval": None}, "portfolios": []}
+        self._previous: Optional[Dict[str, Any]] = None
+
+    def _held(self) -> None:
+        if self.tracker is not None:
+            self.lock_held.append(self.tracker._lock._is_owned())
+
+    def step(self, now: Optional[float] = None) -> Any:
+        self._held()
+        when = self.clock() if now is None else now
+        self.steps.append(now)
+        self.inputs.append(self.inputs_fn(when))
+        extras = dict(self.extras_fn() or {}) if self.extras_fn is not None else {}
+        self._summary = {"run": {"run_id": "run-1", "steps": len(self.steps), "last_step_at": when,
+                                 "last_step_seconds": 0.01, "interval": None}, "portfolios": [], **extras}
+        return SimpleNamespace(errors=list(self.errors))
+
+    def summary(self) -> Dict[str, Any]:
+        return self._summary
+
+    def previous(self) -> Optional[Dict[str, Any]]:
+        return self._previous
+
+    def reset(self, now: Any = None, start_capital: Any = None, target_hours: Any = None, capital_source: Any = None) -> str:
+        self._held()
+        self.calls.append(("reset", now, start_capital, target_hours, capital_source))
+        self._previous = {"run": {"run_id": "run-1", "end_reason": "reset"}, "portfolios": []}
+        return "run-2"
+
+    def end_run(self, now: Any = None, reason: str = "completed") -> Dict[str, Any]:
+        self._held()
+        self.calls.append(("end", now, reason))
+        return {"at": now, "reason": reason}
+
+
+class StubFairValues:
+    """Stands in for fairvalue.FairValueService (package A)."""
+
+    def __init__(self, tracker_box: Optional[List[Any]] = None, gate: Optional[threading.Event] = None) -> None:
+        self.box = tracker_box if tracker_box is not None else []
+        self.gate = gate
+        self.targets: List[List[Any]] = []
+        self.refreshes: List[float] = []
+        self.started = threading.Event()
+        self.provider: Dict[str, Any] = {"status": "ok", "last_ok_at": None, "last_error": None, "requests": 1,
+                                         "matched": 2, "quoted": 2, "next_try_at": None}
+        self.lock_held: List[bool] = []
+
+    def _held(self) -> None:
+        if self.box:
+            self.lock_held.append(self.box[0]._lock._is_owned())
+
+    def set_targets(self, infos: Any) -> None:
+        self._held()
+        self.targets.append(list(infos))
+
+    def refresh(self, now: float) -> Any:
+        self._held()
+        self.started.set()
+        if self.gate is not None:
+            self.gate.wait(10)
+        self.refreshes.append(now)
+
+    def status(self) -> Dict[str, Any]:
+        return {"mode": "auto", "enabled": True, "last_refresh_at": self.refreshes[-1] if self.refreshes else None,
+                "usable": 2, "total": 5, "providers": {"polymarket": dict(self.provider)}, "manual": None, "map": None}
+
+    def current(self) -> Any:
+        return SimpleNamespace(enabled=True, values={})
+
+    def races(self) -> Dict[str, Any]:
+        return {}
+
+
+@pytest.fixture
+def stub_runner(monkeypatch: Any) -> List[StubRunner]:
+    import supermarket_bot.paper as paper_mod
+
+    made: List[StubRunner] = []
+
+    def factory(*args: Any, **kwargs: Any) -> StubRunner:
+        runner = StubRunner(*args, **kwargs)
+        made.append(runner)
+        return runner
+
+    monkeypatch.setattr(paper_mod, "PaperRunner", factory)
+    return made
+
+
+ENGINE = SimpleNamespace(config=SimpleNamespace(reads_per_min=20))
+
+
+def test_paper_and_fair_value_workers_start_only_when_configured(make_tracker: Any, stub_runner: List[StubRunner]) -> None:
+    plain = make_tracker(interval=0.05)
+    plain.start()
+    names = {t.name for t in plain._threads}
+    assert "tracker-paper" not in names and "tracker-fairvalue" not in names
+    status = plain.status()
+    assert status["paper"] is None and status["fair_value"] is None and status["read_budget"]["paper"] is None
+    assert plain.paper_step() is None and plain.fair_value_step() is False
+    assert plain.paper_view() is None and plain.paper_reset() is None and plain.paper_end() is None
+    plain.stop(timeout=2)
+
+    fv = StubFairValues()
+    tracker = make_tracker(interval=0.05, paper=ENGINE, fair_values=fv)
+    [runner] = stub_runner
+    assert runner.engine is ENGINE and isinstance(runner.reader, tracker_mod.TrackerMarketReader)
+    assert runner.limiter is tracker.paper_limiter and runner.interval == 0.05 and runner.clock is tracker._clock
+    tracker.start()
+    assert {"tracker-paper", "tracker-fairvalue"} <= {t.name for t in tracker._threads}
+    assert wait_for(lambda: len(runner.steps) >= 2 and fv.refreshes, timeout=5)
+    cycles = tracker.status()["cycles"]
+    assert len(runner.steps) <= cycles + 1  # at most one paper step per tracker cycle
+    tracker.stop(timeout=2)
+    assert not any(t.is_alive() for t in tracker._threads)
+
+
+def test_paper_step_and_fair_value_step_run_synchronously(make_tracker: Any, stub_runner: List[StubRunner],
+                                                          data_clock: FakeClock) -> None:
+    box: List[Any] = []
+    fv = StubFairValues(box)
+    tracker = make_tracker(paper=ENGINE, fair_values=fv)
+    box.append(tracker)
+    runner = stub_runner[0]
+    runner.tracker = tracker
+    tracker.run_once()
+    assert [i.exchange_id for i in fv.targets[-1]] == ["e1", "e2", "e3a", "e3b", "e3c"]  # open outcomes, after a list read
+    assert tracker.fair_value_step(T0 + 5) is True and fv.refreshes == [T0 + 5]
+    assert tracker.fair_value_step() is True and fv.refreshes[-1] == T0  # defaults to the tracker clock
+    report = tracker.paper_step(T0 + 7)
+    assert report.errors == [] and runner.steps == [T0 + 7]
+    inputs, obs = runner.inputs[-1]
+    assert set(inputs.infos) == {"e1", "e2", "e3a", "e3b", "e3c"} and set(obs.open_ids) == set(inputs.infos)
+    assert inputs.latest["e1"].bid == 0.39 and obs.quotes["e1"].ask == 0.41
+    assert inputs.settlement_regime == "unknown"
+    view = tracker.paper_view()
+    assert view["run"]["interval"] == tracker.interval and view["run"]["steps"] == 1
+    assert view["fair_value"] == {"mode": "auto", "enabled": True, "usable": 2, "total": 5}  # the tracker's extras
+    assert runner.summary()["run"]["interval"] is None  # paper_view copies; the published summary is untouched
+    assert tracker.status()["paper"] == {"enabled": True, "run_id": "run-1", "steps": 1, "last_step_at": T0 + 7,
+                                         "last_step_seconds": 0.01}
+    assert tracker.status()["fair_value"]["providers"]["polymarket"]["status"] == "ok"
+    assert tracker.paper_view("previous") is None
+    assert tracker.paper_reset(start_capital=5000.0, target_hours=12) == "run-2"
+    assert runner.calls[-1] == ("reset", T0, 5000.0, 12, "set by you")
+    assert tracker.paper_view("previous")["run"]["end_reason"] == "reset"
+    tracker.paper_reset()
+    assert runner.calls[-1] == ("reset", T0, None, None, "")
+    assert tracker.paper_end("completed") == {"at": T0, "reason": "completed"}
+    # lock rule (D43): neither the runner nor the fair-value service is ever called under the tracker's lock
+    assert runner.lock_held and not any(runner.lock_held)
+    assert fv.lock_held and not any(fv.lock_held)
+
+
+def test_recent_and_cup_mids_come_from_the_published_snapshot(make_tracker: Any, world: World, data_clock: FakeClock) -> None:
+    tracker = make_tracker()
+    assert tracker.recent_mids() == {} and tracker.cup_mids() == {}
+    tracker.run_once()
+    world.set("e1", 0.44)
+    step(tracker, data_clock, 30)
+    assert tracker.cup_mids()["e1"] == pytest.approx(0.44) and tracker.cup_mids()["e2"] == pytest.approx(0.97)
+    mids = tracker.recent_mids(300)
+    assert mids["e1"] == [(T0, pytest.approx(0.40)), (T0 + 30, pytest.approx(0.44))]
+    assert tracker.recent_mids(10)["e1"] == [(T0 + 30, pytest.approx(0.44))]
+
+
+def test_paper_budget_in_the_status_is_6_per_min_while_the_backfill_runs(make_tracker: Any, world: World,
+                                                                         stub_runner: List[StubRunner],
+                                                                         data_clock: FakeClock) -> None:
+    world.add_history(data_clock)
+    tracker = make_tracker(backfill=True, paper=ENGINE, paper_reads_per_min=20, paper_reads_per_min_during_backfill=6)
+    tracker.run_once()
+    budget = tracker.status()["read_budget"]
+    assert tracker.status()["backfill"]["pending"] > 0
+    assert budget["paper"] == {"used": 0, "limit": 6, "room": 6}
+    assert budget["reserve"] == 12 and isinstance(budget["projected_per_min"], float) and budget["projected_per_min"] > 0
+    assert budget["warning"] is None  # the test client is not capped like a real account
+    tracker.paper_limiter.acquire()
+    assert tracker.status()["read_budget"]["paper"] == {"used": 1, "limit": 6, "room": 5}
+    while tracker.backfill_step(10):
+        pass
+    assert tracker.status()["backfill"]["pending"] == 0
+    assert tracker.status()["read_budget"]["paper"] == {"used": 1, "limit": 20, "room": 19}
+
+
+def test_projected_reads_warn_close_to_the_account_limit(make_client: Any, make_tracker: Any, world: World,
+                                                         stub_runner: List[StubRunner], data_clock: FakeClock) -> None:
+    world.add_history(data_clock)
+    tracker = make_tracker(client=make_client(reads_per_min=90), backfill=True, backfill_reads_per_min=60,
+                           attributor=FakeAttributor(), paper=ENGINE)
+    tracker.run_once()
+    budget = tracker.status()["read_budget"]
+    assert budget["projected_per_min"] > 75
+    assert budget["warning"] == (f"Projected reads ({budget['projected_per_min']:.0f}/min) are close to the account limit of 100 "
+                                 "per minute shared by all your keys: do not run other scripts on this account.")
+    problem = next(p for p in tracker.status()["problems"] if p["source"] == "read budget")
+    assert problem["severity"] == "warning"
+    while tracker.backfill_step(20):
+        pass
+    step(tracker, data_clock, 300)  # the market list is re-read: the projection follows the finished backfill
+    assert tracker.status()["read_budget"]["warning"] is None
+    assert not any(p["source"] == "read budget" for p in tracker.status()["problems"])
+
+
+def test_new_problem_sources_are_warnings() -> None:
+    for source in ("paper", "fair value", "settlements", "read budget"):
+        assert tracker_mod.PROBLEM_SEVERITY[source] == "warning"
+
+
+def _settled_route(world: World, settled: List[Dict[str, Any]], calls: List[Dict[str, str]]) -> Callable[[httpx.Request], httpx.Response]:
+    def handler(request: httpx.Request) -> httpx.Response:
+        params = dict(request.url.params)
+        if params.get("status") == "settled":
+            calls.append(params)
+            return httpx.Response(200, json=market_page(settled))
+        return httpx.Response(200, json=market_page(world.markets))
+
+    return handler
+
+
+def test_settlements_are_read_and_stored_with_their_detection_time(make_tracker: Any, world: World, fake: Any,
+                                                                  data_clock: FakeClock) -> None:
+    done = market("m9", "Will Democrats win the Iowa Senate race?", [("e9", None, 1.0)], status="settled")
+    done.update(settledWith="YES", settledOn="2026-09-30T00:00:00.000Z")
+    refund = market("m8", "Will the debate happen?", [("e8", None, None)], status="settled")
+    refund["settledWith"] = "REFUND"
+    calls: List[Dict[str, str]] = []
+    replace_route(fake, f"/tournaments/{SLUG}/markets", _settled_route(world, [done, refund], calls))
+    tracker = make_tracker()
+    tracker.run_once()
+    assert len(calls) == 1 and calls[0]["limit"] == "100"
+    stored = tracker.store.settlements()
+    assert stored["e9"].payout_yes == 1.0 and stored["e9"].detected_at == T0 and stored["e9"].market_id == "m9"
+    assert stored["e9"].settled_on == pytest.approx(iso_epoch("2026-09-30T00:00:00.000Z"))
+    assert stored["e8"].refund is True and stored["e8"].payout_yes is None
+    assert set(tracker.settlements()) == {"e8", "e9"}
+    step(tracker, data_clock, 120)
+    assert len(calls) == 1  # every settlement_refresh (600 s) ...
+    world.quotes.pop("e1")  # ... and early when an outcome goes missing from the bulk prices
+    step(tracker, data_clock, 30)
+    step(tracker, data_clock, 30)
+    assert len(calls) == 2
+    assert tracker.store.settlements()["e9"].detected_at == T0  # the first detection is kept
+    replace_route(fake, f"/tournaments/{SLUG}/markets", lambda r: (
+        httpx.Response(500, json=error_body("INTERNAL", "boom")) if r.url.params.get("status") == "settled"
+        else httpx.Response(200, json=market_page(world.markets))))
+    step(tracker, data_clock, 600)
+    problem = next(p for p in tracker.status()["problems"] if p["source"] == "settlements")
+    assert problem["severity"] == "warning"
+
+
+def iso_epoch(text: str) -> float:
+    from datetime import datetime
+
+    return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+
+
+def test_leaderboard_reads_100_rows_and_keeps_entries(make_tracker: Any, fake: Any) -> None:
+    tracker = make_tracker()
+    tracker.run_once()
+    assert fake.calls_to(f"/tournaments/{SLUG}/leaderboard")[0].params["limit"] == "100"
+    board = tracker.view()["context"]["leaderboard"]
+    assert [e["username"] for e in board["top"]] == ["alice", "bob", None]  # the existing keys stay
+    assert {"rank", "username", "pnl", "roi", "trades", "value"} <= set(board["top"][0])
+    assert board["entries"] == [
+        {"rank": 1, "username": "alice", "pnl": 5000.0, "value": 105000.0},
+        {"rank": 2, "username": "bob", "pnl": 3000.0, "value": 103000.0},
+        {"rank": 3, "username": None, "pnl": 2500.0, "value": 102500.0},
+    ]
+    [snap] = tracker.store.leaderboard_snapshots(T0 - 1, T0 + 1)
+    assert snap.at == T0 and snap.my_rank == 17 and snap.initial_balance == 100000 and len(snap.entries) == 3
+
+
+def test_paper_and_fair_value_problems(make_tracker: Any, stub_runner: List[StubRunner]) -> None:
+    fv = StubFairValues()
+    tracker = make_tracker(paper=ENGINE, fair_values=fv)
+    runner = stub_runner[0]
+    tracker.run_once()
+    offline = "Polymarket is unreachable from this machine (connection refused by the network proxy): no outside fair value from Polymarket."
+    fv.provider.update(status="offline", last_error=offline)
+    tracker.fair_value_step()
+    problems = [p for p in tracker.status()["problems"] if p["source"] == "fair value"]
+    assert len(problems) == 1 and problems[0]["message"] == offline and problems[0]["severity"] == "warning"
+    fv.provider.update(status="ok", last_error=None)
+    tracker.fair_value_step()
+    assert not any(p["source"] == "fair value" for p in tracker.status()["problems"])
+    runner.errors = ["no order book"]
+    tracker.paper_step()
+    problem = next(p for p in tracker.status()["problems"] if p["source"] == "paper")
+    assert problem["severity"] == "warning" and "no order book" in problem["message"]
+    runner.errors = []
+    tracker.paper_step()
+    assert not any(p["source"] == "paper" for p in tracker.status()["problems"])
+
+
+def test_a_slow_fair_value_provider_never_blocks_the_snapshot_loop(make_tracker: Any) -> None:
+    gate = threading.Event()
+    fv = StubFairValues(gate=gate)
+    tracker = make_tracker(interval=0.05, fair_values=fv)
+    try:
+        tracker.start()
+        assert fv.started.wait(5)  # the refresh is stuck in its (outside) HTTP call
+        cycles = tracker.status()["cycles"]
+        assert wait_for(lambda: tracker.status()["cycles"] >= cycles + 5, timeout=5)
+        started = time.monotonic()
+        tracker.status()
+        tracker.view()
+        assert time.monotonic() - started < 1.0
+        assert fv.refreshes == []
+    finally:
+        gate.set()
+        tracker.stop(timeout=2)
+    assert fv.refreshes
+
+
+def test_a_saturated_background_workload_does_not_delay_the_snapshot_loop(make_client: Any, make_tracker: Any,
+                                                                          stub_runner: List[StubRunner], world: World,
+                                                                          sleeper: Any, clock: FakeClock,
+                                                                          data_clock: FakeClock) -> None:
+    client = make_client(reads_per_min=90)
+    waits: List[float] = []
+
+    def limiter_sleep(seconds: float) -> None:  # a background read waiting for room above the reserve
+        waits.append(seconds)
+        clock.now += 61  # ...until the client's window has moved on
+
+    world.add_history(data_clock)
+    tracker = make_tracker(client=client, backfill=True, paper=ENGINE, attributor=FakeAttributor(),
+                           limiter_sleep=limiter_sleep)
+    tracker.run_once()  # first cycle: market list, prices and the (gated) context, on an idle budget
+    clock.now += 61  # a minute later the client's window is empty again
+    while client.read_limiter.used < 80:  # background reads (backfill, analysis, paper) have used 80 of the 90 slots
+        client.read_limiter.acquire()
+    assert tracker.read_reserve.room() == 90 - 12 - 80
+    assert tracker.paper_limiter.room() <= 0  # the paper runner skips its reads
+    for _ in range(2):  # snapshot cycles (the context is not due): the loop's own reads are never gated
+        summary = step(tracker, data_clock, 30)
+        assert summary["ticks"] == 5 and summary["errors"] == 0
+    assert sleeper.calls == [] and waits == []  # it never waited: no delay at all, let alone one interval
+    assert client.read_limiter.used <= 90
+    tracker.backfill_step(1)  # a background read waits for room above the reserve instead
+    assert waits and waits[0] == tracker.read_reserve.poll_s
+
+
+def _trade(i: int, ts: float) -> Dict[str, Any]:
+    return {"id": f"t{i}", "createdAt": iso_ts(ts), "price": 0.41, "size": 10, "side": "YES", "volume": 4.1}
+
+
+def test_the_tape_reader_pages_and_flags_truncation(make_tracker: Any, fake: Any, data_clock: FakeClock) -> None:
+    pages = {None: ([_trade(i, T0 - 1000 + i) for i in range(600, 400, -1)], "c1"),
+             "c1": ([_trade(i, T0 - 1000 + i) for i in range(400, 200, -1)], "c2"),
+             "c2": ([_trade(i, T0 - 1000 + i) for i in range(200, 150, -1)], None)}
+    seen: List[Dict[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        params = dict(request.url.params)
+        seen.append(params)
+        data, nxt = pages[params.get("cursor")]
+        return httpx.Response(200, json={"data": data, "pagination": {"limit": 200, "hasMore": nxt is not None, "nextCursor": nxt}})
+
+    fake.add("GET", "/exchanges/e1/trades", handler)
+    tracker = make_tracker()
+    reader = tracker_mod.TrackerMarketReader(tracker)
+    tape = reader.trades("e1", T0 - 1000, max_pages=2)
+    assert tape.pages == 2 and tape.truncated is True and len(tape.trades) == 400
+    assert [t.ts for t in tape.trades] == sorted(t.ts for t in tape.trades)  # oldest first
+    assert tape.trades[0].trade_id == "t201" and tape.trades[-1].trade_id == "t600"
+    assert seen[0] == {"tournamentId": TOURNAMENT_ID, "from": iso_ts(T0 - 1000), "limit": "200"}
+    assert seen[1]["cursor"] == "c1"
+    stored = tracker.store.trades("e1", T0 - 2000)
+    assert len(stored) == 400 and all(t.fetched_at == T0 for t in stored)
+    data_clock.now += 5
+    full = reader.trades("e1", T0 - 1000, max_pages=3)
+    assert full.pages == 3 and full.truncated is False and len(full.trades) == 450
+    assert tracker.paper_limiter.used == 5  # one budget slot per page
+    fake.routes.pop(("GET", "/exchanges/e1/trades"))
+    fake.add("GET", "/exchanges/e1/trades", (500, error_body("INTERNAL", "boom")))
+    assert reader.trades("e1", T0 - 1000) is None
+    assert any(p["source"] == "paper" for p in tracker.status()["problems"])
+
+
+def test_the_book_reader_stores_what_it_read(make_tracker: Any, fake: Any) -> None:
+    tracker = make_tracker()
+    tracker.run_once()
+    reader = tracker_mod.TrackerMarketReader(tracker)
+    obs = reader.book("e1", 20)
+    assert obs.source == "paper" and obs.observed_at == T0 and obs.sequence == 100
+    assert obs.bids == [(0.39, 150.0), (0.38, 300.0)] and obs.asks == [(0.41, 120.0), (0.42, 250.0)]
+    assert fake.calls_to("/exchanges/e1/orderbook")[-1].params == {"depth": "20", "tournamentId": TOURNAMENT_ID}
+    assert tracker.store.book("e1")["at"] == T0  # ideas size by it
+    [snap] = tracker.store.book_snapshots("e1", T0 - 1)
+    assert snap.bids == obs.bids and snap.source == "paper"
+    assert tracker.paper_limiter.used == 1
+    fake.routes.pop(("GET", "/exchanges/e1/orderbook"))
+    fake.add("GET", "/exchanges/e1/orderbook", (500, error_body("INTERNAL", "boom")))
+    assert reader.book("e1", 20) is None
+    assert any(p["source"] == "paper" for p in tracker.status()["problems"])
+
+
+def test_the_lease_refuses_a_second_tracker_on_the_same_store(make_tracker: Any, tmp_path: Any, data_clock: FakeClock) -> None:
+    path = tmp_path / "tracker.sqlite3"
+    first = make_tracker(store=TrackerStore(path), lease=True)
+    second = make_tracker(store=TrackerStore(path), lease=True)
+    first.run_once()
+    with pytest.raises(tracker_mod.TrackerBusy) as caught:
+        second.run_once()
+    message = str(caught.value)
+    assert message.startswith(f"Another process (pid {os_pid()} on ")
+    assert f"is already running the tracker on {path}: stop it, or use --data-dir for a separate copy." in message
+    assert message.endswith("Running two would double the API reads; the account allows 100 per minute across all keys.")
+    with pytest.raises(tracker_mod.TrackerBusy):
+        second.start()
+    with pytest.raises(tracker_mod.TrackerBusy):
+        second.paper_step() if second.paper_runner is not None else second._ensure_lease()
+    first.stop(timeout=2)  # releases the lease
+    second.run_once()
+    data_clock.now += 3 * second.interval + 1  # a lease whose heartbeat is older than 3 x interval is taken over
+    first.run_once()
+
+
+def os_pid() -> int:
+    import os
+
+    return os.getpid()

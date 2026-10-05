@@ -41,8 +41,12 @@ MIN, HOUR, DAY = 60.0, 3600.0, 86400.0
 CUP_END = "2026-11-04T17:00:00.000Z"
 TID = DEMO_TOURNAMENT_ID
 OTHER_UUID = "00000000-0000-4000-8000-000000000000"
-OPEN_EXCHANGES = [str(9001 + i) for i in range(22)]  # 9023 belongs to the settled debate market
-ALL_MARKETS = [str(301 + i) for i in range(15)]
+# 9023 belongs to the settled debate market; 9024-9034 (markets 316-326) were added for the paper trader
+# (docs/PAPER_TRADING.md §7.6); 9034 (the Maine debate) settles live at T0 + 40 min.
+OPEN_EXCHANGES = [str(9001 + i) for i in range(22)] + [str(9024 + i) for i in range(11)]
+ALL_EXCHANGES = [str(9001 + i) for i in range(34)]
+ALL_MARKETS = [str(301 + i) for i in range(26)]
+PAPER_SCRIPTED = {"9033", "9034"}  # the Wyoming liquidity hole and the Maine debate's rise are scripted moves
 MULTI_MARKETS = {"311", "312", "313", "314"}
 PA, OH, MI = "9001", "9002", "9003"  # news surge, participant spike, live surge
 BAND_BEFORE_CUP_END = {"9007", "9008"}
@@ -245,7 +249,7 @@ def test_tournament_and_account(api: SuperMarketClient) -> None:
     assert t["id"] == TID and t["slug"] == DEMO_SLUG
     assert t["name"] == "Predictions Cup — Midterm Elections (demo)"
     assert t["currencyName"] == "SUSQies" and t["initialBalance"] == 100_000 and t["status"] == "active"
-    assert t["endDate"] == CUP_END and t["marketCount"] == 15
+    assert t["endDate"] == CUP_END and t["marketCount"] == 26
     account = api.get_account()
     assert account["balance"] == t["myBalance"]
     listed = api.list_tournaments()
@@ -259,7 +263,7 @@ def test_markets_and_outcomes(api: SuperMarketClient) -> None:
     markets = api.list_markets(tournament_id=TID, status="any")["data"]
     assert sorted(m["id"] for m in markets) == ALL_MARKETS
     exchanges = [ex for m in markets for ex in m["exchanges"]]
-    assert sorted(ex["id"] for ex in exchanges) == OPEN_EXCHANGES + ["9023"]
+    assert sorted(ex["id"] for ex in exchanges) == ALL_EXCHANGES
     by_id = {m["id"]: m for m in markets}
     assert by_id["301"]["title"] == "Will Republicans keep control of the Pennsylvania Senate?"
     assert by_id["302"]["title"] == "Will Republicans win Ohio House District 9?"
@@ -307,7 +311,7 @@ def test_nodes(api: SuperMarketClient) -> None:
 def test_leaderboard_portfolio_and_token(api: SuperMarketClient) -> None:
     board = api.get_tournament_leaderboard(DEMO_SLUG, limit=100)
     rows = board["leaderboard"]
-    assert board["total"] == len(rows) == 48
+    assert board["total"] == len(rows) == 51  # + the three far-ahead leaders of the paper-trading demo (§7.6)
     pnls = [r["pnl"] for r in rows]
     assert pnls == sorted(pnls, reverse=True) and [r["rank"] for r in rows] == sorted(r["rank"] for r in rows)
     me = next(r for r in rows if r["username"] == "demo_trader")
@@ -349,9 +353,9 @@ def _cursor_pages(fetch: Callable[[Optional[str]], Dict[str, Any]], items_key: s
 def test_market_cursor_pagination(api: SuperMarketClient) -> None:
     pages = _cursor_pages(lambda cur: api.list_markets(tournament_id=TID, status="any", limit=4, cursor=cur))
     ids = [m["id"] for p in pages for m in p["data"]]
-    assert len(pages) == 4 and [len(p["data"]) for p in pages] == [4, 4, 4, 3]
+    assert len(pages) == 7 and [len(p["data"]) for p in pages] == [4, 4, 4, 4, 4, 4, 2]
     assert len(ids) == len(set(ids)) and sorted(ids) == ALL_MARKETS
-    assert all(p["pagination"]["total"] == 15 and p["pagination"]["limit"] == 4 for p in pages)
+    assert all(p["pagination"]["total"] == 26 and p["pagination"]["limit"] == 4 for p in pages)
     assert [m["id"] for m in api.iter_markets(tournament_id=TID, status="any")] == [m["id"] for m in api.list_markets(tournament_id=TID, status="any")["data"]]
 
     tm_pages = _cursor_pages(lambda cur: api.list_tournament_markets(DEMO_SLUG, limit=6, cursor=cur))
@@ -359,8 +363,8 @@ def test_market_cursor_pagination(api: SuperMarketClient) -> None:
     assert "contexts" not in tm_pages[0]["data"][0]  # tournament rows are not the canonical shape
 
     ex_pages = _cursor_pages(lambda cur: api.list_exchanges(tournament_id=TID, limit=10, cursor=cur))
-    assert [len(p["data"]) for p in ex_pages] == [10, 10, 3]
-    assert [e["id"] for p in ex_pages for e in p["data"]] == OPEN_EXCHANGES + ["9023"]
+    assert [len(p["data"]) for p in ex_pages] == [10, 10, 10, 4]
+    assert [e["id"] for p in ex_pages for e in p["data"]] == ALL_EXCHANGES
 
 
 def test_trade_cursor_pagination(api: SuperMarketClient) -> None:
@@ -420,7 +424,7 @@ def test_market_filters_and_sorting(api: SuperMarketClient, raw: httpx.Client) -
     def ids(**kw: Any) -> List[str]:
         return [m["id"] for m in api.list_markets(tournament_id=TID, **kw)["data"]]
 
-    assert sorted(ids(status="open")) == ALL_MARKETS[:-1] and ids(status="settled") == ["315"]
+    assert sorted(ids(status="open")) == [m for m in ALL_MARKETS if m != "315"] and ids(status="settled") == ["315"]
     assert ids(status="resolved") == ["315"]
     senate = ids(status="any", search="SENATE")
     assert senate and all("senate" in m["title"].lower() for m in api.list_markets(tournament_id=TID, status="any", search="senate")["data"])
@@ -428,7 +432,7 @@ def test_market_filters_and_sorting(api: SuperMarketClient, raw: httpx.Client) -
     assert set(ids(status="any", is_multi_outcome=True)) == MULTI_MARKETS
     assert set(ids(status="any", is_multi_outcome=False)) == set(ALL_MARKETS) - MULTI_MARKETS
     assert sorted(ids(status="any", ids=["301", "311", "999"])) == ["301", "311"]
-    assert ids(status="any", category="sports-outcome") == [] and len(ids(status="any", category="election-outcome")) == 15
+    assert ids(status="any", category="sports-outcome") == [] and len(ids(status="any", category="election-outcome")) == 26
     assert ids(status="any", is_composite=True) == []
     assert ids(status="any", sort="oldest") == ALL_MARKETS and ids(status="any", sort="recent") == ALL_MARKETS[::-1]
     closing = api.list_markets(tournament_id=TID, status="any", sort="closing")["data"]
@@ -546,7 +550,8 @@ def test_the_client_maps_demo_errors(api: SuperMarketClient) -> None:
     assert (caught.value.status, caught.value.code) == (404, "NOT_FOUND")
     # get_prices chunks large requests to 100 ids, so a long list works through the client
     bulk = api.get_prices(ids, tournament_id=TID)
-    assert len(bulk["data"]) == 23 and len(bulk["missingIds"]) == 101 - 23
+    # every open outcome is quoted; the settled debate (9023) is missing like any settled outcome (§7.6 (l))
+    assert len(bulk["data"]) == 33 and len(bulk["missingIds"]) == 101 - 33 and "9023" in bulk["missingIds"]
 
 
 # --------------------------------------------------------------------------- determinism and time consistency
@@ -675,7 +680,7 @@ def test_high_band_outcomes_hover_in_the_high_90s(api: SuperMarketClient) -> Non
         if closes and min(fav) >= 0.95:
             favourites[eid] = (min(fav), max(fav), closes[-1])
     assert BAND_BEFORE_CUP_END | BAND_AFTER_CUP_END <= set(favourites)
-    assert 4 <= len(favourites) <= 5
+    assert 4 <= len(favourites) <= 6  # + the Nebraska Democratic long shot (NO ~0.97), added for the paper trader
     for eid in BAND_BEFORE_CUP_END | BAND_AFTER_CUP_END:
         low, high, _ = favourites[eid]
         assert 0.95 <= low and high <= 0.99
@@ -759,8 +764,8 @@ def timeline() -> Iterator[SimpleNamespace]:
 
 
 def test_pipeline_start_up(timeline: SimpleNamespace) -> None:
-    assert (timeline.first["markets"], timeline.first["exchanges"], timeline.first["ticks"]) == (14, 22, 22)
-    assert timeline.backfill_reads == 44  # 22 outcomes x (7 days of 1h + 24 hours of 5m)
+    assert (timeline.first["markets"], timeline.first["exchanges"], timeline.first["ticks"]) == (25, 33, 33)
+    assert timeline.backfill_reads == 66  # 33 outcomes x (7 days of 1h + 24 hours of 5m)
     assert len(timeline.second["new_surges"]) == 2 and timeline.second["errors"] == 0
     assert timeline.tracker.status()["errors"] == 0
 
@@ -816,13 +821,15 @@ def test_live_surge_on_michigan_is_attributed_to_participants(timeline: SimpleNa
 
 
 def test_background_noise_never_trips_a_surge(timeline: SimpleNamespace) -> None:
-    assert set(timeline.end) == {PA, OH, MI}
-    assert [eid for _, eid, _ in timeline.detections] == [MI]
+    # Only scripted moves surge: the three originals and the paper-trading scenarios (k) the Wyoming hole
+    # (T0 + 20 min) and (l) the Maine debate's rise before it settles (§7.6).
+    assert set(timeline.end) == {PA, OH, MI} | PAPER_SCRIPTED
+    assert [eid for _, eid, _ in timeline.detections if eid not in PAPER_SCRIPTED] == [MI]
 
 
 def test_tracker_sees_the_high_band_outcomes(timeline: SimpleNamespace) -> None:
     bands = {b["exchange_id"]: b for b in timeline.view_t0["high_band"]}
-    assert BAND_BEFORE_CUP_END | BAND_AFTER_CUP_END <= set(bands) and 4 <= len(bands) <= 5
+    assert BAND_BEFORE_CUP_END | BAND_AFTER_CUP_END <= set(bands) and 4 <= len(bands) <= 6  # + Nebraska D (NO ~0.97)
     cup_end = epoch(CUP_END)
     for eid in BAND_BEFORE_CUP_END | BAND_AFTER_CUP_END:
         band = bands[eid]
@@ -844,7 +851,8 @@ def test_tracker_context_has_the_arbitrage_and_violation(timeline: SimpleNamespa
 
 def test_settled_market_is_not_tracked(timeline: SimpleNamespace) -> None:
     rows = timeline.view_end["exchanges"]
-    assert len(rows) == 22 and "9023" not in {r["exchange_id"] for r in rows}
+    ids = {r["exchange_id"] for r in rows}
+    assert len(rows) == 32 and "9023" not in ids and "9034" not in ids  # the Maine debate settled at T0 + 40 min
 
 
 def test_news_queries_came_from_market_titles(timeline: SimpleNamespace) -> None:
@@ -923,3 +931,255 @@ def test_news_searcher_ranks_demo_headlines(market: DemoMarket) -> None:
     assert pa[0].relevance >= 0.5
     ohio = searcher.search_for_market("Will Republicans win Ohio House District 9?", "YES", T0 - 6 * HOUR, T0)
     assert all(a.relevance < 0.5 for a in ohio)  # only unrelated noise
+
+
+# --------------------------------------------------------------------------- paper-trading scenarios (g)-(l), §7.6
+
+
+PAPER_TITLES = {
+    "316": "Will the Democratic Party win the Nevada Governor?",
+    "317": "Will the Republican Party win the Nevada Governor?",
+    "318": "Will the Democratic Party win the Texas Senate?",
+    "319": "Will the Republican Party win the Texas Senate?",
+    "320": "Will the Democratic Party win the Iowa Senate?",
+    "321": "Will the Republican Party win the Iowa Senate?",
+    "322": "Will the Democratic Party win the Nebraska Senate?",
+    "323": "Will the Republican Party win the Nebraska Senate?",
+    "324": "Will the Independent Party win the Nebraska Senate?",
+    "325": "Will the Republican Party win the Wyoming Governor?",
+    "326": "Will the Maine Senate candidates debate before October 7?",
+}
+PAPER_RACES = {
+    "9024": ("2026:GOVERNOR:NV", "D"), "9025": ("2026:GOVERNOR:NV", "R"), "9026": ("2026:SENATE:TX", "D"),
+    "9027": ("2026:SENATE:TX", "R"), "9028": ("2026:SENATE:IA", "D"), "9029": ("2026:SENATE:IA", "R"),
+    "9030": ("2026:SENATE:NE", "D"), "9031": ("2026:SENATE:NE", "R"), "9032": ("2026:SENATE:NE", "I"),
+    "9033": ("2026:GOVERNOR:WY", "R"),
+}
+SCRIPTED_FEED = {  # §7.6: the demo's outside fair value of each scripted outcome at T0
+    "9024": 0.50, "9025": 0.50, "9026": 0.58, "9027": 0.42, "9028": 0.46, "9029": 0.54, "9030": 0.02, "9031": 0.67,
+    "9032": 0.31, "9033": 0.94, "9034": 0.99,
+}
+LEADING = ("9003", "9004", "9005", "9006")
+
+
+@pytest.fixture
+def paper_demo() -> Iterator[SimpleNamespace]:
+    """A demo market whose clock the test moves (``off.now`` seconds after T0), with a client on it."""
+    off = Offset()
+    market = make_market(offset=off)
+    client = make_client(market)
+    try:
+        yield SimpleNamespace(market=market, client=client, off=off)
+    finally:
+        client.close()
+
+
+def _quotes(client: SuperMarketClient, ids: List[str]) -> Tuple[Dict[str, Tuple[float, float]], List[str]]:
+    bulk = client.get_prices(ids, tournament_id=TID)
+    return {r["exchangeId"]: (r["bestBid"], r["bestAsk"]) for r in bulk["data"]}, list(bulk["missingIds"])
+
+
+def _at(demo: SimpleNamespace, minutes: float, ids: List[str]) -> Dict[str, Tuple[float, float]]:
+    demo.off.now = minutes * MIN
+    return _quotes(demo.client, ids)[0]
+
+
+def test_published_paper_constants() -> None:
+    from supermarket_bot.models import PaperConfig, default_portfolios
+    from supermarket_bot.paper import headline_id
+
+    assert demo_mod.PAPER_MARKET_IDS == tuple(str(316 + i) for i in range(11))
+    assert demo_mod.PAPER_EXCHANGE_IDS == tuple(str(9024 + i) for i in range(11))
+    assert demo_mod.DEMO_LEADER_VALUES == (285_000.0, 242_000.0, 221_500.0)
+    assert demo_mod.DEMO_BAR == 221_500.0 and demo_mod.DEMO_CHASER_M == pytest.approx(2.215)
+    assert [name for name, _ in demo_mod.DEMO_TOP_MEMBERS] == ["election_whale", "polls_gambler", "longshot_lucy"]
+    ids = (
+        "human:conservative", "policy:conservative", "policy:chaser", "kind:value", "kind:basket", "kind:hole",
+        "kind:fade", "kind:carry", "kind:arbitrage",
+    )
+    assert demo_mod.DEMO_PORTFOLIO_IDS == ids
+    assert tuple(p.portfolio_id for p in default_portfolios("conservative")) == ids
+    assert headline_id(PaperConfig(sizing="conservative", portfolios=default_portfolios("conservative"))) == demo_mod.DEMO_HEADLINE
+    assert demo_mod.DEMO_HEADLINE == "human:conservative"
+    assert demo_mod.SIM_T0 == epoch("2026-10-05T14:00:00Z")
+
+
+def test_paper_markets_use_the_real_cup_grammar(api: SuperMarketClient) -> None:
+    from supermarket_bot.fairvalue import parse_race
+
+    markets = {m["id"]: m for m in api.list_markets(tournament_id=TID, status="any")["data"]}
+    for mid, title in PAPER_TITLES.items():
+        assert markets[mid]["title"] == title
+        assert not markets[mid]["isMultiOutcome"]
+    exchanges = {ex["id"]: (m["title"], ex.get("option")) for m in markets.values() for ex in m["exchanges"]}
+    assert [markets[mid]["exchanges"][0]["id"] for mid in PAPER_TITLES] == list(demo_mod.PAPER_EXCHANGE_IDS)
+    for eid, (race_key, party) in PAPER_RACES.items():
+        ref = parse_race(exchanges[eid][0], exchanges[eid][1])
+        assert ref is not None and (ref.race_key, ref.party) == (race_key, party), eid
+    assert parse_race(exchanges["9034"][0], exchanges["9034"][1]) is None  # a debate market, not a race
+    assert markets["326"]["settlementDate"] == iso(T0 + 40 * MIN).replace("Z", ".000Z")
+    assert all(markets[mid]["settlementDate"] == CUP_END for mid in PAPER_TITLES if mid != "326")
+
+
+def test_paper_scenario_references(market: DemoMarket) -> None:
+    sc = market.scenario
+    assert sc["basket_pair"]["exchange_ids"] == ["9024", "9025"]
+    assert sc["value_winner"]["exchange_id"] == "9026" and sc["value_winner"]["pair_exchange_id"] == "9027"
+    assert sc["value_loser"]["exchange_id"] == "9028" and sc["value_loser"]["drop_at"] == T0 + 90 * MIN
+    assert sc["basket_triple"]["exchange_ids"] == ["9030", "9031", "9032"]
+    assert sc["liquidity_hole"]["exchange_id"] == "9033" and sc["liquidity_hole"]["start"] == T0 + 20 * MIN
+    assert sc["settles_live"]["exchange_id"] == "9034" and sc["settles_live"]["settles_at"] == T0 + 40 * MIN
+    assert sc["leading_feed"] == {"exchange_ids": list(LEADING), "lead_s": 900.0}
+
+
+def test_scenario_g_nevada_no_basket(paper_demo: SimpleNamespace) -> None:
+    pair = ["9024", "9025"]
+    before = _at(paper_demo, 1, pair)
+    assert sum(b for b, _ in before.values()) <= 1.0 + 1e-9  # outside the window the pair adds up
+    for minutes in (5, 12, 20, 29):
+        q = _at(paper_demo, minutes, pair)
+        assert 1.04 - 1e-9 <= sum(b for b, _ in q.values()) <= 1.06 + 1e-9, minutes  # YES bids above 1: buy both NOs
+    for minutes in (45, 60, 120):
+        q = _at(paper_demo, minutes, pair)
+        assert sum(a for _, a in q.values()) <= 1.01 + 1e-9, minutes  # the NO basket can be sold back at a profit
+
+
+def test_scenario_h_texas_value_winner(paper_demo: SimpleNamespace) -> None:
+    mids = {}
+    for minutes in (10, 60, 120, 180):
+        q = _at(paper_demo, minutes, ["9026", "9027"])
+        mids[minutes] = (q["9026"][0] + q["9026"][1]) / 2
+        assert (q["9026"][0] + q["9026"][1]) / 2 + (q["9027"][0] + q["9027"][1]) / 2 == pytest.approx(1.0, abs=0.011)
+    assert mids[10] == pytest.approx(0.50, abs=0.006) and mids[180] == pytest.approx(0.575, abs=0.006)
+    assert mids[10] < mids[60] < mids[120] < mids[180]  # converges toward the outside 0.58
+    feed = paper_demo.market.fair_value_feed
+    for ts in (T0 - 2 * HOUR + 60, T0, T0 + 3 * HOUR):
+        assert feed("9026", ts) == pytest.approx(0.58) and feed("9027", ts) == pytest.approx(0.42)
+
+
+def test_scenario_i_iowa_value_loser(paper_demo: SimpleNamespace) -> None:
+    q5, q89 = _at(paper_demo, 5, ["9028"]), _at(paper_demo, 89, ["9028"])
+    assert sum(q5["9028"]) / 2 == pytest.approx(0.38, abs=0.006)
+    assert sum(q89["9028"]) / 2 == pytest.approx(0.33, abs=0.006)  # drifted away from the outside price
+    feed = paper_demo.market.fair_value_feed
+    assert feed("9028", T0) == pytest.approx(0.46) and feed("9028", T0 + 89 * MIN) == pytest.approx(0.46)
+    assert feed("9028", T0 + 91 * MIN) == pytest.approx(0.30)  # the outside price was wrong: it drops below the bid
+    assert feed("9029", T0) == pytest.approx(0.54) and feed("9029", T0 + 91 * MIN) == pytest.approx(0.70)
+
+
+def test_scenario_j_nebraska_three_leg_no_basket(paper_demo: SimpleNamespace) -> None:
+    triple = ["9030", "9031", "9032"]
+    for minutes in (30, 59, 81):
+        assert sum(b for b, _ in _at(paper_demo, minutes, triple).values()) < 1.0
+    for minutes in (61, 70, 79):
+        assert sum(b for b, _ in _at(paper_demo, minutes, triple).values()) >= 1.03 - 1e-9, minutes
+
+
+def test_scenario_k_wyoming_liquidity_hole(paper_demo: SimpleNamespace) -> None:
+    before = _at(paper_demo, 19, ["9033"])["9033"]
+    assert before == pytest.approx((0.925, 0.935))
+    paper_demo.off.now = 21 * MIN
+    book = paper_demo.client.get_exchange_orderbook("9033", depth=5, tournament_id=TID)
+    assert book["bids"][0]["price"] <= 0.65  # the hole: the best bid is far below the 0.93 mid
+    paper_demo.off.now = 30 * MIN
+    tape = paper_demo.client.get_trades("9033", tournament_id=TID, start=iso(T0 + 20 * MIN), end=iso(T0 + 20 * MIN + 21),
+                                        limit=200)["data"]
+    hole = [t for t in tape if t["side"] == "NO" and t["size"] == 100]
+    assert len(hole) == 12
+    prices = [t["price"] for t in sorted(hole, key=lambda t: t["createdAt"])]
+    assert prices[0] == pytest.approx(0.925) and min(prices) == pytest.approx(0.62)
+    assert prices == sorted(prices, reverse=True)  # they walk down the bids
+    after = _at(paper_demo, 27, ["9033"])["9033"]
+    assert sum(after) / 2 == pytest.approx(0.93, abs=0.011)  # recovered by T0 + 26 min
+
+
+def test_scenario_l_maine_debate_settles_live(paper_demo: SimpleNamespace) -> None:
+    early = _at(paper_demo, 10, ["9034"])["9034"]
+    late = _at(paper_demo, 39, ["9034"])["9034"]
+    assert sum(early) / 2 == pytest.approx(0.85, abs=0.011) and sum(late) / 2 >= 0.94
+    paper_demo.off.now = 41 * MIN
+    quotes, missing = _quotes(paper_demo.client, ["9034", "9033"])
+    assert "9034" in missing and "9034" not in quotes and "9033" in quotes
+    settled = {m["id"]: m for m in paper_demo.client.list_tournament_markets(DEMO_SLUG, status="settled", limit=100)["data"]}
+    assert settled["326"]["status"] == "settled" and settled["326"]["settledWith"] == "YES"
+    assert epoch(settled["326"]["settledOn"]) == T0 + 40 * MIN
+    open_ids = {m["id"] for m in paper_demo.client.list_tournament_markets(DEMO_SLUG, status="open", limit=100)["data"]}
+    assert "326" not in open_ids and "325" in open_ids
+    paper_demo.off.now = 39 * MIN
+    open_ids = {m["id"] for m in paper_demo.client.list_tournament_markets(DEMO_SLUG, status="open", limit=100)["data"]}
+    assert "326" in open_ids
+
+
+def test_demo_fair_value_provider(paper_demo: SimpleNamespace) -> None:
+    provider = demo_mod.DemoFairValueProvider(paper_demo.market)
+    assert provider.name == "demo"
+    targets = [str(9001 + i) for i in range(34)]
+    result = provider.refresh(targets, T0)
+    assert (result.venue, result.status, result.requests) == ("demo", "ok", 0)
+    assert set(result.quotes) == set(SCRIPTED_FEED) | set(LEADING)  # nothing else has an outside price
+    for eid, value in SCRIPTED_FEED.items():
+        q = result.quotes[eid]
+        assert q.last == pytest.approx(value) and q.bid == pytest.approx(value - 0.005) and q.ask == pytest.approx(value + 0.005)
+        assert (q.venue, q.external_id, q.match_kind, q.match_confidence, q.fetched_at) == ("demo", f"demo:{eid}", "EXACT", 1.0, T0)
+    for now in (T0, T0 + 30 * MIN, T0 + 91 * MIN):
+        quotes = provider.refresh(targets, now).quotes
+        for eid in LEADING:  # the outside price LEADS the Cup: it is the Cup's own mid 15 minutes later (D37)
+            assert quotes[eid].last == pytest.approx(paper_demo.market.mid_at(eid, now + 900))
+    again = demo_mod.DemoFairValueProvider(make_market()).refresh(targets, T0 + 91 * MIN)
+    assert {k: v.to_dict() for k, v in again.quotes.items()} == {
+        k: v.to_dict() for k, v in provider.refresh(targets, T0 + 91 * MIN).quotes.items()}  # deterministic
+    assert provider.refresh(targets, T0 + 91 * MIN).quotes["9028"].last == pytest.approx(0.30)
+    provider.close()
+
+
+def test_leaderboard_bar_for_the_chaser(api: SuperMarketClient) -> None:
+    from supermarket_bot.tracker import leaderboard_value
+
+    board = api.get_tournament_leaderboard(DEMO_SLUG, limit=100)
+    top = board["leaderboard"][:3]
+    assert [(r["rank"], r["username"], r["pnl"]) for r in top] == [
+        (1, "election_whale", 185_000.0), (2, "polls_gambler", 142_000.0), (3, "longshot_lucy", 121_500.0)]
+    values = tuple(leaderboard_value(r, 100_000.0) for r in top)
+    assert values == demo_mod.DEMO_LEADER_VALUES
+    assert values[2] / 100_000.0 == pytest.approx(demo_mod.DEMO_CHASER_M)
+    try:
+        from supermarket_bot.models import LeaderboardSnapshot
+        from supermarket_bot.sizing import estimate_bar
+
+        snap = LeaderboardSnapshot(at=T0, entries=[{"rank": r["rank"], "username": r["username"], "pnl": r["pnl"],
+                                                    "value": leaderboard_value(r, 100_000.0)} for r in board["leaderboard"]],
+                                   initial_balance=100_000.0)
+        bar = estimate_bar(snap, [], 100_000.0, 33.0)
+    except NotImplementedError:  # package B not merged yet: the published constants above are what F relies on
+        return
+    assert bar.third_value == pytest.approx(demo_mod.DEMO_BAR) and bar.value == pytest.approx(demo_mod.DEMO_BAR)
+
+
+def test_sim_clock_and_no_wait() -> None:
+    import threading
+
+    from supermarket_bot.ratelimit import SlidingWindowLimiter
+
+    clock = demo_mod.SimClock(1000.0)
+    assert clock() == 1000.0 and clock.now == 1000.0
+    assert clock.advance(30) == 1030.0 and clock() == 1030.0
+    clock.set(5000.0)
+    assert clock() == 5000.0
+    workers = [threading.Thread(target=lambda: [clock.advance(1) for _ in range(1000)]) for _ in range(4)]
+    for w in workers:
+        w.start()
+    for w in workers:
+        w.join(10)
+    assert clock() == 9000.0  # advance is atomic
+    demo_mod.no_wait(0.0)
+    demo_mod.no_wait(-1.0)
+    with pytest.raises(demo_mod.SimClockStall) as caught:
+        demo_mod.no_wait(1.2)
+    assert str(caught.value) == "A fast simulation tried to wait 1.2 s for a rate limiter: raise its demo budget"
+    limiter = SlidingWindowLimiter(2, clock=clock, sleep=demo_mod.no_wait)
+    limiter.acquire()
+    limiter.acquire()
+    with pytest.raises(demo_mod.SimClockStall):
+        limiter.acquire()  # a third read inside the simulated minute would have to wait: loud, deterministic
+    clock.advance(61)
+    limiter.acquire()

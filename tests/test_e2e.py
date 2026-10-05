@@ -1,7 +1,8 @@
 """End-to-end browser tests of the dashboard UI (Playwright via node).
 
-Runs ``tests/e2e/ui_smoke.cjs`` (every view, the drawer, themes, outages, phone layout, hostile
-data) and ``tests/e2e/regressions.cjs`` (one check per UI bug fixed after QA, named after its id)
+Runs ``tests/e2e/ui_smoke.cjs`` (every view including the Simulation view, the drawer, themes, outages,
+phone layout, hostile data) and ``tests/e2e/regressions.cjs`` (one check per UI bug fixed after QA, named
+after its id, plus the Simulation view's states on ``page.route()`` fixtures)
 against ``tests/e2e/serve_demo.py`` (the simulated market: no API key, no network). Both are
 skipped when node or the Playwright package is not installed. Screenshots go to a temporary
 folder here; run ``node tests/e2e/ui_smoke.cjs`` directly to refresh ``docs/screenshots/``.
@@ -90,7 +91,7 @@ def test_dashboard_ui_smoke(tmp_path: Path) -> None:
     assert done.returncode == 0, "UI smoke test failed:\n" + output[-8000:]
     assert "all checks passed" in done.stdout, output[-8000:]
     shots = sorted(p.name for p in Path(env["E2E_SCREENSHOT_DIR"]).glob("*.png"))
-    for view in ("overview", "markets", "surges", "high", "strategy", "drawer"):
+    for view in ("overview", "markets", "surges", "high", "strategy", "sim", "drawer"):
         for theme in ("light", "dark"):
             assert f"{view}-{theme}.png" in shots, shots
     assert "mobile-390.png" in shots, shots

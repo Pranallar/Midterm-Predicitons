@@ -37,6 +37,26 @@ Scripted events (``t0`` = demo start)
 * (e) one ALL constraint violation (the Senate-control outcomes sum to 1.03).
 * (f) a live participant-style surge on the Michigan Senate market at ``t0 + 90s``.
 
+Paper-trading scenarios (docs/PAPER_TRADING.md §7.6; markets 316-326, exchanges 9024-9034, titles in the
+real Cup grammar so the race matcher is exercised):
+
+* (g) a NO basket on the Nevada Governor pair: the two YES bids sum to 1.05 over ``[t0 + 4m, t0 + 30m]``,
+  and from ``t0 + 45m`` the YES asks sum to 1.00 (the set can be sold at a profit);
+* (h) a value winner on the Texas Senate pair: an outside fair value of 0.58 while the Cup trades at 0.50,
+  converging linearly to 0.575 over ``[t0 + 10m, t0 + 3h]``;
+* (i) a value loser on the Iowa Senate pair: the outside price says 0.46 but the Cup drifts from 0.38 to
+  0.33, and at ``t0 + 90m`` the outside price drops to 0.30 (it was wrong);
+* (j) a 3-leg NO basket on the Nebraska Senate (D, R and Independent legs): bids sum above 1.03 over
+  ``[t0 + 60m, t0 + 80m]``;
+* (k) a liquidity hole on the Wyoming Governor: 12 sell prints walk the bid from 0.925 down to 0.62 within
+  20 seconds at ``t0 + 20m``; the price is back at 0.93 by ``t0 + 26m``;
+* (l) a market that settles live: the Maine Senate debate market rises to 0.97 and settles YES at
+  ``t0 + 40m`` (it then leaves the open list and the bulk prices).
+
+:class:`DemoFairValueProvider` serves the scripted outside prices (and, for the liquid Michigan, Georgia,
+North Carolina and Maine Senate markets, an outside price that LEADS the Cup by 15 minutes, D37).
+:class:`SimClock` and :func:`no_wait` make fast simulated runs deterministic (D42).
+
 Read-only: order endpoints are not simulated (they return 404 like any unknown route).
 """
 
@@ -60,7 +80,7 @@ import httpx
 from .books import parse_time
 from .bot import Context
 from .client import SuperMarketClient
-from .models import Article
+from .models import Article, FairValueQuote
 from .news import NewsProvider
 
 log = logging.getLogger("supermarket_bot")
@@ -100,6 +120,29 @@ _PNL_PERIOD_DAYS = {"day": 1, "week": 7, "month": 30, "quarter": 90, "year": 365
 _OCTAVES = ((2 * DAY, 0.030), (6 * HOUR, 0.015), (45 * MIN, 0.008), (5 * MIN, 0.004))
 _JITTER = 0.002
 _BLOCK_CACHE_MAX = 60000
+
+# Fast simulated runs (``paper --demo --fast``, ``backtest --demo``, tests) start at this fixed time, so two
+# runs give identical results whatever the wall clock says (D42): 2026-10-05T14:00:00Z.
+SIM_T0 = 1_791_208_800.0
+
+# --------------------------------------------------------------------------- published demo constants (D61)
+# Package F hard-codes these in its e2e checks; tests/test_demo.py asserts them.
+PAPER_MARKET_IDS: Tuple[str, ...] = tuple(str(316 + i) for i in range(11))  # 316-326
+PAPER_EXCHANGE_IDS: Tuple[str, ...] = tuple(str(9024 + i) for i in range(11))  # 9024-9034
+DEMO_TOP_MEMBERS: Tuple[Tuple[str, float], ...] = (
+    ("election_whale", 185_000.0), ("polls_gambler", 142_000.0), ("longshot_lucy", 121_500.0),
+)
+DEMO_LEADER_VALUES: Tuple[float, ...] = (285_000.0, 242_000.0, 221_500.0)  # initial 100,000 + pnl
+DEMO_BAR = 221_500.0  # the top-3 bar
+DEMO_CHASER_M = 2.215  # bar / 100,000: the chaser runs in "chase" mode
+DEMO_PORTFOLIO_IDS: Tuple[str, ...] = (
+    "human:conservative", "policy:conservative", "policy:chaser", "kind:value", "kind:basket", "kind:hole",
+    "kind:fade", "kind:carry", "kind:arbitrage",
+)
+DEMO_HEADLINE = "human:conservative"
+FEED_LEAD_S = 15 * 60.0  # the leading outside feed is the Cup's own mid this much later (D37)
+FEED_LEADING_KEYS = ("mi-senate", "ga-senate", "nc-senate", "me-senate")  # exchanges 9003-9006
+DEMO_FEED_HALF_SPREAD = 0.005  # demo quotes: feed -/+ this (their uncertainty)
 
 
 # --------------------------------------------------------------------------- helpers
@@ -176,6 +219,43 @@ def _read_cursor(raw: Optional[str], kind: str) -> Optional[int]:
         return int(value)
     except (ValueError, UnicodeError, binascii.Error):
         raise _Fail(400, "INVALID_CURSOR", "Invalid or expired pagination cursor") from None
+
+
+class SimClockStall(RuntimeError):
+    """A fast simulation tried to wait for a rate limiter (its budget is too small for the per-step demand)."""
+
+
+class SimClock:
+    """A thread-safe fake clock for fast, deterministic simulations (D42): a callable returning the
+    simulated time, moved only by :meth:`advance` and :meth:`set`."""
+
+    def __init__(self, start: float) -> None:
+        self._now = float(start)
+        self._lock = threading.Lock()
+
+    def __call__(self) -> float:
+        with self._lock:
+            return self._now
+
+    @property
+    def now(self) -> float:
+        return self()
+
+    def advance(self, seconds: float) -> float:
+        with self._lock:
+            self._now += float(seconds)
+            return self._now
+
+    def set(self, ts: float) -> None:
+        with self._lock:
+            self._now = float(ts)
+
+
+def no_wait(seconds: float) -> None:
+    """The ``sleep`` of every limiter in a fast simulation: waiting would make results depend on CPU speed,
+    so any positive wait raises :class:`SimClockStall` instead."""
+    if seconds > 0:
+        raise SimClockStall(f"A fast simulation tried to wait {seconds:.1f} s for a rate limiter: raise its demo budget")
 
 
 class _Fail(Exception):
@@ -256,6 +336,7 @@ _LIQUIDITY = {
     "thin": _Liquidity(0.5, 6, 30.0, 0.85, 0.45, 1.5, (5, 40)),
     "band": _Liquidity(0.4, 2, 650.0, 0.9, 0.0, 3.0, (20, 300)),
     "multi": _Liquidity(0.6, 2, 220.0, 0.86, 0.05, 5.0, (10, 120)),
+    "deep": _Liquidity(0.5, 2, 900.0, 0.92, 0.0, 10.0, (20, 200)),
 }
 
 # (key, title, liquidity, settlement date, [(option, base price)], options)
@@ -296,6 +377,30 @@ _MARKET_SPECS: List[Tuple[str, str, str, str, List[Tuple[str, float]], Dict[str,
       "note": "Settles on state certification."}),
     ("ga-debate", "Will the Georgia Senate candidates hold a televised debate?", "medium", "",
      [("YES", 0.80)], {"office": "U.S. Senate", "jurisdiction": "Georgia", "settled": "YES"}),
+    # ---- paper-trading scenarios (g)-(l), appended so the ids above never change (316+ / 9024+) ----
+    ("nv-gov-d", "Will the Democratic Party win the Nevada Governor?", "medium", CUP_END,
+     [("YES", 0.50)], {"office": "Governor", "jurisdiction": "Nevada", "party": "Democratic", "vol": 0.15}),
+    ("nv-gov-r", "Will the Republican Party win the Nevada Governor?", "medium", CUP_END,
+     [("YES", 0.50)], {"office": "Governor", "jurisdiction": "Nevada", "party": "Republican", "mirror": "nv-gov-d"}),
+    ("tx-sen-d", "Will the Democratic Party win the Texas Senate?", "liquid", CUP_END,
+     [("YES", 0.50)], {"office": "U.S. Senate", "jurisdiction": "Texas", "party": "Democratic", "vol": 0.10}),
+    ("tx-sen-r", "Will the Republican Party win the Texas Senate?", "liquid", CUP_END,
+     [("YES", 0.50)], {"office": "U.S. Senate", "jurisdiction": "Texas", "party": "Republican", "mirror": "tx-sen-d"}),
+    ("ia-sen-d", "Will the Democratic Party win the Iowa Senate?", "medium", CUP_END,
+     [("YES", 0.38)], {"office": "U.S. Senate", "jurisdiction": "Iowa", "party": "Democratic", "vol": 0.10}),
+    ("ia-sen-r", "Will the Republican Party win the Iowa Senate?", "medium", CUP_END,
+     [("YES", 0.62)], {"office": "U.S. Senate", "jurisdiction": "Iowa", "party": "Republican", "mirror": "ia-sen-d"}),
+    ("ne-sen-d", "Will the Democratic Party win the Nebraska Senate?", "thin", CUP_END,
+     [("YES", 0.03)], {"office": "U.S. Senate", "jurisdiction": "Nebraska", "party": "Democratic", "vol": 0.0}),
+    ("ne-sen-r", "Will the Republican Party win the Nebraska Senate?", "medium", CUP_END,
+     [("YES", 0.66)], {"office": "U.S. Senate", "jurisdiction": "Nebraska", "party": "Republican", "vol": 0.0}),
+    ("ne-sen-i", "Will the Independent Party win the Nebraska Senate?", "medium", CUP_END,
+     [("YES", 0.31)], {"office": "U.S. Senate", "jurisdiction": "Nebraska", "party": "Independent", "vol": 0.0}),
+    ("wy-gov-r", "Will the Republican Party win the Wyoming Governor?", "deep", CUP_END,
+     [("YES", 0.93)], {"office": "Governor", "jurisdiction": "Wyoming", "party": "Republican", "vol": 0.30}),
+    ("me-debate", "Will the Maine Senate candidates debate before October 7?", "medium", "",
+     [("YES", 0.85)], {"office": "U.S. Senate", "jurisdiction": "Maine", "vol": 0.10, "settles_live": 40 * MIN,
+                       "settled": "YES"}),
 ]
 
 # Members of the demo leaderboard besides the demo user (deterministic per seed).
@@ -395,6 +500,9 @@ class _Exchange:
     liq: _Liquidity
     market: "_Market" = field(repr=False)
     yes_bias: float = 0.0
+    # The other leg of a two-party race: this outcome's unscripted fair value is 1 - the mirror's (so the
+    # pair sums to 1 outside its scripted windows).
+    mirror: Optional["_Exchange"] = field(default=None, repr=False)
     knot_times: List[float] = field(default_factory=list)
     knot_values: List[float] = field(default_factory=list)
     scripted: List[Tuple[float, str, int]] = field(default_factory=list)
@@ -443,7 +551,14 @@ class _Market:
 
     @property
     def status(self) -> str:
+        """Whether the market ever settles in this simulation (use :meth:`status_at` for a given time)."""
         return "settled" if self.settled_at is not None else "open"
+
+    def is_settled(self, now: float) -> bool:
+        return self.settled_at is not None and now >= self.settled_at
+
+    def status_at(self, now: float) -> str:
+        return "settled" if self.is_settled(now) else "open"
 
 
 # --------------------------------------------------------------------------- the simulated API
@@ -452,18 +567,21 @@ class _Market:
 class DemoMarket:
     """A deterministic, offline simulation of one Predictions Cup tournament.
 
-    ``now`` pins the demo start ``t0`` (default: ``clock()`` at construction); after that
-    the demo's current time advances with ``clock``: ``now() = t0 + clock() - clock_at_start``.
-    So with the default arguments the demo runs in real time, and with an injected fake
-    clock every request sees the fake time. The same ``seed`` and ``now`` give identical
-    data.
+    ``now`` pins the demo's time at construction (default: ``clock()``); after that the demo's
+    current time advances with ``clock``: ``now() = now + clock() - clock_at_start``. So with the
+    default arguments the demo runs in real time, and with an injected fake clock every request
+    sees the fake time. ``start`` is the scripted start ``t0`` (default: ``now``): a demo rebuilt
+    on a kept database passes the original start so its scripted events continue where they were
+    (docs/PAPER_TRADING.md D47). The same ``seed`` and ``start`` give identical data.
     """
 
-    def __init__(self, seed: int = 7, now: Optional[float] = None, clock: Callable[[], float] = time.time) -> None:
+    def __init__(self, seed: int = 7, now: Optional[float] = None, clock: Callable[[], float] = time.time, *,
+                 start: Optional[float] = None) -> None:
         self.seed = int(seed)
         self._clock = clock
         self._clock_start = float(clock())
-        self.t0 = float(now) if now is not None else self._clock_start
+        self._origin = float(now) if now is not None else self._clock_start  # the demo's time at construction
+        self.t0 = float(start) if start is not None else self._origin
         self.history_start = math.floor((self.t0 - HISTORY_DAYS * DAY) / HOUR) * HOUR
         self.tournament_id = DEMO_TOURNAMENT_ID
         self.slug = DEMO_SLUG
@@ -487,7 +605,7 @@ class DemoMarket:
 
     def now(self) -> float:
         """The demo's current time (epoch seconds)."""
-        return self.t0 + (float(self._clock()) - self._clock_start)
+        return self._origin + (float(self._clock()) - self._clock_start)
 
     def transport(self) -> httpx.MockTransport:
         """An ``httpx`` transport that answers like the Super Market API (``/api/v1`` paths)."""
@@ -531,7 +649,13 @@ class DemoMarket:
             )
             vol_scale = details.pop("vol", 1.0)
             settled = details.pop("settled", None)
-            if settled:
+            settles_live = details.pop("settles_live", None)
+            mirror_key = details.pop("mirror", None)
+            if settled and settles_live is not None:
+                market.settled_at = self.t0 + float(settles_live)  # settles during the run (scenario l)
+                market.settled_with = settled
+                market.settlement_date = _iso(market.settled_at)
+            elif settled:
                 market.settled_at = math.floor((self.t0 - 2 * DAY) / MIN) * MIN
                 market.settled_with = settled
                 market.settlement_date = _iso(market.settled_at)
@@ -546,6 +670,8 @@ class DemoMarket:
                     ex.initial_price = _tick(base)
                 if liq_name == "band":
                     ex.yes_bias = 0.15 if base >= 0.5 else -0.15
+                if mirror_key:
+                    ex.mirror = self._by_key[mirror_key].exchanges[0]
                 market.exchanges.append(ex)
                 self.exchanges.append(ex)
                 self._exchange_by_id[ex.id] = ex
@@ -597,8 +723,41 @@ class DemoMarket:
         assert debate.settled_at is not None
         ex.set_knots([(self.history_start, 0.0), (debate.settled_at - DAY, 0.06), (debate.settled_at - 2 * HOUR, 0.185)])
 
+        self._script_paper_events(rng)
+
         for ex in self.exchanges:
             ex.scripted.sort()
+
+    def _script_paper_events(self, rng: random.Random) -> None:
+        """Scenarios (g)-(l) for the paper trader (docs/PAPER_TRADING.md §7.6)."""
+        t0 = self.t0
+
+        def ex_of(key: str) -> _Exchange:
+            return self._by_key[key].exchanges[0]
+
+        # (g) Nevada Governor pair: both legs +0.035 over [t0+4m, t0+30m] (YES bids sum 1.05: a NO basket),
+        # then from t0+45m both -0.01 (YES asks sum 1.00: the set sells at a profit).
+        for key in ("nv-gov-d", "nv-gov-r"):
+            ex_of(key).set_knots([(t0 + 3 * MIN, 0.0), (t0 + 4 * MIN, 0.035), (t0 + 30 * MIN, 0.035),
+                                  (t0 + 33 * MIN, 0.0), (t0 + 42 * MIN, 0.0), (t0 + 45 * MIN, -0.01)])
+        # (h) Texas Senate: the Cup converges from 0.50 toward the outside 0.58, reaching 0.575 at t0+3h.
+        ex_of("tx-sen-d").set_knots([(t0 + 10 * MIN, 0.0), (t0 + 3 * HOUR, 0.075)])
+        ex_of("tx-sen-r").set_knots([(t0 + 10 * MIN, 0.0), (t0 + 3 * HOUR, -0.075)])
+        # (i) Iowa Senate: the Cup drifts away from the (wrong) outside price, 0.38 -> 0.33 by t0+90m.
+        ex_of("ia-sen-d").set_knots([(t0 + 5 * MIN, 0.0), (t0 + 90 * MIN, -0.05)])
+        ex_of("ia-sen-r").set_knots([(t0 + 5 * MIN, 0.0), (t0 + 90 * MIN, 0.05)])
+        # (j) Nebraska Senate triple: the Independent leg +0.075 over [t0+60m, t0+80m] (bids sum 1.035).
+        ex_of("ne-sen-i").set_knots([(t0 + 59 * MIN, 0.0), (t0 + 60 * MIN, 0.075), (t0 + 80 * MIN, 0.075),
+                                     (t0 + 81 * MIN, 0.0)])
+        # (k) Wyoming Governor liquidity hole: the mid falls 0.93 -> 0.625 within 20 s at t0+20m (12 sell
+        # prints of 100 walk the bid down to 0.62), stays there until t0+23m and is back by t0+26m.
+        wy = ex_of("wy-gov-r")
+        hole = t0 + 20 * MIN
+        wy.set_knots([(hole, 0.0), (hole + 20.0, -0.305), (t0 + 23 * MIN, -0.305), (t0 + 26 * MIN, 0.0)])
+        for i in range(12):
+            wy.scripted.append((hole + i * 20.0 / 11.0, "NO", 100))
+        # (l) Maine Senate debate: rises to ~0.97 over [t0+20m, t0+40m] and settles YES at t0+40m.
+        ex_of("me-debate").set_knots([(t0 + 20 * MIN, 0.0), (t0 + 40 * MIN, 0.12)])
 
     def _build_relationships(self) -> List[Dict[str, Any]]:
         senate = self._by_key["senate-control"]
@@ -626,6 +785,18 @@ class DemoMarket:
                 "volume": round(rng.uniform(20000.0, 400000.0), 2),
                 "winRate": None if rng.random() < 0.1 else round(rng.uniform(35.0, 75.0), 1),
                 "factors": {p: rng.uniform(lo, hi) for p, (lo, hi) in sorted(_LEADERBOARD_FACTORS.items())},
+            })
+        # Three far-ahead leaders (§7.6): their all-time values set the top-3 bar at 221,500, so a 100,000
+        # portfolio is "behind" (M = 2.215) and the chaser runs in its chase mode.
+        for i, (handle, pnl) in enumerate(DEMO_TOP_MEMBERS):
+            members.append({
+                "profileId": _uuid(self.seed, 14, i),
+                "username": handle,
+                "pnl": pnl,
+                "tradesCount": (612, 455, 389)[i],
+                "volume": (2_400_000.0, 1_900_000.0, 1_650_000.0)[i],
+                "winRate": (61.5, 57.2, 49.8)[i],
+                "factors": {"1d": 0.01, "7d": 0.25, "30d": 0.9, "quarter": 1.0, "all": 1.0},
             })
         return members
 
@@ -674,7 +845,72 @@ class DemoMarket:
             "arbitrage_market_id": self._by_key["az-governor"].id,
             "violation_relationship_id": self._relationships[0]["id"],
             "settled_market_id": self._by_key["ga-debate"].id,
+            # paper-trading scenarios (g)-(l), docs/PAPER_TRADING.md §7.6
+            "basket_pair": {"exchange_ids": [self._by_key[k].exchanges[0].id for k in ("nv-gov-d", "nv-gov-r")],
+                            "market_ids": [self._by_key[k].id for k in ("nv-gov-d", "nv-gov-r")],
+                            "start": self.t0 + 4 * MIN, "end": self.t0 + 30 * MIN, "bid_sum": 1.05,
+                            "exit_from": self.t0 + 45 * MIN, "ask_sum_after": 1.00},
+            "value_winner": {**ref("tx-sen-d"), "pair_exchange_id": self._by_key["tx-sen-r"].exchanges[0].id,
+                             "fair_value": 0.58, "converge_start": self.t0 + 10 * MIN, "converge_end": self.t0 + 3 * HOUR,
+                             "mid_from": 0.50, "mid_to": 0.575},
+            "value_loser": {**ref("ia-sen-d"), "pair_exchange_id": self._by_key["ia-sen-r"].exchanges[0].id,
+                            "fair_value": 0.46, "fair_value_after": 0.30, "drop_at": self.t0 + 90 * MIN,
+                            "mid_from": 0.38, "mid_to": 0.33},
+            "basket_triple": {"exchange_ids": [self._by_key[k].exchanges[0].id for k in ("ne-sen-d", "ne-sen-r", "ne-sen-i")],
+                              "market_ids": [self._by_key[k].id for k in ("ne-sen-d", "ne-sen-r", "ne-sen-i")],
+                              "start": self.t0 + 60 * MIN, "end": self.t0 + 80 * MIN, "bid_sum_min": 1.03},
+            "liquidity_hole": {**ref("wy-gov-r"), "start": self.t0 + 20 * MIN, "prints": 12, "print_size": 100,
+                               "low_bid": 0.62, "recovered_by": self.t0 + 26 * MIN, "fair_value": 0.94},
+            "settles_live": {**ref("me-debate"), "settles_at": self.t0 + 40 * MIN, "settled_with": "YES",
+                             "fair_value": 0.99},
+            "leading_feed": {"exchange_ids": [self._by_key[k].exchanges[0].id
+                                              for k in ("mi-senate", "ga-senate", "nc-senate", "me-senate")],
+                             "lead_s": FEED_LEAD_S},
         }
+
+    # ------------------------------------------------------------------ outside fair values (scripted)
+
+    def fair_value_feed(self, exchange_id: str, ts: float) -> Optional[float]:
+        """The demo's outside YES fair value of an outcome at ``ts`` (None: no outside market prices it).
+
+        Pure in (seed, exchange, ts). Scripted outcomes follow §7.6; the liquid Michigan, Georgia, North
+        Carolina and Maine Senate markets get an outside price that LEADS the Cup by ``FEED_LEAD_S`` (the
+        Cup's own mid 15 minutes later): the hypothesis that the Cup lags outside prices, by design."""
+        eid = str(exchange_id)
+        ex = self._exchange_by_id.get(eid)
+        if ex is None:
+            return None
+        key = ex.market.key
+        t0 = self.t0
+
+        def mid(at: float) -> Optional[float]:
+            quote = self._quote(ex, at)
+            return quote[0] if quote else None
+
+        if key in FEED_LEADING_KEYS:
+            return mid(ts + FEED_LEAD_S)
+        if key in ("nv-gov-d", "nv-gov-r"):
+            return 0.50
+        if key == "tx-sen-d":
+            return 0.58 if ts >= t0 - 2 * HOUR else mid(ts)
+        if key == "tx-sen-r":
+            return 0.42 if ts >= t0 - 2 * HOUR else mid(ts)
+        if key in ("ia-sen-d", "ia-sen-r"):
+            if ts < t0 - HOUR:
+                return mid(ts)
+            d = 0.46 if ts < t0 + 90 * MIN else 0.30
+            return d if key == "ia-sen-d" else round(1.0 - d, 6)
+        if key == "ne-sen-d":
+            return 0.02
+        if key == "ne-sen-r":
+            return 0.67
+        if key == "ne-sen-i":
+            return 0.31
+        if key == "wy-gov-r":
+            return 0.94
+        if key == "me-debate":
+            return 0.99 if ts >= t0 else mid(ts)
+        return None
 
     # ------------------------------------------------------------------ price model
 
@@ -698,16 +934,20 @@ class DemoMarket:
             total += amp * (a + (self._node(j, octave, k + 1) - a) * f)
         return total + _JITTER * (2.0 * _unit(self.seed, 2, j, minute) - 1.0)
 
-    def _fair(self, ex: _Exchange, ts: float) -> float:
-        """Unrounded YES fair value at ``ts``."""
+    def _fair_raw(self, ex: _Exchange, ts: float) -> float:
+        """Unscripted, unclipped YES fair value at ``ts`` (base + noise; 1 - the mirror's for a race pair)."""
+        if ex.mirror is not None:
+            return 1.0 - self._fair_raw(ex.mirror, ts)
         minute = math.floor(ts / MIN)
         market = ex.market
         if market.target_sum is not None:
             weights = [max(0.004, e.base + e.amp * self._noise(e.index, minute)) for e in market.exchanges]
-            price = market.target_sum * weights[ex.slot] / sum(weights)
-        else:
-            price = ex.base + ex.amp * self._noise(ex.index, minute)
-        price += ex.offset(ts)
+            return market.target_sum * weights[ex.slot] / sum(weights)
+        return ex.base + ex.amp * self._noise(ex.index, minute)
+
+    def _fair(self, ex: _Exchange, ts: float) -> float:
+        """Unrounded YES fair value at ``ts``."""
+        price = self._fair_raw(ex, ts) + ex.offset(ts)
         return min(0.99, max(0.01, price))
 
     def _quote(self, ex: _Exchange, ts: float) -> Optional[Tuple[float, float, float]]:
@@ -865,15 +1105,18 @@ class DemoMarket:
 
     def _market_json(self, market: _Market, now: float, canonical: bool = True) -> Dict[str, Any]:
         latest = {ex.id: self._latest(ex, now) for ex in market.exchanges}
-        settled_on = _iso(market.settled_at) if market.settled_at is not None else None
+        settled = market.is_settled(now)
+        settled_on = _iso(market.settled_at) if settled and market.settled_at is not None else None
+        settled_with = market.settled_with if settled else None
+        status = market.status_at(now)
         out: Dict[str, Any] = {
             "id": market.id,
             "title": market.title,
             "thumbnailUrl": None,
-            "status": market.status,
+            "status": status,
             "createdAt": _iso(market.created_at),
             "settlementDate": market.settlement_date,
-            "settledWith": market.settled_with,
+            "settledWith": settled_with,
             "settledOn": settled_on,
             "categories": ["Election Outcome"],
             "isComposite": False,
@@ -886,8 +1129,8 @@ class DemoMarket:
         if canonical:
             out["contexts"] = [{
                 **self._context_descriptor(),
-                "status": market.status,
-                "settledWith": market.settled_with,
+                "status": status,
+                "settledWith": settled_with,
                 "settledOn": settled_on,
                 "exchanges": [{"id": ex.id, "latestPrice": latest[ex.id]} for ex in market.exchanges],
             }]
@@ -939,7 +1182,7 @@ class DemoMarket:
                 "marketId": market.id,
                 "marketTitle": market.title,
                 "option": ex.option,
-                "settled": market.settled_at is not None,
+                "settled": market.is_settled(now),
                 "quantity": qty,
                 "avgCost": avg,
                 "currentPrice": price,
@@ -1050,7 +1293,7 @@ class DemoMarket:
         search = params.get("search")
         if search is not None and len(search) > 200:
             raise _invalid("search", "must be at most 200 characters")
-        markets = [m for m in self.markets if status == "any" or m.status == status]
+        markets = [m for m in self.markets if status == "any" or m.status_at(now) == status]
         if search:
             needle = search.lower()
             markets = [m for m in markets if needle in m.title.lower()]
@@ -1282,8 +1525,8 @@ class DemoMarket:
                 continue
             seen.add(eid)
             ex = self._exchange_by_id.get(eid)
-            if ex is None:
-                missing.append(eid)
+            if ex is None or ex.market.is_settled(now):
+                missing.append(eid)  # unknown, or settled: no longer quoted by the bulk read
             else:
                 data.append(self._price_json(ex, now))
         return {"data": data, "missingIds": missing}
@@ -1530,6 +1773,44 @@ _ROUTES: List[Tuple[str, Any, str]] = [
         ("POST", "/realtime/token", "_post_realtime_token"),
     )
 ]
+
+
+# --------------------------------------------------------------------------- outside fair values
+
+
+class DemoFairValueProvider:
+    """The demo's outside fair-value provider (docs/PAPER_TRADING.md §4.9): one EXACT, fully confident quote
+    per scripted outcome (``DemoMarket.fair_value_feed``) with bid/ask = feed -/+ 0.005, fetched "now".
+    No HTTP (``requests`` 0); deterministic in (seed, exchange, now); never raises."""
+
+    name = "demo"
+
+    def __init__(self, market: DemoMarket) -> None:
+        self.market = market
+
+    def refresh(self, targets: Sequence[Any], now: float, *, deadline: Optional[float] = None) -> Any:
+        from .fairvalue import ProviderResult
+
+        quotes: Dict[str, FairValueQuote] = {}
+        try:
+            for target in targets:
+                eid = str(getattr(target, "exchange_id", target))
+                value = self.market.fair_value_feed(eid, float(now))
+                if value is None:
+                    continue
+                title = getattr(target, "title", "") or ""
+                quotes[eid] = FairValueQuote(
+                    venue="demo", external_id=f"demo:{eid}", label=f"Demo outside market: {title}".strip(),
+                    bid=round(max(0.0, value - DEMO_FEED_HALF_SPREAD), 6), ask=round(min(1.0, value + DEMO_FEED_HALF_SPREAD), 6),
+                    last=round(value, 6), fetched_at=float(now), match_kind="EXACT", match_confidence=1.0,
+                )
+        except Exception as exc:  # providers never raise
+            log.warning("demo fair-value feed failed: %s", exc)
+            return ProviderResult(venue="demo", status="error", errors=["The demo fair-value feed failed."])
+        return ProviderResult(venue="demo", status="ok", quotes=quotes, requests=0)
+
+    def close(self) -> None:
+        pass
 
 
 # --------------------------------------------------------------------------- news

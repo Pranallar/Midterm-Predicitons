@@ -10,9 +10,15 @@ import asyncio
 import csv
 import json
 import logging
+import math
+import os
+import shutil
 import sys
+import tempfile
+import time
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, TextIO
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, TextIO
 
 from . import __version__
 from .books import Book, books_from_market_orderbook, select_context
@@ -21,6 +27,7 @@ from .client import SuperMarketClient
 from .config import ConfigError, Settings, mask_key
 from .display import fmt_num, fmt_price, sparkline, table, truncate
 from .errors import ApiError, SuperMarketError, install_log_redaction
+from .models import POLICIES, REGIMES
 
 log = logging.getLogger("supermarket_bot")
 
@@ -116,7 +123,93 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--no-browser", action="store_true", help="do not open a browser tab")
     s.add_argument("--llm", action="store_true", help="also ask Claude to judge surges (needs ANTHROPIC_API_KEY; costs money)")
     s.add_argument("--no-news", action="store_true", help="do not search online news for surges")
+    s.add_argument("--no-paper", action="store_true", help="do not run the paper trader (the Simulation view)")
+    _fair_value_options(s)
+    _simulation_options(s)
+
+    s = sub.add_parser(
+        "paper",
+        help="simulate the strategy on live read-only data (paper trading, nothing is traded)",
+        description="Run the paper trader without the web server: simulated portfolios on live (or demo) read-only "
+                    "data, a summary every hour and an honest verdict at the end. Nothing is ever traded.",
+    )
+    s.add_argument("--hours", type=positive_float, default=24.0, help="target: hours of covered data (default 24)")
+    s.add_argument("--summary-every", type=positive_float, default=60.0, help="minutes between summaries (default 60)")
+    s.add_argument("--interval", type=float, default=30.0, help="seconds between price snapshots (default 30)")
+    s.add_argument("--reset", action="store_true", help="end the current simulation run and start a new one")
+    s.add_argument("--keep-running", action="store_true",
+                   help="do not end the run when --hours is reached (live: keep simulating until Ctrl-C)")
+    s.add_argument("--demo", action="store_true", help="simulate on the demo market (no API key; a temporary directory)")
+    s.add_argument("--fast", action="store_true", help="demo only: run on a simulated clock, as fast as the CPU allows")
+    s.add_argument("--step", type=positive_float, default=30.0, help="fast mode: simulated seconds per step (default 30)")
+    s.add_argument("--no-news", action="store_true", help="do not search online news for surges")
+    _fair_value_options(s)
+    _simulation_options(s)
+
+    s = sub.add_parser(
+        "backtest",
+        help="replay the stored history through the paper trader (offline, read-only)",
+        description="Replay the tracker's stored prices, books, trades and fair values through the same signals, "
+                    "sizing and fill model as the paper trader. Opens the database read-only; no API key needed.",
+    )
+    s.add_argument("--store", help="the tracker database (default data/<tournament>/tracker.sqlite3)")
+    s.add_argument("--hours", type=positive_float, default=None, help="window length in hours (default 24)")
+    s.add_argument("--since", help="window start (ISO-8601, UTC)")
+    s.add_argument("--until", help="window end (ISO-8601, UTC; default the newest stored price)")
+    s.add_argument("--step", type=positive_float, default=300.0, help="seconds between decisions (default 300)")
+    s.add_argument("--latency", type=nonnegative_float, default=60.0, help="seconds before a decision can fill (default 60)")
+    s.add_argument("--spread", type=nonnegative_float, default=0.02, help="assumed spread for candle-only quotes (default 0.02)")
+    s.add_argument("--touch-qty", type=positive_float, default=100.0, help="shares at the touch of a synthetic book (default 100)")
+    s.add_argument("--volume-share", type=positive_float, default=0.1, help="share of candle volume a fill may take (default 0.1)")
+    s.add_argument("--candle-cap", type=positive_float, default=50.0, help="shares per candle trade-through fill (default 50)")
+    s.add_argument("--no-books", action="store_true", help="ignore stored order-book snapshots")
+    s.add_argument("--no-fair-values", action="store_true", help="ignore recorded outside fair values")
+    s.add_argument("--no-history", action="store_true", help="ignore imported outside price history")
+    s.add_argument("--sweep", action="append", default=[], metavar="NAME=V1,V2",
+                   help="re-run with each value of a parameter (repeatable; exploratory only)")
+    s.add_argument("--latency-sweep", action="store_true", help="same as --sweep latency_s=30,120,300")
+    s.add_argument("--sizing", choices=list(POLICIES), default="conservative", help="sizing policy of the headline")
+    s.add_argument("--regime", choices=list(REGIMES), default=None,
+                   help="Cup end-settlement assumption (default SUPERMARKET_SETTLEMENT_REGIME or unknown)")
+    s.add_argument("--demo", action="store_true", help="first simulate the demo fast into a temporary directory, then replay it")
+    s.add_argument("--demo-hours", type=positive_float, default=6.0, help="--demo: hours to simulate first (default 6)")
+
+    s = sub.add_parser(
+        "fairvalue",
+        help="outside fair values (Polymarket, Kalshi, your file) matched to every outcome",
+        description="Read Polymarket and Kalshi anonymously (GET only) and your fair_values.json, match them to every "
+                    "open outcome and show the gaps. Nothing is traded.",
+    )
+    s.add_argument("--demo", action="store_true", help="use the demo market and its scripted outside prices (no API key)")
+    s.add_argument("--fair-value", choices=["auto", "manual"], default="auto",
+                   help="auto: outside venues and your file; manual: only data/<tournament>/fair_values.json")
+    s.add_argument("--template", action="store_true", help="write data/<tournament>/fair_values.json if it does not exist")
+    s.add_argument("--only-usable", action="store_true", help="only outcomes with a usable fair value")
+    s.add_argument("--show-override", metavar="EID", help="print the fair_value_map.json snippets for one outcome")
+    s.add_argument("--import-history", action="store_true",
+                   help="import outside price history into the tracker database for backtests (GET only)")
+    s.add_argument("--days", type=positive_float, default=7.0, help="--import-history: days to import (default 7)")
     return p
+
+
+def _fair_value_options(s: argparse.ArgumentParser) -> None:
+    s.add_argument("--fair-value", choices=["auto", "manual", "off"], default="auto",
+                   help="outside fair values: auto (Polymarket, Kalshi and your file; GET only, no account), "
+                        "manual (only data/<tournament>/fair_values.json) or off (default auto)")
+    s.add_argument("--no-fair-value", action="store_true", help="same as --fair-value off")
+
+
+def _simulation_options(s: argparse.ArgumentParser) -> None:
+    s.add_argument("--regime", choices=list(REGIMES), default=None,
+                   help="how the Cup settles unresolved markets at its end: unknown (default; or "
+                        "SUPERMARKET_SETTLEMENT_REGIME), resolved_outcomes or vwap_closeout")
+    s.add_argument("--sizing", choices=list(POLICIES), default="conservative",
+                   help="sizing of the Strategy view and of the simulation's headline (you, by hand): conservative "
+                        "(default) or chaser (goal-based, for catching up)")
+    s.add_argument("--all-collateral", action="store_true",
+                   help="assume D/R pairs share collateral (unknown; off by default)")
+    s.add_argument("--paper-capital", type=capital_amount, default=None,
+                   help="start capital of every simulated portfolio (default: your account value)")
 
 
 def _context_options(p: argparse.ArgumentParser, default: Any) -> None:
@@ -147,6 +240,37 @@ def _parser_with(common: argparse.ArgumentParser) -> Any:
 
 def positive_int(text: str) -> int:
     return bounded_int(1, None)(text)
+
+
+def _float_arg(text: str) -> float:
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a number, got {text!r}")
+    if not math.isfinite(value):
+        raise argparse.ArgumentTypeError(f"expected a finite number, got {text!r}")
+    return value
+
+
+def positive_float(text: str) -> float:
+    value = _float_arg(text)
+    if value <= 0:
+        raise argparse.ArgumentTypeError(f"must be > 0, got {text}")
+    return value
+
+
+def nonnegative_float(text: str) -> float:
+    value = _float_arg(text)
+    if value < 0:
+        raise argparse.ArgumentTypeError(f"must be >= 0, got {text}")
+    return value
+
+
+def capital_amount(text: str) -> float:
+    value = _float_arg(text)
+    if not (1 <= value <= 10_000_000):
+        raise argparse.ArgumentTypeError(f"must be between 1 and 10,000,000, got {text}")
+    return value
 
 
 def bounded_int(low: int, high: Optional[int]) -> Any:
@@ -562,6 +686,692 @@ class App:
         asyncio.run(run_stream())
 
 
+# --------------------------------------------------------------------------- simulation commands
+# ``paper``, ``backtest`` and ``fairvalue`` (docs/PAPER_TRADING.md §7.5). ``paper --demo``, ``fairvalue --demo`` and
+# every ``backtest`` need no API key. Exit codes: 0 ok, 1 API/OS errors, 2 usage/config errors and a lease
+# conflict (another process tracks the same database), 130 Ctrl-C. Every client is GET-only (readonly.py).
+
+EXIT_OK, EXIT_ERROR, EXIT_USAGE, EXIT_INTERRUPTED = 0, 1, 2, 130
+_HORIZON_LABELS = {"5m": "+5 min", "30m": "+30 min", "2h": "+2 h", "6h": "+6 h"}
+
+
+class UsageError(Exception):
+    """A command-line mistake (exit 2)."""
+
+
+def _say(stream: TextIO, lines: Sequence[str]) -> None:
+    for line in lines:
+        print(line, file=stream, flush=True)
+
+
+def _num(value: Any) -> Optional[float]:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    out = float(value)
+    return out if math.isfinite(out) else None
+
+
+def _utc_text(ts: Any) -> str:
+    value = _num(ts)
+    if value is None:
+        return "—"
+    return datetime.fromtimestamp(value, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def _signed(value: Any, fmt: str = "+.3f") -> str:
+    v = _num(value)
+    return format(v, fmt) if v is not None else "—"
+
+
+def _share(value: Any) -> str:
+    v = _num(value)
+    return f"{v:.0%}" if v is not None else "n/a"
+
+
+def _json_safe(payload: Any) -> Any:
+    """``payload`` as plain JSON (NaN/inf -> null, dataclasses -> dicts), like the dashboard sends it."""
+    from .web import encode_json
+
+    return json.loads(encode_json(payload).decode("utf-8"))
+
+
+def _dump_json(out: TextIO, payload: Any) -> None:
+    print(json.dumps(_json_safe(payload), indent=2, ensure_ascii=True, sort_keys=True), file=out, flush=True)
+
+
+def study_lines(study: Any, horizon: str = "30m") -> List[str]:
+    """One line per event-study kind at ``horizon`` (§6.14)."""
+    if not isinstance(study, Mapping):
+        return []
+    lines: List[str] = []
+    kinds = study.get("kinds") or {}
+    order = [k for k in ("value", "basket") if k in kinds] + sorted(k for k in kinds if k not in ("value", "basket"))
+    for kind in order:
+        info = kinds.get(kind) or {}
+        h = (info.get("horizons") or {}).get(horizon) or {}
+        label = _HORIZON_LABELS.get(horizon, horizon)
+        events = int(info.get("events") or 0)
+        if _num(h.get("mean")) is None:
+            lines.append(f"  Signal study ({kind}, {label}): {events} signal{'' if events == 1 else 's'}, no outcome yet")
+            continue
+        lo, hi = _num(h.get("ci_low")), _num(h.get("ci_high"))
+        level = _num(h.get("ci_level")) or 0.9
+        ci = (f"({level:.0%}: {lo:+.3f} to {hi:+.3f})" if lo is not None and hi is not None
+              else "(too few signals for an interval)")
+        lines.append(
+            f"  Signal study ({kind}, {label}): {events} signal{'' if events == 1 else 's'}, mean {_signed(h.get('mean'))} "
+            f"per share {ci}, converged {_share(h.get('share_converged'))}, reversed {_share(h.get('share_reversed'))}"
+        )
+    return lines
+
+
+def paper_summary_lines(body: Mapping[str, Any]) -> List[str]:
+    """The ``paper`` command's periodic summary (§7.5)."""
+    run = body.get("run") if isinstance(body.get("run"), Mapping) else {}
+    budget = body.get("budget") if isinstance(body.get("budget"), Mapping) else {}
+    hours = _num(run.get("hours_run")) or 0.0
+    target = _num(run.get("target_hours")) or 0.0
+    wall = _num(run.get("wall_hours")) or 0.0
+    lines = [
+        f"[paper] {_utc_text(body.get('now'))}  {hours:.1f} h observed of {target:g} h (wall {wall:.1f} h)  "
+        f"steps {int(run.get('steps') or 0)}  reads {int(budget.get('reads_used') or 0)}/{int(budget.get('reads_limit') or 0)} per min"
+    ]
+    for p in body.get("portfolios") or []:
+        if not isinstance(p, Mapping):
+            continue
+        pnl, pct = _num(p.get("pnl_liq")) or 0.0, _num(p.get("pnl_liq_pct")) or 0.0
+        lines.append(
+            f"  {p.get('label') or p.get('portfolio_id')}: {pnl:+,.0f} ({pct:+.2%}) at liquidation  fills {int(p.get('fills') or 0)}  "
+            f"closed {int(p.get('trades_closed') or 0)}  open {int(p.get('positions_open') or 0)}"
+        )
+    head = body.get("headline") if isinstance(body.get("headline"), Mapping) else None
+    verdict = head.get("verdict") if head and isinstance(head.get("verdict"), Mapping) else None
+    if head and verdict:
+        lines.append(f"  Verdict ({head.get('label') or head.get('portfolio_id')}): {verdict.get('sentence')}")
+    lines.extend(study_lines(body.get("study")))
+    return lines
+
+
+def paper_final_lines(body: Mapping[str, Any]) -> List[str]:
+    """The summary plus every verdict, the table warning and the verdict caveats (§7.5)."""
+    lines = paper_summary_lines(body)
+    run = body.get("run") if isinstance(body.get("run"), Mapping) else {}
+    if run.get("end_reason"):
+        lines.append(f"  Run {run.get('run_id')} ended ({run.get('end_reason')}).")
+    settled = [t for t in body.get("trades") or [] if isinstance(t, Mapping) and t.get("exit_reason") == "settled"]
+    if settled:
+        titles: List[str] = []
+        for t in settled:
+            title = str(t.get("title") or ", ".join(str(e) for e in t.get("exchange_ids") or []))
+            if title and title not in titles:
+                titles.append(title)
+        n_pf = len({t.get("portfolio_id") for t in settled})
+        lines.append(f"  Settled while running: {len(settled)} position{'' if len(settled) == 1 else 's'} in "
+                     f"{n_pf} portfolio{'' if n_pf == 1 else 's'} ({'; '.join(titles)}).")
+    lines.append("Verdicts (one pre-registered headline; every other portfolio is exploratory):")
+    for p in body.get("portfolios") or []:
+        v = p.get("verdict") if isinstance(p, Mapping) and isinstance(p.get("verdict"), Mapping) else None
+        if v is None:
+            continue
+        tag = "headline" if p.get("headline") else "exploratory"
+        lines.append(f"  {p.get('label') or p.get('portfolio_id')} ({tag}): {v.get('level')}: {v.get('sentence')}")
+        if p.get("no_trade_reason"):
+            lines.append(f"    No trades: {p['no_trade_reason']}")
+    if body.get("table_warning"):
+        lines.append(str(body["table_warning"]))
+    study = body.get("study") if isinstance(body.get("study"), Mapping) else None
+    if study:
+        for key in ("can_show", "cannot_show"):
+            if study.get(key):
+                lines.append(str(study[key]))
+    head = body.get("headline") if isinstance(body.get("headline"), Mapping) else None
+    caveats = list((head or {}).get("verdict_caveats") or [])
+    if caveats:
+        lines.append("Read the verdict with these in mind:")
+        lines.extend(f"  - {c}" for c in caveats)
+    extra = [c for c in body.get("caveats") or [] if c not in caveats]
+    if extra:
+        lines.append("Also:")
+        lines.extend(f"  - {c}" for c in extra)
+    return lines
+
+
+def _settings_for(args: argparse.Namespace) -> Settings:
+    overrides: Dict[str, Any] = {}
+    if getattr(args, "data_dir", None):
+        overrides["data_dir"] = args.data_dir
+    return Settings.load(env_file=Path(args.env_file) if args.env_file else None, **overrides)
+
+
+def _plain_env(args: argparse.Namespace) -> Dict[str, str]:
+    """Environment plus the --env-file (no API key needed): for commands that only read local files."""
+    from .config import load_env_file
+
+    merged: Dict[str, str] = {}
+    if getattr(args, "env_file", None):
+        merged.update(load_env_file(Path(args.env_file)))
+    merged.update(os.environ)
+    return {k: v.strip() for k, v in merged.items() if isinstance(v, str) and v.strip()}
+
+
+def _guarded(fn: Callable[[], int], err: TextIO) -> int:
+    """Run a simulation command and map failures to exit codes (§7.5)."""
+    from .tracker import TrackerBusy
+
+    try:
+        return fn()
+    except KeyboardInterrupt:
+        print("\nStopped.", file=err, flush=True)
+        return EXIT_INTERRUPTED
+    except TrackerBusy as exc:
+        print(f"error: {exc}", file=err, flush=True)
+        return EXIT_USAGE
+    except (ConfigError, UsageError) as exc:
+        print(f"error: {exc}", file=err, flush=True)
+        return EXIT_USAGE
+    except ApiError as exc:
+        print(f"error: {exc}", file=err, flush=True)
+        if exc.details:
+            print(f"details: {json.dumps(exc.details, default=str)}", file=err)
+        return EXIT_ERROR
+    except SuperMarketError as exc:
+        print(f"error: {exc}", file=err, flush=True)
+        return EXIT_ERROR
+    except OSError as exc:
+        print(f"error: {exc}", file=err, flush=True)
+        return EXIT_ERROR
+
+
+# ------------------------------------------------------------------ paper
+
+
+def cmd_paper(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
+    return _guarded(lambda: _paper(args, out, err), err)
+
+
+def _paper(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
+    from . import pipeline, web
+    from .demo import SIM_T0, SimClock
+
+    if args.fast and not args.demo:
+        raise UsageError("--fast needs --demo (a live simulation runs in real time)")
+    if not math.isfinite(args.interval) or args.interval < 1:
+        raise UsageError("--interval must be at least 1 second")
+    temp_dir: Optional[str] = None
+    runtime: Any = None
+    try:
+        if args.demo:
+            if args.data_dir:
+                data_dir = Path(args.data_dir)
+            else:  # never the dashboard's data/demo: a running `dashboard --demo` keeps its database (D46)
+                temp_dir = tempfile.mkdtemp(prefix="supermarket-paper-")
+                data_dir = Path(temp_dir)
+            clock = SimClock(SIM_T0) if args.fast else None
+            runtime = web.build_demo(data_dir, args.interval, news=not args.no_news, out=err, clock=clock,
+                                     target_hours=args.hours, **web.simulation_options(args))
+        else:
+            runtime = web.build_live(_settings_for(args), args, out=err)
+        tracker = runtime.tracker
+        if getattr(tracker, "paper_runner", None) is None:
+            print(f"error: {getattr(tracker, 'paper_error', None) or 'The paper trader is not available.'}", file=err)
+            return EXIT_ERROR
+        if args.fast:
+            return _paper_fast(runtime, args, out, err, pipeline)
+        return _paper_live(runtime, args, out, err)
+    finally:
+        if runtime is not None:
+            runtime.close()
+        if temp_dir is not None:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def _paper_capital(args: argparse.Namespace) -> Optional[float]:
+    value = getattr(args, "paper_capital", None)
+    return float(value) if value else None
+
+
+def _paper_fast(runtime: Any, args: argparse.Namespace, out: TextIO, err: TextIO, pipeline: Any) -> int:
+    tracker = runtime.tracker
+    clock = runtime.clock
+    if not args.json:
+        print(f"Fast demo simulation: {args.hours:g} simulated hours in {args.step:g}-second steps "
+              "(scripted demo data; nothing is traded).", file=out, flush=True)
+    if args.reset:
+        tracker.paper_reset(start_capital=_paper_capital(args), target_hours=args.hours)
+
+    def on_summary(body: Mapping[str, Any]) -> None:
+        if not args.json:
+            _say(out, paper_summary_lines(body))
+
+    pipeline.run_simulation(runtime, clock, hours=args.hours, step_s=args.step, summary_every_s=args.summary_every * 60.0,
+                            on_summary=on_summary, end_run=not args.keep_running)
+    body = runtime.app.paper()
+    if args.json:
+        _dump_json(out, body)
+    else:
+        _say(out, paper_final_lines(body))
+    return EXIT_OK
+
+
+def _paper_live(runtime: Any, args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
+    """Real time (live, or the demo without --fast): the tracker's threads, no web server."""
+    tracker = runtime.tracker
+    runtime.start()  # TrackerBusy (exit 2) when another process tracks this database
+    if args.reset:
+        tracker.paper_reset(start_capital=_paper_capital(args), target_hours=args.hours)
+    if not args.json:
+        what = "the demo market (scripted data)" if args.demo else "live read-only data"
+        until = "until Ctrl-C" if args.keep_running else f"until {args.hours:g} covered hours"
+        print(f"Paper trading on {what} {until}; a summary every {args.summary_every:g} min. Nothing is traded.",
+              file=out, flush=True)
+    every = float(args.summary_every) * 60.0
+    next_summary = time.monotonic() + every
+    reached = interrupted = False
+    try:
+        while True:
+            body = tracker.paper_view() or {}
+            run = body.get("run") if isinstance(body.get("run"), Mapping) else {}
+            hours = _num(run.get("hours_run")) or 0.0
+            reached = hours >= float(args.hours) - 1e-9
+            if reached and not args.keep_running:
+                break
+            if not tracker.running:
+                fatal = (tracker.status() or {}).get("fatal_error")
+                print(f"error: the tracker stopped: {fatal or 'see the log'}", file=err, flush=True)
+                return EXIT_ERROR
+            if time.monotonic() >= next_summary:
+                if not args.json:
+                    _say(out, paper_summary_lines(body))
+                next_summary += every
+            time.sleep(1.0)
+    except KeyboardInterrupt:
+        interrupted = True
+        print("\nStopping the simulation…", file=err, flush=True)
+    if reached and not args.keep_running:
+        tracker.paper_end("completed")
+    elif not args.json:
+        print("The run stays open: the next `paper` or `dashboard` on this database continues it.", file=out, flush=True)
+    body = runtime.app.paper()
+    if args.json:
+        _dump_json(out, body)
+    else:
+        _say(out, paper_final_lines(body))
+    return EXIT_INTERRUPTED if interrupted else EXIT_OK
+
+
+# ------------------------------------------------------------------ backtest
+
+
+def cmd_backtest(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
+    return _guarded(lambda: _backtest(args, out, err), err)
+
+
+def _iso_arg(text: Optional[str], name: str) -> Optional[float]:
+    from .books import parse_time
+
+    if not text:
+        return None
+    parsed = parse_time(text)
+    if parsed is None:
+        raise UsageError(f"{name}: not an ISO-8601 time: {text!r}")
+    return parsed.timestamp()
+
+
+def backtest_store_path(args: argparse.Namespace) -> Path:
+    """``--store``, else data/<slug>/tracker.sqlite3 (slug: --tournament, SUPERMARKET_TOURNAMENT, or the only
+    data/*/tracker.sqlite3 except demo)."""
+    if getattr(args, "store", None):
+        path = Path(args.store).expanduser()
+        if not path.is_file():
+            raise UsageError(f"{path}: no such database")
+        return path
+    env = _plain_env(args)
+    data_dir = Path(args.data_dir or env.get("SUPERMARKET_DATA_DIR") or "data")
+    slug = getattr(args, "tournament", None) or env.get("SUPERMARKET_TOURNAMENT")
+    if slug:
+        path = data_dir / slug / "tracker.sqlite3"
+        if not path.is_file():
+            raise UsageError(f"{path}: no such database (run the dashboard or `paper` first, or pass --store)")
+        return path
+    found = sorted(p for p in data_dir.glob("*/tracker.sqlite3") if p.parent.name != "demo")
+    if len(found) == 1:
+        return found[0]
+    if not found:
+        raise UsageError(f"no tracker database under {data_dir}/ (run the dashboard or `paper` first, pass --store, "
+                         "or use --demo)")
+    names = ", ".join(p.parent.name for p in found)
+    raise UsageError(f"several tracker databases under {data_dir}/ ({names}): pick one with --tournament or --store")
+
+
+def _backtest(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
+    from . import backtest as bt
+    from . import pipeline, web
+    from .demo import SIM_T0, SimClock
+    from .models import BacktestConfig, PaperConfig, default_portfolios
+    from .store import TrackerStore
+
+    regime = web.regime_option(args)
+    specs = list(args.sweep or []) + (["latency_s=30,120,300"] if args.latency_sweep else [])
+    try:
+        grid = bt.parse_sweep(specs)
+    except ValueError as exc:
+        raise UsageError(str(exc))
+    temp_dir: Optional[str] = None
+    try:
+        if args.demo:
+            temp_dir = tempfile.mkdtemp(prefix="supermarket-backtest-")
+            clock = SimClock(SIM_T0)
+            if not args.json:
+                print(f"Simulating the demo market for {args.demo_hours:g} h (fast, scripted data) before the replay…",
+                      file=out, flush=True)
+            runtime = web.build_demo(Path(temp_dir), 30.0, news=False, out=err, clock=clock, regime=regime,
+                                     sizing=args.sizing)
+            try:
+                pipeline.run_simulation(runtime, clock, hours=args.demo_hours, step_s=30.0, summary_every_s=0.0,
+                                        end_run=True)
+            finally:
+                runtime.close()
+            path = Path(temp_dir) / "demo" / "tracker.sqlite3"
+            hours = args.hours if args.hours is not None else float(args.demo_hours)
+        else:
+            path = backtest_store_path(args)
+            hours = args.hours if args.hours is not None else 24.0
+        config = BacktestConfig(
+            start=_iso_arg(args.since, "--since"), end=_iso_arg(args.until, "--until"), hours=float(hours),
+            step_s=float(args.step), latency_s=float(args.latency), assumed_spread=float(args.spread),
+            assumed_touch_qty=float(args.touch_qty), volume_share=float(args.volume_share),
+            use_book_snapshots=not args.no_books, use_fair_values=not args.no_fair_values,
+            candle_fill_cap=float(args.candle_cap), use_history_fair_values=not args.no_history,
+            paper=PaperConfig(sizing=args.sizing, regime=regime, portfolios=default_portfolios(args.sizing), demo=bool(args.demo)),
+            label="demo" if args.demo else "",
+        )
+        try:
+            source = TrackerStore.open_read_only(path)  # a second, read-only connection: never writes (D52)
+        except RuntimeError as exc:  # an older schema
+            raise UsageError(str(exc))
+        try:
+            report = bt.sweep(source, config, grid) if grid else bt.run_backtest(source, config)
+        except ValueError as exc:
+            raise UsageError(str(exc))
+        finally:
+            source.close()
+    finally:
+        if temp_dir is not None:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+    if args.json:
+        _dump_json(out, report)
+    else:
+        _say(out, backtest_lines(report, path=None if args.demo else path))
+    return EXIT_OK
+
+
+def backtest_lines(report: Any, path: Optional[Path] = None) -> List[str]:
+    """The backtest report as text: the testability table FIRST, then window, coverage, assumptions, one row per
+    portfolio, the headline verdict, the event study, sweep rows and warnings (§7.5)."""
+    data = _json_safe(report)
+    lines: List[str] = ["What this replay can test (per idea kind):"]
+    testability = data.get("testability") or {}
+    for kind, info in testability.items():
+        info = info or {}
+        status = str(info.get("status") or "").replace("_", " ")
+        hours = _num(info.get("hours"))
+        lines.append(f"  {kind:<10} {status:<15} {f'{hours:.1f} h' if hours is not None else '':>7}  {info.get('sentence') or ''}")
+    if not testability:
+        lines.append("  (nothing to test: no stored history in the window)")
+    window = data.get("window") or {}
+    where = f" from {path}" if path is not None else ""
+    lines.append(f"Window{where}: {_utc_text(window.get('start'))} to {_utc_text(window.get('end'))} "
+                 f"({fmt_num(window.get('hours'))} h, {int(window.get('steps') or 0)} decision steps)")
+    cov = data.get("coverage") or {}
+    if cov:
+        parts = []
+        for key, label in (("tick_share", "tick quotes"), ("candle_share", "candle quotes"),
+                           ("book_snapshot_share", "real books"), ("synthetic_book_share", "synthetic books"),
+                           ("fair_value_share", "fair values"), ("tape_share", "trade tape")):
+            if _num(cov.get(key)) is not None:
+                parts.append(f"{label} {_share(cov.get(key))}")
+        if parts:
+            lines.append("Coverage: " + ", ".join(parts))
+    if data.get("assumptions"):
+        lines.append("Assumptions:")
+        lines.extend(f"  - {a}" for a in data["assumptions"])
+    rows = []
+    head_id = None
+    for p in data.get("portfolios") or []:
+        v = p.get("verdict") or {}
+        if p.get("headline"):
+            head_id = p.get("portfolio_id")
+        rows.append({
+            "portfolio": truncate(p.get("label") or p.get("portfolio_id"), 48),
+            "pnl": f"{(_num(p.get('pnl_liq')) or 0.0):+,.0f}",
+            "ideas": v.get("n_ideas") if v else "",
+            "win": _share(p.get("win_rate")) if p.get("win_rate") is not None else "—",
+            "dd": _share(p.get("max_drawdown")),
+            "level": v.get("level") or "",
+        })
+    if rows:
+        lines.append(table(rows, [("portfolio", "PORTFOLIO"), ("pnl", "P&L AT LIQUIDATION"), ("ideas", "IDEAS"),
+                                  ("win", "WIN RATE (CLOSED ONLY)"), ("dd", "DRAWDOWN"), ("level", "VERDICT")]))
+    verdicts = data.get("verdicts") or {}
+    if head_id and head_id in verdicts:
+        lines.append(f"Headline verdict ({head_id}): {verdicts[head_id].get('sentence')}")
+    study = study_lines(data.get("study"))
+    if study:
+        lines.append("Signal study:")
+        lines.extend(study)
+    for row in data.get("sweep") or []:
+        lines.append(f"  sweep {row.get('label')}: {(_num(row.get('pnl_liq')) or 0.0):+,.0f} at liquidation, "
+                     f"{int(row.get('trades_closed') or 0)} closed, verdict {row.get('verdict_level')}")
+    for w in data.get("warnings") or []:
+        lines.append(f"Warning: {w}")
+    if data.get("stopped_early"):
+        lines.append("Warning: the replay stopped early (time budget).")
+    return lines
+
+
+# ------------------------------------------------------------------ fairvalue
+
+
+def cmd_fairvalue(args: argparse.Namespace, out: TextIO, err: TextIO, transport: Any = None) -> int:
+    return _guarded(lambda: _fairvalue(args, out, err, transport), err)
+
+
+def _fairvalue(args: argparse.Namespace, out: TextIO, err: TextIO, transport: Any) -> int:
+    from . import web
+    from .readonly import enforce_get_only
+    from .store import TrackerStore
+
+    temp_dir: Optional[str] = None
+    runtime: Any = None
+    client: Any = None
+    store: Any = None
+    owned_fv: Any = None  # live mode: the service this command built (closed at the end)
+    try:
+        if args.demo:
+            from .demo import SIM_T0, SimClock
+
+            temp_dir = tempfile.mkdtemp(prefix="supermarket-fairvalue-")
+            clock = SimClock(SIM_T0)
+            runtime = web.build_demo(Path(temp_dir), 30.0, news=False, out=err, clock=clock, paper=False,
+                                     fair_value=args.fair_value)
+            runtime.tracker.run_once()
+            runtime.tracker.fair_value_step(clock())
+            fv = runtime.fair_values
+            directory = Path(temp_dir) / "demo"
+            store = runtime.store
+            payload = runtime.app.fairvalue()
+            now = clock()
+        else:
+            settings = _settings_for(args)
+            client = SuperMarketClient.from_settings(settings, transport=transport)
+            enforce_get_only(client)
+            ctx = resolve_context(client, slug=args.tournament or settings.tournament, public=args.public)
+            snap = MarketDataBot(client, ctx).snapshot(status="open")
+            memory = TrackerStore(":memory:")
+            try:
+                memory.upsert_markets(snap.markets)
+                infos = memory.exchanges()
+            finally:
+                memory.close()
+            quotes = {r["exchange_id"]: {"bid": r.get("best_bid"), "ask": r.get("best_ask")} for r in snap.rows if not r.get("missing")}
+            mids = {eid: round((q["bid"] + q["ask"]) / 2, 6) for eid, q in quotes.items()
+                    if _num(q.get("bid")) is not None and _num(q.get("ask")) is not None}
+            directory = Path(settings.data_dir) / ctx.label
+            from .fairvalue import FairValueService, default_providers
+
+            if args.fair_value == "auto" and not args.json:
+                print(web.FV_AUTO_NOTICE, file=err, flush=True)
+            fv = owned_fv = FairValueService(directory, mode=args.fair_value, providers=default_providers(args.fair_value),
+                                             cup_mids=lambda: mids)
+            fv.set_targets(infos)
+            now = time.time()
+            fv.refresh(now)
+            db = directory / "tracker.sqlite3"
+            if args.import_history:
+                store = TrackerStore(db)
+            history = None
+            if db.is_file():
+                try:
+                    reader = store or TrackerStore.open_read_only(db)
+                    try:
+                        history = reader.fair_value_source_stats("history")
+                    finally:
+                        if reader is not store:
+                            reader.close()
+                except Exception as exc:  # an older database: no history stats
+                    log.debug("fair-value history stats unavailable: %s", exc)
+            payload = web.fairvalue_payload(fv, quotes, now, history=history)
+        if args.template:
+            return _fv_template(fv, directory, out)
+        if args.show_override:
+            return _fv_show_override(fv, payload, str(args.show_override), out, args.json)
+        if args.import_history:
+            result = fv.import_history(now - float(args.days) * 86400.0, now, recorder=store.add_fair_values)
+            if args.json:
+                _dump_json(out, result)
+            else:
+                _say(out, [f"Imported {int(result.get('records') or 0)} outside price-history records (indicative, GET only)."]
+                     + [f"  {venue}: {int(n)}" for venue, n in sorted((result.get("by_venue") or {}).items())]
+                     + [f"  error: {e}" for e in result.get("errors") or []])
+            return EXIT_OK
+        if args.only_usable:
+            payload = dict(payload, rows=[r for r in payload.get("rows") or [] if (r.get("fair") or {}).get("usable")])
+        if args.json:
+            _dump_json(out, payload)
+        else:
+            _say(out, fairvalue_lines(payload, demo=bool(args.demo)))
+        return EXIT_OK
+    finally:
+        if runtime is None and store is not None:
+            store.close()  # live --import-history (the demo's store closes with its runtime)
+        if owned_fv is not None:
+            owned_fv.close()
+        if runtime is not None:
+            runtime.close()
+        if client is not None:
+            client.close()
+        if temp_dir is not None:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def _fv_template(fv: Any, directory: Path, out: TextIO) -> int:
+    from .fairvalue import MANUAL_JSON
+
+    path = directory / MANUAL_JSON
+    if path.exists():
+        print(f"{path} already exists: edit it (set \"probability\" for the outcomes you have an opinion on).", file=out)
+        return EXIT_OK
+    directory.mkdir(parents=True, exist_ok=True)
+    template = fv.manual.template(fv.targets())
+    path.write_text(json.dumps(template, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    print(f"Wrote {path} with {len(template.get('values') or [])} outcomes: set \"probability\" (0-1) where you have "
+          "an opinion; the bot reads it within a minute.", file=out)
+    return EXIT_OK
+
+
+def _fv_show_override(fv: Any, payload: Mapping[str, Any], eid: str, out: TextIO, as_json: bool) -> int:
+    row = next((r for r in payload.get("rows") or [] if str(r.get("exchange_id")) == eid), None)
+    if row is None:
+        raise UsageError(f"no open outcome with exchange id {eid}")
+    from .fairvalue import MAP_FILE
+
+    map_info = (fv.status() or {}).get("map") or {}
+    map_path = map_info.get("path") or MAP_FILE
+    if as_json:
+        _dump_json(out, {"exchange_id": eid, "map_path": map_path, "snippets": row.get("snippets"),
+                         "matches": row.get("matches")})
+        return EXIT_OK
+    lines = [f"{row.get('title')}{' — ' + str(row['option']) if row.get('option') else ''}  (exchange {eid}, "
+             f"race {row.get('race_key') or 'not recognised'})"]
+    for m in row.get("matches") or []:
+        lines.append(f"  matched {m.get('venue')}: {m.get('external_id')} {m.get('label') or ''} "
+                     f"({m.get('kind')}, confidence {fmt_num(m.get('confidence'))}): {m.get('reason') or ''}".rstrip())
+    if not row.get("matches"):
+        lines.append(f"  not matched: {row.get('unmatched_reason') or 'no outside market'}")
+    lines.append(f"Add one of these lines inside \"overrides\" in {map_path} (the bot reloads it within a minute):")
+    labels = {"disable": "switch this outcome's outside fair value off", "pin": "pin these outside markets",
+              "confirm": "confirm a suspect match", "trade_near": "allow trading a near match"}
+    for key, snippet in (row.get("snippets") or {}).items():
+        if snippet:
+            lines.append(f"  {labels.get(key, key)}:")
+            lines.append(f"    {snippet}")
+    _say(out, lines)
+    return EXIT_OK
+
+
+def fairvalue_lines(payload: Mapping[str, Any], demo: bool = False) -> List[str]:
+    counts = payload.get("counts") or {}
+    lines = [
+        f"Outside fair values ({payload.get('mode')}{', demo feed' if demo else ''}): {int(counts.get('outcomes') or 0)} outcomes, "
+        f"{int(counts.get('matched') or 0)} matched, {int(counts.get('usable') or 0)} usable, {int(counts.get('manual') or 0)} "
+        f"from your file, {int(counts.get('suspect') or 0)} suspect, {int(counts.get('near') or 0)} near matches"
+    ]
+    for r in payload.get("rows") or []:
+        title = f"{r.get('title')}{' — ' + str(r['option']) if r.get('option') else ''}"
+        lines.append(f"{title}  [{r.get('race_key') or 'race not recognised'}]  (exchange {r.get('exchange_id')})")
+        fair = r.get("fair") if isinstance(r.get("fair"), Mapping) else None
+        sm = f"Super Market {_signed(r.get('sm_bid'), '.3f')}/{_signed(r.get('sm_ask'), '.3f')}"
+        if fair and _num(fair.get("value")) is not None:
+            age = _num(fair.get("age_s"))
+            unc = _num(fair.get("uncertainty"))
+            venues = ", ".join(sorted({str(m.get("venue")) for m in r.get("matches") or []})) or fair.get("source")
+            usable = "usable" if fair.get("usable") else f"not usable: {fair.get('reason') or 'see the dashboard'}"
+            lines.append(
+                f"    fair {fair['value']:.3f} ({fair.get('source')}, {fair.get('confidence')}"
+                f"{f', ±{unc:.3f}' if unc is not None else ''}{f', {age:.0f} s old' if age is not None else ''})  {sm}  "
+                f"gap {_signed(r.get('gap'))}  venues: {venues}  [{usable}]"
+            )
+        else:
+            lines.append(f"    no fair value: {r.get('unmatched_reason') or (fair or {}).get('reason') or 'no outside market'}  {sm}")
+        if r.get("suspect"):
+            lines.append("    suspect: far from the Cup price; check the match and confirm it in the map file (--show-override).")
+        if r.get("near"):
+            lines.append("    near match: shown, not traded unless you allow it (--show-override).")
+    lines.append("Providers:")
+    for p in payload.get("providers") or []:
+        err_text = f": {p.get('last_error')}" if p.get("last_error") else ""
+        lines.append(f"  {p.get('name')}: {p.get('status')}, {int(p.get('requests') or 0)} requests, "
+                     f"{int(p.get('matched') or 0)} matched, {int(p.get('quoted') or 0)} quoted{err_text}")
+    if not payload.get("providers"):
+        lines.append("  none (manual mode, or fair values are off)")
+    mp = payload.get("map") if isinstance(payload.get("map"), Mapping) else None
+    if mp:
+        lines.append(f"Map file: {mp.get('path')} ({'exists' if mp.get('exists') else 'not written yet'}, "
+                     f"{int(mp.get('overrides') or 0)} overrides)")
+        lines.extend(f"  error: {e}" for e in mp.get("errors") or [])
+    man = payload.get("manual") if isinstance(payload.get("manual"), Mapping) else None
+    if man:
+        lines.append(f"Your file: {man.get('path')} ({'exists' if man.get('exists') else 'absent: --template writes one'}, "
+                     f"{int(man.get('entries') or 0)} entries)")
+        lines.extend(f"  error: {e}" for e in man.get("errors") or [])
+    hist = payload.get("history") if isinstance(payload.get("history"), Mapping) else None
+    if hist:
+        lines.append(f"Imported history: {int(hist.get('records') or 0)} records, {_utc_text(hist.get('first'))} to "
+                     f"{_utc_text(hist.get('last'))}")
+    lines.extend(f"Note: {c}" for c in payload.get("caveats") or [])
+    return lines
+
+
 def _tree_lines(node: Dict[str, Any], depth: int = 0) -> List[str]:
     pad = "  " * depth
     if node.get("node_type") == "operator":
@@ -609,6 +1419,14 @@ def main(argv: Optional[Sequence[str]] = None, out: Optional[TextIO] = None, tra
         from .web import run_dashboard  # loads settings itself; --demo needs no API key
 
         return run_dashboard(None, args, out=out)
+    # The simulation commands load settings themselves: ``paper --demo``, ``fairvalue --demo`` and every
+    # ``backtest`` need no API key.
+    if args.command == "paper":
+        return cmd_paper(args, out, sys.stderr)
+    if args.command == "backtest":
+        return cmd_backtest(args, out, sys.stderr)
+    if args.command == "fairvalue":
+        return cmd_fairvalue(args, out, sys.stderr, transport)
     try:
         overrides: Dict[str, Any] = {}
         if args.data_dir:

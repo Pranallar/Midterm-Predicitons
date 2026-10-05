@@ -4,8 +4,9 @@
  *   node tests/e2e/ui_smoke.cjs [URL]
  *
  * Without a URL it starts tests/e2e/serve_demo.py itself (python3 on PATH, or $PYTHON).
- * It opens every view, sorts, filters, searches, opens and closes the detail drawer (button,
- * Esc, backdrop), toggles the theme, re-analyzes a surge, simulates an outage and a fatal
+ * It opens every view (including the Simulation view: the human-speed headline, the table warning,
+ * the published demo portfolios and top-3 bar, a simulated fill), sorts, filters, searches, opens and
+ * closes the detail drawer (button, Esc, backdrop), toggles the theme, re-analyzes a surge, simulates an outage and a fatal
  * tracker error, waits for poll cycles, and fails on any console error, page error, failed
  * request, HTTP error response or unhandled promise rejection.
  *
@@ -29,7 +30,10 @@ const { chromium } = require(PW_MODULE);
 const ROOT = path.resolve(__dirname, '..', '..');
 const SHOTS = path.resolve(process.env.E2E_SCREENSHOT_DIR || path.join(ROOT, 'docs', 'screenshots'));
 const EXTRA = process.env.E2E_EXTRA_SHOTS ? path.resolve(process.env.E2E_EXTRA_SHOTS) : null;
-const VIEWS = ['overview', 'markets', 'surges', 'high', 'strategy'];
+const VIEWS = ['overview', 'markets', 'surges', 'high', 'strategy', 'sim'];
+// Published demo constants (docs/PAPER_TRADING.md §7.6): portfolio ids in config order, headline first.
+const SIM_PORTFOLIOS = ['human:conservative', 'policy:conservative', 'policy:chaser', 'kind:value', 'kind:basket', 'kind:hole', 'kind:fade',
+  'kind:carry', 'kind:arbitrage'];
 
 const problems = [];
 let expectErrors = false; // true only while an outage is simulated on purpose
@@ -378,6 +382,38 @@ async function strategy(page) {
   check(/Read-only/.test(await page.textContent('#strategy-body .disclaimer')), 'disclaimer shown');
 }
 
+async function simulation(page) {
+  await gotoView(page, 'sim');
+  await page.waitForSelector('#sim-body [data-panel="headline"] .verdict-sentence', { timeout: 60000 });
+  check(/^human:/.test(await page.getAttribute('#sim-body [data-panel="headline"]', 'data-portfolio')), 'the headline is the human: portfolio');
+  check(/Paper trading on live data\. Nothing is traded: every order here is simulated\./.test(await page.textContent('#view-sim .view-head')), 'the view says nothing is traded');
+  check(await page.isVisible('#sim-demo-badge'), 'the demo badge is shown on the Simulation view');
+  const warning = await page.textContent('#sim-body [data-panel="portfolios"] .table-warning');
+  check(/^The best of 9 portfolios looks better than it is by chance: judge the headline/.test(warning.trim()), 'the table warning is present: ' + warning);
+  const ids = await page.$$eval('#sim-body .portfolios-table tbody tr[data-pid]', (trs) => trs.map((tr) => tr.dataset.pid));
+  check(ids.join(',') === SIM_PORTFOLIOS.join(','), 'the published portfolios, headline first: ' + ids.join(','));
+  const summary = await page.evaluate(() => [document.querySelector('#sim-body .sim-chart').getAttribute('aria-label'),
+    document.querySelector('#sim-body [data-panel="equity"] .chart-summary').textContent]);
+  check(/^Equity curves: 9 portfolios; headline \(you, by hand\): /.test(summary[0]), 'the equity summary names the headline: ' + summary[0]);
+  check(!/\bbest\b/i.test(summary.join(' ')), 'no "best" in the equity summary: ' + summary.join(' / '));
+  const verdict = await page.textContent('#sim-body [data-panel="headline"] .verdict-level');
+  check(/Not enough evidence|Inconclusive|Promising, not proof|Losing so far/.test(verdict), 'a one-day demo run never reads "Profitable so far": ' + verdict);
+  check((await page.$$('#sim-body [data-panel="headline"] .verdict-caveats li')).length === 4, 'the verdict caveats sit under the verdict');
+  // the demo scripts fills within the first minutes (2 s steps here); wait for one
+  await page.waitForSelector('#sim-body .fills-table tbody tr', { timeout: 90000 });
+  check(/^(Bought|Sold|Settled) \d[\d,]* (YES|NO) @ \d\.\d{3}$/.test((await page.textContent('#sim-body .fills-table tbody tr .fill-text')).trim()), 'a fill reads as an order');
+  const chaser = (await page.textContent('#sim-body [data-panel="chaser"]')).replace(/\s+/g, ' ');
+  check(/221,500/.test(chaser) && /M\s*2\.2(?!\d)/.test(chaser), 'the chaser sees the published top-3 bar 221,500 and M 2.2: ' + chaser.slice(0, 200));
+  check(/Settlement rule assumed: unknown, valued conservatively/.test(await page.textContent('#sim-body [data-panel="clock"]')), 'the run clock names the settlement rule');
+  check(await page.isVisible('#sim-body [data-panel="backtest"]') && await page.isVisible('#sim-body [data-panel="fairvalue"]'), 'backtest and fair-value panels are shown');
+  check((await page.$$('#sim-body [data-panel="caveats"] li')).length >= 9, 'How to read this lists the caveats');
+  // the reset dialog opens and Cancel sends nothing (the regression checks cover the POST)
+  await page.click('#sim-reset');
+  await page.waitForFunction(() => document.getElementById('sim-reset-dialog').open);
+  await page.keyboard.press('Escape');
+  await page.waitForFunction(() => !document.getElementById('sim-reset-dialog').open);
+}
+
 async function themeAndPersistence(page) {
   await page.click('[data-theme-choice="dark"]');
   check((await page.getAttribute('html', 'data-theme')) === 'dark', 'dark theme applied');
@@ -419,6 +455,10 @@ async function settleView(page, v) {
   if (v === 'surges') await page.waitForSelector('#surge-cards .surge-card');
   if (v === 'high') await page.waitForSelector('#high-body tr');
   if (v === 'strategy') await page.waitForSelector('#strategy-body .idea');
+  if (v === 'sim') {
+    await page.waitForSelector('#sim-body [data-panel="headline"] .verdict-sentence', { timeout: 60000 });
+    await page.waitForSelector('#sim-body .sim-chart svg, #sim-body .sim-chart .chart-empty');
+  }
 }
 
 async function deepLink(page, url) {
@@ -563,6 +603,33 @@ function evilPayloads(now) {
       book_error: EVIL, book_fetched_at: 'now', high_band: { side: null },
     },
     '/api/exchange/42': {},
+    '/api/paper': {
+      enabled: 'yes', available: 1, demo: EVIL, error: EVIL, has_previous: 'yes', table_warning: EVIL, model_label: EVIL,
+      run: { run_id: EVIL, steps: 5, hours_run: 'x', target_hours: -1, gaps: 'x', started_at: 'x', capital_source: EVIL, regime: EVIL,
+        code_version: EVIL, sizing: EVIL, settings: { params_changed: { [EVIL]: EVIL } }, complete: 'yes' },
+      headline: { portfolio_id: EVIL, label: EVIL, pnl_liq: 'x', verdict: { level: EVIL, sentence: EVIL, reasons: [EVIL, null, 4] }, verdict_caveats: EVIL },
+      portfolios: [null, 'x', { portfolio_id: EVIL, label: EVIL, verdict: 'x', execution: { [EVIL]: { entries: 'x' } }, no_trade_reason: EVIL + '. ' + EVIL },
+        { portfolio_id: 'policy:chaser', policy: 'chaser', sizing: { mode: EVIL, lines: EVIL, bar: 'x', M: 'big' }, verdict: { level: 'promising', exploratory: 'no' } }],
+      equity: { [EVIL]: [[1, 'x'], 'bad', null], 'policy:chaser': [[now - 600, 100000], [now - 300, 'x'], [now, 99000]] },
+      positions: [null, { portfolio_id: EVIL, exchange_id: EVIL, title: EVIL, option: EVIL, flags: [EVIL, null], qty: 'x', exit_note: EVIL, side: EVIL }],
+      baskets: [{ portfolio_id: EVIL, legs: [null, { exchange_id: EVIL, side: EVIL }], sets: 'x' }],
+      fills: [{ action: EVIL, side: EVIL, reason: EVIL, title: EVIL, exchange_id: 'x1', qty: 'x', ts: 'x', kind: EVIL }, null],
+      trades: [{ exit_reason: EVIL, exchange_ids: EVIL, title: EVIL, kind: EVIL }],
+      study: { kinds: { [EVIL]: { horizons: { [EVIL]: { n: 'x' } } }, value: null }, can_show: EVIL, cannot_show: EVIL, pending: EVIL },
+      caveats: [EVIL, null],
+    },
+    '/api/fairvalue': {
+      enabled: true, mode: EVIL, last_refresh_at: 'x', providers: [{ name: EVIL, status: EVIL, last_error: EVIL }, null],
+      manual: { path: EVIL, exists: true, entries: 'x', errors: [EVIL] }, map: { path: EVIL, overrides: EVIL, errors: EVIL }, counts: 'x',
+      rows: [null, { exchange_id: 'x1', title: EVIL, option: EVIL, race_key: EVIL, fair: { value: 'x', source: EVIL, reason: EVIL, usable: 'yes' },
+        matches: [{ venue: EVIL, external_id: EVIL, reason: EVIL, label: EVIL }, null], snippets: { disable: EVIL, pin: EVIL, confirm: 5 }, suspect: true, near: 'x' }],
+      caveats: [EVIL],
+    },
+    '/api/backtest': {
+      status: 'ready', error: EVIL, generated_at: 'x',
+      report: { testability: { [EVIL]: { status: EVIL, sentence: EVIL } }, warnings: [EVIL, null], assumptions: [EVIL], coverage: { exchanges: 'x' },
+        portfolios: [{ portfolio_id: EVIL, verdict: { level: EVIL } }], sweep: [{ label: EVIL, params: EVIL }], window: { start: 'x' }, study: 'x', overlap_hours: 'x' },
+    },
   };
 }
 
@@ -595,11 +662,17 @@ async function hostile(browser, url) {
   await page.waitForFunction(() => document.getElementById('tournament-name').textContent.indexOf('<img') !== -1);
   await page.waitForTimeout(600);
   await safeDom('overview');
-  for (const v of ['markets', 'surges', 'high', 'strategy']) {
+  for (const v of ['markets', 'surges', 'high', 'strategy', 'sim']) {
     await gotoView(page, v);
     await page.waitForTimeout(600);
     await safeDom(v);
   }
+  await gotoView(page, 'sim');
+  await page.waitForSelector('#sim-body [data-panel="portfolios"]');
+  for (const sum of await page.$$('#sim-body details > summary')) await sum.click().catch(() => {});
+  await page.click('#sim-body button[data-action="sim-table-toggle"]');
+  await page.waitForTimeout(300);
+  await safeDom('simulation details');
   await gotoView(page, 'markets');
   check((await page.$$('#markets-body tr')).length === 2, 'rows without a usable id are skipped and duplicates collapse');
   await gotoView(page, 'surges');
@@ -638,7 +711,7 @@ async function mobile(browser, url) {
   const overflow = await page.evaluate(() => document.documentElement.scrollWidth - 390);
   check(overflow <= 1, 'no horizontal page scroll at 390 px (overflow ' + overflow + ' px)');
   await shot(page, 'mobile-390');
-  for (const v of ['markets', 'surges', 'high', 'strategy']) {
+  for (const v of ['markets', 'surges', 'high', 'strategy', 'sim']) {
     await gotoView(page, v);
     await settleView(page, v);
     const o = await page.evaluate(() => document.documentElement.scrollWidth - 390);
@@ -693,6 +766,10 @@ async function run(url) {
     await strategy(page);
     await shot(page, 'strategy-light');
     log('strategy ok');
+    await simulation(page);
+    await page.evaluate(() => { window.scrollTo(0, 0); if (document.activeElement) document.activeElement.blur(); });
+    await shot(page, 'sim-light');
+    log('simulation ok');
     await waitPolls(page, 2);
     log('two poll cycles ok');
     await themeAndPersistence(page);

@@ -23,6 +23,7 @@ from supermarket_bot.models import (
     HighBand,
     Opportunity,
     PricePoint,
+    StrategyParams,
     StrategyReport,
     Surge,
 )
@@ -197,11 +198,15 @@ class TestFade:
         assert o is not None
         assert (o.kind, o.side, o.exchange_id, o.market_id, o.surge_id) == ("fade", "no", "e1", "m1", 7)
         assert (o.entry_price, o.target_price, o.stop_price) == (0.31, 0.40, 0.22)
-        p, gain, loss = 0.66, 0.09, 0.09
+        # [updated, PAPER_TRADING.md §5.5.4] exits sell at the bid: half the 0.01 spread comes off the target
+        # (0.40 -> 0.395) and the stop (0.22 -> 0.215), so gain 0.085 and loss 0.095 (was 0.09 / 0.09)
+        p, gain, loss = 0.66, 0.085, 0.095
+        assert (o.exit_plan.target_bid, o.exit_plan.stop_bid) == (0.395, 0.215)
         assert o.prob_win == pytest.approx(p)
         assert o.edge == pytest.approx(p * gain - (1 - p) * loss)
         assert o.expected_return == pytest.approx(o.edge / 0.31, abs=1e-6)
-        assert o.score == pytest.approx(o.expected_return * 0.64, abs=1e-6)
+        # [updated, §5.1 / D33] score = growth_score (was expected_return x confidence)
+        assert o.score == pytest.approx(S.growth_score(o.bet, o.edge, 0.64, 0.31), abs=1e-6)
         assert o.confidence == 0.64 and o.horizon_hours == 6.0
         # bracket Kelly risks 8,000 (way above the cap) -> 8% cap: floor(8000 / 0.31)
         assert o.suggested_shares == math.floor(8000 / 0.31)
@@ -228,18 +233,27 @@ class TestFade:
         assert mark_only is not None and mark_only.entry_price == 0.32
 
     def test_backtest_blend_needs_ten_surges(self) -> None:
-        ten = BacktestResult(n_surges=10, n_reverted=4, reversion_rate=0.4)
+        # [updated, §5.5.4 / D36] no 50/50 blend with the all-surge rate any more: the attribution odds are
+        # CAPPED by the measured net-of-spread reversion rate of participant-driven surges, once there are 10
+        ten = BacktestResult(n_surges=10, n_reverted=4, reversion_rate=0.4, n_participant=10,
+                             participant_reversion_rate=0.6)
         o = fade_opportunity(mk_surge(), quote(0.69, 0.70), info(), NOW, BAL, ten)
-        assert o is not None and o.prob_win == pytest.approx(0.5 * 0.66 + 0.5 * 0.4)
-        assert any("blended 50/50" in r and "10 surges" in r for r in o.rationale)
-        nine = BacktestResult(n_surges=9, n_reverted=4, reversion_rate=0.44)
+        assert o is not None and o.prob_win == pytest.approx(0.6)
+        assert any("capped at the measured 60%" in r and "10 participant-driven surges" in r for r in o.rationale)
+        nine = BacktestResult(n_surges=12, n_reverted=4, reversion_rate=0.44, n_participant=9,
+                              participant_reversion_rate=0.3)
         o = fade_opportunity(mk_surge(), quote(0.69, 0.70), info(), NOW, BAL, nine)
+        assert o is not None and o.prob_win == pytest.approx(0.66)
+        legacy = BacktestResult(n_surges=10, n_reverted=4, reversion_rate=0.4)  # no participant measure: odds alone
+        o = fade_opportunity(mk_surge(), quote(0.69, 0.70), info(), NOW, BAL, legacy)
         assert o is not None and o.prob_win == pytest.approx(0.66)
 
     def test_negative_edge_suppressed(self) -> None:
         assert fade_opportunity(mk_surge(odds=0.3), quote(0.69, 0.70), info(), NOW, BAL) is None
         assert fade_opportunity(mk_surge(odds=0.5), quote(0.69, 0.70), info(), NOW, BAL) is None  # zero edge
-        low = BacktestResult(n_surges=20, n_reverted=2, reversion_rate=0.1)
+        # [updated, §5.5.4] the low measured rate must be the participant-only one to cap the odds
+        low = BacktestResult(n_surges=20, n_reverted=2, reversion_rate=0.1, n_participant=20,
+                             participant_reversion_rate=0.1)
         assert fade_opportunity(mk_surge(odds=0.6), quote(0.69, 0.70), info(), NOW, BAL, low) is None
 
     @pytest.mark.parametrize("verdict", ["news", "unclear", None])
@@ -285,7 +299,8 @@ class TestCarry:
         assert o.edge == pytest.approx(p_true * (1 - 0.975) - (1 - p_true) * 0.975)
         assert o.suggested_shares == size_position(p_true, 0.975, BAL) == math.floor(0.25 * 0.12 * BAL / 0.975)
         assert o.settles_before_cup_end is True and o.horizon_hours == pytest.approx(40.0)
-        assert o.score == pytest.approx(o.expected_return * o.confidence, abs=1e-6)
+        # [updated, §5.1 / D33] score = growth_score (was expected_return x confidence)
+        assert o.score == pytest.approx(S.growth_score(o.bet, o.edge, o.confidence, o.entry_price), abs=1e-6)
         text = " | ".join(o.rationale)
         assert "favourite-longshot adjustment" in text and "before the Cup ends" in text
 
@@ -310,7 +325,15 @@ class TestCarry:
         late = carry_opportunity(band(settle=CUP_END + 30 * 86400), quote(0.97, 0.975), None, NOW, CUP_END, BAL)
         assert early is not None and late is not None
         assert late.settles_before_cup_end is False
-        assert late.score == pytest.approx(early.score / 2, abs=1e-6)
+        # [updated, §5.5.2] no "score x 0.5" rule: the edge itself is the regime EV (unknown rule: the smaller of
+        # a real resolution and a VWAP closeout, whose uncalled branch loses), and the score is its growth score
+        assert early.edge == pytest.approx(0.978 - 0.975)
+        ev, _, detail = S.regime_ev(0.978, 0.975, 0.9725, "unknown", 0.97, StrategyParams(), settles_before_end=False)
+        assert late.edge == pytest.approx(ev, abs=1e-6) and late.edge < early.edge
+        assert detail["uncalled_payoff"] < 0
+        assert late.score == pytest.approx(S.growth_score(late.bet, late.edge, late.confidence, late.entry_price), abs=1e-6)
+        assert not any("score halved" in line for line in late.rationale)
+        assert any("5-hour VWAP closeout" in line and "called probability 97%" in line for line in late.rationale)
         assert any("valued at market price at cup end, not paid out" in r.lower() for r in late.risks)
         assert not any("not paid out" in r for r in early.risks)
         assert late.horizon_hours == pytest.approx((CUP_END - NOW) / H, abs=0.01)
@@ -377,7 +400,9 @@ class TestArbitrage:
         assert o.entry_price == 0.95  # buy YES 0.50 + buy NO (sell YES at 0.55) 0.45
         assert o.edge == 0.05 and o.expected_return == pytest.approx(0.05 / 0.95, abs=1e-6)  # rounded to 6 dp
         assert o.suggested_shares == math.floor(8000 / 0.95)
-        assert o.score == pytest.approx(o.expected_return * S.CONSTRAINT_CONFIDENCE, abs=1e-6)
+        # [updated, §5.1 / D33] score = growth_score of the set's bet (was expected_return x confidence)
+        assert o.bet is not None and o.bet.kind == "bounded"
+        assert o.score == pytest.approx(S.growth_score(o.bet, o.edge, S.CONSTRAINT_CONFIDENCE, o.entry_price), abs=1e-6)
         text = " | ".join(o.rationale)
         assert "monotonic violation of 0.05" in text and "Rule: P(160K) <= P(150K)" in text
         assert "buy NO at 0.45" in text and "overpriced" in text
@@ -446,9 +471,14 @@ class TestBuildReport:
         r = build_report(**scenario())
         assert 4 <= len(r.principles) <= 6
         text = " ".join(r.principles)
-        for needle in ("top 3", "convex", "variance is your friend", "compound slowly", "participant-driven",
-                       "settlement dates", "Diversify", "uncorrelated"):
+        # [updated, §5.5.8] the chaser rule replaces "variance is your friend", the national polling error replaces
+        # "diversify across uncorrelated markets", and the regime-aware rule replaces the settlement-date one
+        for needle in ("top 3", "convex", "concentrate on your best edges", "one bet on the national swing",
+                       "compound slowly", "participant-driven", "end rule is unknown", "5-hour VWAP closeout",
+                       "national polling error", "diversify only to protect a lead"):
             assert needle in text
+        for gone in ("variance is your friend", "uncorrelated markets", "Respect settlement dates"):
+            assert gone not in text
 
     def test_aggressive_multipliers(self) -> None:
         base = {o.kind: o.score for o in build_report(**scenario()).opportunities if o.kind != "arbitrage"}
@@ -549,7 +579,9 @@ def reference_backtest(series_by: Dict[str, List[PricePoint]], horizon_s: float,
 class TestBacktest:
     def test_two_scripted_spikes(self) -> None:
         pts, a_at, b_at = scripted_series()
-        r = backtest_fade({"e1": pts}, market_of={"e1": "m1"})
+        # [updated, §5.5.7] the old mark-to-mark numbers need net_of_spread=False (the default is now net of spread)
+        r = backtest_fade({"e1": pts}, market_of={"e1": "m1"}, net_of_spread=False)
+        assert r.net_of_spread is False
         assert (r.n_surges, r.n_reverted, r.reversion_rate, r.horizon_hours) == (2, 1, 0.5, 6.0)
         # A: detected at the first 5-minute step after the jump, faded from ~0.68; 6 h later YES is ~0.536
         a_mark = next(p.price for p in reversed(pts) if p.ts <= math.ceil(a_at / 300) * 300)
@@ -574,7 +606,7 @@ class TestBacktest:
             rng_pts.append(PricePoint(ts=p.ts + 7, price=round(price + (0.002 if i % 3 else 0.0), 6)))
         series = {"e1": pts, "e2": rng_pts}
         ref = reference_backtest(series, 6 * H, 300.0)
-        r = backtest_fade(series)
+        r = backtest_fade(series, net_of_spread=False)  # [updated, §5.5.7] the reference walk is mark-to-mark
         assert r.n_surges == len(ref) >= 2
         assert r.n_reverted == sum(1 for e in ref if e[3])
         assert r.avg_fade_return == pytest.approx(sum(e[2] for e in ref) / len(ref), abs=1e-6)

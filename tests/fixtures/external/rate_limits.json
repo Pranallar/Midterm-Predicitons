@@ -1,0 +1,35 @@
+{
+ "_fixture": {
+  "built_by": "package A (tests/test_fairvalue.py), by hand. ILLUSTRATIVE values, real field names and shapes.",
+  "matching_rule": "D57: path + query multiset ignoring 'limit' and parameter order (tickers / market_tickers lists compared as sets in the test transport)",
+  "what": "HTTP 429 answers with Retry-After for the two steady-state routes (spec \u00a74.4/\u00a74.5, D56/D57). The Kalshi one asks for 900 s, more than MAX_RETRY_AFTER_S (600 s): the provider must cap it.",
+  "unsure_fields": [
+   "the exact 429 body of Gamma is not documented in what we read; Kalshi's error envelope is from kalshi_events.json"
+  ]
+ },
+ "responses": [
+  {
+   "request": "GET https://gamma-api.polymarket.com/markets?id=630844&id=630845&limit=2",
+   "status": 429,
+   "headers": {
+    "Retry-After": "120"
+   },
+   "body": {
+    "error": "Too Many Requests"
+   }
+  },
+  {
+   "request": "GET https://api.elections.kalshi.com/trade-api/v2/markets?tickers=SENATENH-26-D,SENATENH-26-R&limit=100",
+   "status": 429,
+   "headers": {
+    "Retry-After": "900"
+   },
+   "body": {
+    "error": {
+     "code": "too_many_requests",
+     "message": "too many requests"
+    }
+   }
+  }
+ ]
+}

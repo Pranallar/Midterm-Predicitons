@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-/* Regression checks for the dashboard UI bugs found in QA round 1 (CommonJS, Playwright).
+/* Regression checks for the dashboard UI bugs found in QA round 1, and the Simulation view's states
+ * (docs/PAPER_TRADING.md §8.4, "sim-*" checks on page.route() fixtures from sim_fixtures.cjs) (CommonJS, Playwright).
  *
  *   node tests/e2e/regressions.cjs [URL] [--only id,id]
  *
@@ -14,6 +15,7 @@
 'use strict';
 
 const { launch, startServer, stopServer, check } = require('./lib.cjs');
+const SF = require('./sim_fixtures.cjs');
 
 const args = process.argv.slice(2);
 let URL_ARG = null;
@@ -751,6 +753,397 @@ async function desktopChecks(browser) {
   await page.context().close();
 }
 
+// ------------------------------------------------------------------ simulation view (docs/PAPER_TRADING.md §8.4)
+
+const JSON_HEADERS = { 'content-type': 'application/json' };
+
+/** Serve the Simulation endpoints from fixtures (§10). opts: paper(now, url) -> body or {status, body}; fairvalue,
+ *  backtest likewise; resets: an array that records every POST /api/paper/reset; gets: records GET /api/paper URLs. */
+async function simRoutes(page, opts) {
+  opts = opts || {};
+  const reply = (route, out) => {
+    const res = out && out.__status ? out : { __status: 200, body: out };
+    return route.fulfill({ status: res.__status, headers: JSON_HEADERS, body: JSON.stringify(res.body) });
+  };
+  await page.route((u) => u.pathname === '/api/paper', (route) => {
+    const now = Date.now() / 1000;
+    const u = new URL(route.request().url());
+    if (opts.gets) opts.gets.push(u.search);
+    if (u.searchParams.get('run') === 'previous') return reply(route, opts.previous ? opts.previous(now) : SF.previous(now));
+    return reply(route, (opts.paper || SF.paper)(now, {}));
+  });
+  await page.route((u) => u.pathname === '/api/paper/reset', (route) => {
+    const req = route.request();
+    if (opts.resets) opts.resets.push({ method: req.method(), type: req.headers()['content-type'], body: req.postData() });
+    return reply(route, { reset: true, run_id: 'run-2', previous_run_id: 'run-1',
+      message: 'Started a new 24-hour simulation with 100,000 SUSQies per portfolio. The previous run\'s result is kept under Previous run.' });
+  });
+  await page.route((u) => u.pathname === '/api/fairvalue', (route) => reply(route, (opts.fairvalue || SF.fairvalue)(Date.now() / 1000)));
+  await page.route((u) => u.pathname === '/api/backtest', (route) => reply(route, (opts.backtest || SF.backtest)(Date.now() / 1000)));
+}
+
+async function openSim(page) {
+  await open(page, '#sim', { noWait: true });
+  await page.waitForSelector('#sim-body > *', { timeout: 20000 });
+}
+
+function waitText(page, sel, re, timeout) {
+  return page.waitForFunction((a) => {
+    const el = document.querySelector(a[0]);
+    return !!el && new RegExp(a[1]).test(el.textContent.replace(/\s+/g, ' '));
+  }, [sel, re.source], { timeout: timeout || 15000 });
+}
+
+async function simChecks(browser) {
+  const page = await newPage(browser);
+
+  await run('sim-empty-run', page, async () => {
+    await simRoutes(page, { paper: (now) => SF.paper(now, { empty: true }) });
+    await openSim(page);
+    await waitText(page, '#sim-body [data-panel="clock"]', /Waiting for the first simulated step \(every 30 s\)\./);
+    check(/0\.0 h observed of the 24-hour test/.test(await text(page, '#sim-clock-text')), 'the clock reads 0.0 h of the 24-hour test');
+    const bar = await page.evaluate(() => { const b = document.querySelector('#sim-body [role="progressbar"]'); return b && [b.getAttribute('aria-valuenow'), b.getAttribute('aria-valuemax')]; });
+    check(bar && bar[0] === '0' && bar[1] === '24', 'the progress bar runs from 0 to the 24 target hours: ' + JSON.stringify(bar));
+    check(!(await page.$('#sim-body [data-panel="headline"]')), 'no headline before the first step');
+    check(await page.isVisible('#sim-body [data-panel="fairvalue"]'), 'the fair values still show');
+    await page.unrouteAll({ behavior: 'ignoreErrors' });
+    await simRoutes(page, { paper: (now) => Object.assign(SF.paper(now, { empty: true }), { run: null }) });
+    await openSim(page);
+    await waitText(page, '#sim-body .sim-note', /^Waiting for the first simulated step \(every \d+ s\)\.$/);
+  });
+
+  await run('sim-populated', page, async () => {
+    await simRoutes(page);
+    await openSim(page);
+    await page.waitForSelector('#sim-body [data-panel="headline"] .verdict-sentence');
+    const head = await text(page, '#sim-body [data-panel="headline"]');
+    check((await page.getAttribute('#sim-body [data-panel="headline"]', 'data-portfolio')) === 'human:conservative', 'the headline is the pre-registered human: portfolio');
+    check(/You, acting by hand ~4 min late: all ideas, conservative sizing/.test(head), 'the headline label is shown');
+    check(/\+412 SUSQies profit/.test(head) && /\+0\.41% at liquidation value/.test(head) && /\(at mid marks: \+1,234\)/.test(head), 'P&L, % and mid marks: ' + head.slice(0, 200));
+    const fx = SF.paper(Date.now() / 1000, {});
+    check((await text(page, '#sim-body [data-panel="headline"] .verdict-sentence')) === fx.headline.verdict.sentence, 'the verdict sentence is verbatim');
+    check((await text(page, '#sim-body [data-panel="headline"] .verdict-level')) === 'Not enough evidence', 'the verdict badge has its icon and text');
+    const cav = await page.$$eval('#sim-body [data-panel="headline"] .verdict-caveats li', (els) => els.map((e) => e.textContent));
+    check(cav.length === 4 && cav[0] === SF.CAVEATS[0] && cav[3] === SF.CAVEATS[3], 'the four verdict caveats sit directly under the verdict');
+    check(/1 position whose market closed without a ruling is left out/.test(head) && /8% of the value is marked without a recent order book/.test(head), 'unvalued and depth-unknown lines');
+    check((await text(page, '#sim-clock-text')) === '6.0 h observed of the 24-hour test (1 gap; 6.4 h on the clock)', 'covered hours, gaps and clock hours: ' + (await text(page, '#sim-clock-text')));
+    const clock = await text(page, '#sim-body [data-panel="clock"]');
+    check(/Settlement rule assumed: unknown, valued conservatively/.test(clock) && /100,000 SUSQies \(default 100,000\)/.test(clock), 'regime and capital source: ' + clock.slice(0, 300));
+    await page.click('#sim-body [data-panel="clock"] .sim-details summary');
+    check(/min_value_edge = 0\.03/.test(await text(page, '#sim-body [data-panel="clock"]')) && /0\.1\.0\+bb37b8755/.test(await text(page, '#sim-body [data-panel="clock"]')), 'the run settings list the changed parameters and code version');
+    // portfolios: three groups, the warning above, exploratory badges, the model column's footnote
+    const groups = await page.$$eval('#sim-body .portfolios-table tbody .group-row', (els) => els.map((e) => e.textContent.trim()));
+    check(groups.join('|') === 'Your headline (decided before the run)|Bot speed: an upper bound for acting by hand|By strategy (equal capital, conservative sizing, exploratory)', 'three portfolio groups: ' + groups.join('|'));
+    const ids = await page.$$eval('#sim-body .portfolios-table tbody tr[data-pid]', (els) => els.map((e) => e.dataset.pid));
+    check(ids.join(',') === SF.PORTFOLIOS.map((p) => p[0]).join(','), 'every portfolio in config order, headline first: ' + ids.join(','));
+    check((await text(page, '#sim-body [data-panel="portfolios"] .table-warning')) === SF.TABLE_WARNING, 'the table warning is the fixed sentence');
+    check(/\* The model's own opinion/.test(await text(page, '#sim-body [data-panel="portfolios"] .footnote')), 'the model valuation is labelled');
+    check(/No fade signals in 6\.0 h/.test(await text(page, '#sim-body .portfolios-table tr[data-pid="kind:fade"]')), 'a portfolio without fills says why');
+    // no text names a best portfolio (the fixed warnings are the only place the word may appear)
+    const best = await page.evaluate(() => {
+      const root = document.getElementById('sim-body').cloneNode(true);
+      for (const w of root.querySelectorAll('.table-warning')) w.remove();
+      const host = document.querySelector('#sim-body .sim-chart');
+      return { text: /\bbest\b/i.test(root.textContent), label: /\bbest\b/i.test(host.getAttribute('aria-label') || '') };
+    });
+    check(!best.text && !best.label, 'nothing names or highlights a best portfolio: ' + JSON.stringify(best));
+    // equity chart: one line per portfolio, the headline thicker and labelled, kinds told apart by dash patterns
+    const eq = await page.evaluate(() => {
+      const paths = Array.from(document.querySelectorAll('#sim-body .sim-chart path.eq-line'));
+      return {
+        n: paths.length, head: paths.filter((p) => p.classList.contains('eq-headline')).length,
+        dashes: paths.filter((p) => p.classList.contains('eq-kind')).map((p) => p.getAttribute('stroke-dasharray')),
+        label: (document.querySelector('#sim-body .sim-chart .end-label') || {}).textContent,
+        aria: document.querySelector('#sim-body .sim-chart').getAttribute('aria-label'),
+        legend: Array.from(document.querySelectorAll('#sim-body .eq-legend button')).map((b) => b.getAttribute('aria-pressed')),
+      };
+    });
+    check(eq.n === 9 && eq.head === 1, 'nine equity lines, one headline: ' + JSON.stringify(eq));
+    check(new Set(eq.dashes).size === eq.dashes.length && eq.dashes.every(Boolean), 'every kind line has its own dash pattern: ' + eq.dashes.join(' | '));
+    check(/^You, by hand [+−]/.test(eq.label || ''), 'the headline is labelled at its end: ' + eq.label);
+    check(/^Equity curves: 9 portfolios; headline \(you, by hand\): \+412 at liquidation$/.test(eq.aria), 'the chart summary names the headline only: ' + eq.aria);
+    check(eq.legend.length === 9 && eq.legend.every((x) => x === 'true'), 'the legend is a row of pressed toggle buttons');
+    await page.focus('#sim-body .eq-legend button[data-pid="kind:value"]');
+    await page.keyboard.press('Space');
+    await page.waitForFunction(() => document.querySelectorAll('#sim-body .sim-chart path.eq-line').length === 8);
+    check((await page.getAttribute('#sim-body .eq-legend button[data-pid="kind:value"]', 'aria-pressed')) === 'false', 'a legend toggle hides its line (keyboard)');
+    await page.keyboard.press('Space');
+    await page.waitForFunction(() => document.querySelectorAll('#sim-body .sim-chart path.eq-line').length === 9);
+    await page.focus('#sim-body .sim-chart');
+    await page.keyboard.press('ArrowLeft');
+    await page.waitForSelector('#sim-body .sim-chart .tooltip:not([hidden])');
+    const tip = await text(page, '#sim-body .sim-chart .tooltip');
+    check(/You, by hand \(headline\)/.test(tip) && /Arbitrage only/.test(tip), 'the readout lists every portfolio at that time: ' + tip.slice(0, 160));
+    await page.waitForFunction(() => /Time \d+ of \d+\./.test(document.querySelector('#sim-body [data-panel="equity"] [role="status"]').textContent));
+    // positions, baskets, fills and trades in plain words (the filter starts on the headline portfolio)
+    check((await page.inputValue('#sim-pos-filter')) === SF.PORTFOLIOS[0][0], 'open positions start filtered to the headline: ' + (await page.inputValue('#sim-pos-filter')));
+    await page.selectOption('#sim-pos-filter', '');
+    await page.waitForFunction(() => document.querySelectorAll('#sim-body .positions-table tbody tr').length > 1);
+    const pos = await text(page, '#sim-body [data-panel="positions"]');
+    for (const w of ['depth from an older book', 'depth unknown: valued with a haircut', 'market closed, no ruling yet (not counted)', 'quote stale', 'after the Cup end', 'bold bet']) {
+      check(pos.indexOf(w) !== -1, 'position flag in plain words: ' + w);
+    }
+    check(/Right after entry a set is worth less at liquidation than its cost: that is the spread, not a loss of the locked edge\./.test(pos), 'the basket sentence');
+    check(/Floor at settlement/.test(pos) && /Now at liquidation/.test(pos) && /300\.00/.test(pos) && /279\.00/.test(pos), 'floor and liquidation side by side');
+    await page.selectOption('#sim-pos-filter', 'kind:hole');
+    await page.waitForFunction(() => document.querySelectorAll('#sim-body .positions-table tbody tr').length === 1);
+    await page.selectOption('#sim-pos-filter', '');
+    const fills = await page.$$eval('#sim-body .fills-table tbody tr .fill-text', (els) => els.map((e) => e.textContent));
+    check(fills.join('|') === 'Bought 300 YES @ 0.695|Sold 300 NO @ 0.520|Settled 800 YES @ 1.000', 'fills read as orders: ' + fills.join('|'));
+    const trades = await text(page, '#sim-body [data-panel="trades"]');
+    check(/Converged: the gap closed/.test(trades) && /Settled/.test(trades) && /The fair value moved/.test(trades) && /2\.3 h/.test(trades), 'closed trades: exit reasons and hold times');
+    const chaser = await text(page, '#sim-body [data-panel="chaser"]');
+    check(/chase \(kept by hysteresis\)/.test(chaser) && /221,500 SUSQies \(range 221,500–236,000\)/.test(chaser) && /M\s*2\.2(?!\d)/.test(chaser) && /can also lose most of its capital/.test(chaser), 'chaser sizing: ' + chaser.slice(0, 260));
+    const cv = await page.$$eval('#sim-body [data-panel="caveats"] li', (els) => els.map((e) => e.textContent));
+    check(cv.length === 10 && cv[9] === SF.DEMO_CAVEAT, 'How to read this lists every caveat (and the demo one)');
+    check(await page.isVisible('#sim-demo-badge'), 'the demo badge shows');
+  });
+
+  await run('sim-disabled', page, async () => {
+    await simRoutes(page, { paper: (now) => SF.paperDisabled(now) });
+    await openSim(page);
+    await waitText(page, '#sim-body .sim-note', /^The paper trader is off\. Start the dashboard without --no-paper to simulate\.$/);
+    check(!(await page.$('#sim-body [data-panel="headline"]')) && !(await page.$('#sim-body [data-panel="portfolios"]')), 'no simulation panels while it is off');
+    check((await text(page, '#live-label')) !== 'Offline' && (await page.isHidden('#offline-banner')), 'not reported as offline');
+    check(await page.isHidden('#view-errors-sim'), 'no error line for a disabled simulator');
+  });
+
+  await run('sim-endpoint-error', page, async () => {
+    await simRoutes(page, { paper: () => ({ __status: 500, body: { error: 'Internal error; see the dashboard\'s log.' } }) });
+    await openSim(page);
+    await page.waitForSelector('#view-errors-sim:not([hidden])', { timeout: 15000 });
+    check(/Could not load the simulation: Internal error/.test(await text(page, '#view-errors-sim')), 'the failure shows inline in the view: ' + (await text(page, '#view-errors-sim')));
+    check(/Could not load the simulation\. Retrying every 5 s\./.test(await text(page, '#sim-body .sim-note')), 'the view says it retries');
+    check((await text(page, '#live-label')) === 'Live' && (await page.isHidden('#offline-banner')), 'the header stays Live, no Offline banner');
+    await page.unrouteAll({ behavior: 'ignoreErrors' });
+    await simRoutes(page, { backtest: () => ({ __status: 503, body: { error: 'busy' } }) });
+    await page.waitForSelector('#sim-body [data-panel="headline"]', { timeout: 15000 });
+  });
+
+  await run('sim-reset-dialog', page, async () => {
+    const resets = [];
+    const gets = [];
+    await simRoutes(page, { resets, gets });
+    await openSim(page);
+    await page.waitForSelector('#sim-reset');
+    await page.click('#sim-reset');
+    await page.waitForFunction(() => document.getElementById('sim-reset-dialog').open);
+    check((await page.evaluate(() => document.activeElement.id)) === 'sim-reset-cancel', 'the dialog opens with focus on Cancel');
+    check(/Every portfolio goes back to its start capital and the 24-hour clock restarts\. The current run’s result is kept under "Previous run"\. Nothing real is affected\./.test(await text(page, '#sim-reset-text')), 'the dialog explains the reset');
+    await page.click('#sim-reset-cancel');
+    await page.waitForFunction(() => !document.getElementById('sim-reset-dialog').open);
+    check((await page.evaluate(() => document.activeElement.id)) === 'sim-reset', 'focus returns to the Reset button');
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => document.getElementById('sim-reset-dialog').open);
+    await page.keyboard.press('Escape');
+    await page.waitForFunction(() => !document.getElementById('sim-reset-dialog').open);
+    await page.waitForTimeout(300);
+    check(resets.length === 0, 'Cancel and Esc send nothing (' + resets.length + ' requests)');
+    const before = gets.length;
+    await page.click('#sim-reset');
+    await page.click('#sim-reset-confirm');
+    await waitText(page, '#sim-status', /^Started a new 24-hour simulation with 100,000 SUSQies per portfolio\./);
+    await page.waitForTimeout(500);
+    check(resets.length === 1, 'Confirm sends exactly one request (' + resets.length + ')');
+    check(resets[0].method === 'POST' && /^application\/json/.test(resets[0].type || '') && JSON.stringify(JSON.parse(resets[0].body)) === '{"confirm":true}', 'one POST with the JSON body: ' + JSON.stringify(resets[0]));
+    check((await page.getAttribute('#sim-status', 'role')) === 'status', 'the result goes to a status region');
+    check(gets.length > before, 'the view reloads its data after the reset');
+    check(!(await page.evaluate(() => document.getElementById('sim-reset-dialog').open)), 'the dialog closed');
+  });
+
+  await run('sim-equity-table', page, async () => {
+    await simRoutes(page, { paper: (now) => SF.paper(now, { points: 300 }) });
+    await openSim(page);
+    await page.waitForSelector('#sim-body .sim-chart path.eq-line');
+    const btn = '#sim-body button[data-action="sim-table-toggle"]';
+    await page.click(btn);
+    await page.waitForSelector('#sim-body .eq-table tbody tr');
+    const t = await page.evaluate(() => ({
+      rows: document.querySelectorAll('#sim-body .eq-table tbody tr').length,
+      cols: document.querySelectorAll('#sim-body .eq-table thead th').length,
+      chart: document.querySelector('#sim-body .sim-chart').hidden,
+    }));
+    check(t.rows <= 50 && t.rows >= 40 && t.cols === 10 && t.chart, 'the table lists up to 50 evenly spaced times x 9 portfolios: ' + JSON.stringify(t));
+    check((await page.getAttribute(btn, 'aria-pressed')) === 'true' && (await text(page, btn)) === 'Show as table', 'the toggle keeps one label and says it is pressed');
+    await page.click(btn);
+    await page.waitForSelector('#sim-body .sim-chart path.eq-line');
+    check(await page.isHidden('#sim-body .sim-eq-table'), 'the chart is back');
+  });
+
+  await run('sim-verdict-badges', page, async () => {
+    let level = 'insufficient';
+    await simRoutes(page, { paper: (now) => SF.paper(now, { level }) });
+    await openSim(page);
+    const want = { insufficient: 'Not enough evidence', inconclusive: 'Inconclusive', promising: 'Promising, not proof', positive: 'Profitable so far', negative: 'Losing so far' };
+    for (const lv of Object.keys(want)) {
+      level = lv;
+      await page.waitForFunction((w) => {
+        const b = document.querySelector('#sim-body [data-panel="headline"] .verdict-level');
+        return b && b.textContent.trim() === w;
+      }, want[lv], { timeout: 15000 });
+      const s = await text(page, '#sim-body [data-panel="headline"] .verdict-sentence');
+      check(s === SF.paper(Date.now() / 1000, { level: lv }).headline.verdict.sentence, lv + ': the sentence is shown verbatim: ' + s.slice(0, 60));
+      check(await page.$('#sim-body [data-panel="headline"] .verdict-level .icon'), lv + ': the badge has an icon, not only a colour');
+    }
+    const rows = await page.$$eval('#sim-body .portfolios-table tbody tr[data-pid] .cell-verdict', (els) => els.map((e) => e.textContent.trim()));
+    check(rows[0] === 'Profitable so far' || rows[0] === 'Losing so far', 'the headline row is not exploratory: ' + rows[0]);
+    check(rows.indexOf('Exploratory: promising, not proof') !== -1 && rows.indexOf('Exploratory: losing so far') !== -1 && rows.indexOf('Exploratory: inconclusive') !== -1, 'exploratory rows read "Exploratory: <level>": ' + rows.join(' | '));
+    check(rows.slice(1).every((r) => /^Exploratory: /.test(r)), 'every other portfolio is exploratory');
+  });
+
+  await run('sim-study', page, async () => {
+    await simRoutes(page);
+    await openSim(page);
+    await page.waitForSelector('#sim-body [data-panel="study"] .study-table tbody tr');
+    check((await text(page, '#sim-body [data-panel="study"] .study-can')) === SF.CAN_SHOW, 'the "can show" sentence is verbatim');
+    check((await text(page, '#sim-body [data-panel="study"] .study-cannot')) === SF.CANNOT_SHOW, 'the "cannot show" sentence is verbatim');
+    const heads = await page.$$eval('#sim-body [data-panel="study"] .study-table thead th', (els) => els.map((e) => e.textContent.trim()));
+    check(heads.join('|') === 'Kind|+5 min|+30 min|+2 h|+6 h', 'columns +5 min, +30 min, +2 h, +6 h: ' + heads.join('|'));
+    const cells = await page.$$eval('#sim-body [data-panel="study"] .study-table tbody tr', (trs) => trs.map((tr) => Array.from(tr.querySelectorAll('td')).map((td) => td.textContent.replace(/\s+/g, ' ').trim())));
+    check(cells[0][0] === '212 signals: +0.004 (−0.001 to +0.009) per share; converged 41%, reversed 12%', 'value +5 min: ' + cells[0][0]);
+    check(cells[0][2] === '120 signals: +0.011 per share; converged 58%, reversed 18%', 'an interval only when present: ' + cells[0][2]);
+    check(cells[1][0] === '9 signals: +0.012 per set; converged 33%' && cells[1][3] === 'No signals yet', 'basket per set: ' + cells[1].join(' | '));
+  });
+
+  await run('sim-testability', page, async () => {
+    let status = 'ready';
+    await simRoutes(page, { backtest: (now) => SF.backtest(now, status) });
+    await openSim(page);
+    await page.waitForSelector('#sim-body [data-panel="backtest"] .testability-table tbody tr');
+    const order = await page.evaluate(() => {
+      const panel = document.querySelector('#sim-body [data-panel="backtest"]');
+      const tables = Array.from(panel.querySelectorAll('table'));
+      const win = panel.querySelector('.bt-window');
+      return { first: tables[0].classList.contains('testability-table'), before: !!(win && (tables[0].compareDocumentPosition(win) & Node.DOCUMENT_POSITION_FOLLOWING)) };
+    });
+    check(order.first && order.before, 'the testability table comes first in the report: ' + JSON.stringify(order));
+    const rows = await page.$$eval('#sim-body .testability-table tbody tr', (trs) => trs.map((tr) => tr.dataset.kind + ':' + tr.querySelector('td').textContent.trim()));
+    check(rows.join(',') === 'value:Not testable yet,basket:Partly testable,hole:Partly testable,fade:Partly testable,carry:Testable,arbitrage:Not replayable', 'kind, status word: ' + rows.join(','));
+    const bt = await text(page, '#sim-body [data-panel="backtest"]');
+    check(/not an independent check, so agreement between the two is not evidence/.test(await text(page, '#sim-body .bt-overlap')), 'the overlap warning is prominent');
+    check(/The best of 2 settings is an optimistic estimate/.test(bt) && /latency_s=300/.test(bt), 'the sweep table with its warning');
+    check(/Quotes: 62% from live snapshots, 38% from candles/.test(bt) && /Only 9 hours of data/.test(bt) && /cannot tell the sizing policies apart/.test(bt), 'coverage, assumptions and warnings');
+    for (const [st, re] of [['pending', /Replaying the stored history/], ['no_data', /Less than 1 hour of prices is stored yet/], ['error', /The backtest failed: database is locked/]]) {
+      status = st;
+      await openSim(page); // a fresh load: the backtest is otherwise asked again only every 30 s
+      await waitText(page, '#sim-body [data-panel="backtest"] .bt-status', re, 20000);
+    }
+  });
+
+  await run('sim-fairvalue-suspect', page, async () => {
+    await page.context().grantPermissions(['clipboard-read', 'clipboard-write'], { origin: BASE });
+    const consoleErrors = [];
+    const onConsole = (m) => { if (m.type() === 'error') consoleErrors.push(m.text()); };
+    page.on('console', onConsole);
+    await simRoutes(page);
+    await openSim(page);
+    const row = '#sim-body .fv-table tr[data-eid="9031"]';
+    await page.waitForSelector(row);
+    const t = await text(page, row);
+    check(/suspect match/.test(t) && /No/.test(t) && /Suspect: 0\.34 away/.test(t), 'a suspect row says so: ' + t.slice(0, 200));
+    check(/near match: shown, not traded/.test(await text(page, '#sim-body .fv-table tr[data-eid="9016"]')), 'a near match is shown, not traded');
+    check(/Polymarket: offline from this machine/.test(await text(page, '#sim-body [data-panel="fairvalue"]')), 'provider status in words');
+    await page.click(row + ' .fix-details summary');
+    const pres = await page.$$eval(row + ' .fix-details pre', (els) => els.map((e) => e.textContent));
+    check(pres.length === 3 && pres[2] === '"9031": {"polymarket": "512301", "confirmed": true}', 'the disable, pin and confirm snippets: ' + pres.join(' | '));
+    check(/Paste it under "overrides" in \/home\/user\/\.supermarket\/2026-midterms\/fair_value_map\.json; it applies within a minute\./.test(await text(page, row + ' .fix-details')), 'the paste instruction names the map file');
+    await page.click(row + ' .fix-details .btn-copy >> nth=2');
+    await waitText(page, row + ' .fix-details .snippet-block:nth-child(3) .copy-label', /^Copied$/);
+    check((await page.evaluate(() => navigator.clipboard.readText())) === pres[2], 'Copy puts the snippet on the clipboard');
+    // no clipboard access: the snippet is selected instead, without errors
+    await page.evaluate(() => { navigator.clipboard.writeText = () => Promise.reject(new DOMException('Write permission denied.', 'NotAllowedError')); });
+    await page.click(row + ' .fix-details .btn-copy >> nth=0');
+    await waitText(page, row + ' .fix-details .snippet-block:nth-child(1) .copy-label', /Selected: press Ctrl\+C/);
+    check((await page.evaluate(() => getSelection().toString())) === pres[0], 'without clipboard access the snippet text is selected');
+    await page.evaluate(() => getSelection().removeAllRanges());
+    check(!consoleErrors.length, 'no console errors: ' + consoleErrors.join(' | '));
+    page.off('console', onConsole);
+    // filters
+    await page.check('#sim-fv-usable');
+    await page.waitForFunction(() => document.querySelectorAll('#sim-body .fv-table tbody tr').length === 1);
+    check(/Showing 1 of 4 outcomes/.test(await text(page, '#sim-fv-count')), 'Only usable filters the rows');
+    await page.uncheck('#sim-fv-usable');
+    await page.fill('#sim-fv-search', 'nebraska');
+    await page.waitForFunction(() => document.querySelectorAll('#sim-body .fv-table tbody tr').length === 1);
+    await page.fill('#sim-fv-search', '');
+  });
+
+  await run('sim-previous-run', page, async () => {
+    const gets = [];
+    let missing = false;
+    await simRoutes(page, { gets, previous: (now) => (missing ? { __status: 404, body: { error: 'No earlier simulation run has ended yet.' } } : SF.previous(now)) });
+    await openSim(page);
+    await page.waitForSelector('#sim-previous-btn:not([hidden])');
+    check(!gets.some((q) => /run=previous/.test(q)), 'the previous run is not loaded until asked for');
+    await page.click('#sim-previous-btn');
+    await page.waitForSelector('#sim-body [data-panel="previous"] table');
+    check(gets.filter((q) => /run=previous/.test(q)).length === 1, 'opening it loads ?run=previous once');
+    check((await page.getAttribute('#sim-previous-btn', 'aria-expanded')) === 'true', 'the button says it is expanded');
+    const prev = await text(page, '#sim-body [data-panel="previous"]');
+    check(/^Previous run\s*Ended .+\(Simulation reset\)/.test(prev) && /Promising, not proof/.test(prev), 'reason, end time and the headline verdict: ' + prev.slice(0, 200));
+    check((await page.$$('#sim-body [data-panel="previous"] tbody tr')).length === 9, 'one row per portfolio');
+    await page.click('#sim-previous-btn');
+    await page.waitForFunction(() => !document.querySelector('#sim-body [data-panel="previous"]') || !document.querySelector('#sim-body [data-panel="previous"]').isConnected);
+    missing = true;
+    await page.click('#sim-previous-btn');
+    await waitText(page, '#sim-body [data-panel="previous"]', /No earlier simulation run has ended yet\./);
+    await page.click('#sim-previous-btn');
+  });
+
+  await run('strategy-new-kinds', page, async () => {
+    await patch(page, '**/api/strategy', (j, now) => {
+      j.opportunities = SF.strategyIdeas(now).concat(j.opportunities || []);
+      j.sizing = SF.strategySizing();
+      j.settlement_regime = 'unknown';
+    });
+    await open(page, '#strategy', { noWait: true });
+    await page.waitForSelector('#strategy-body .idea');
+    const kinds = await page.$$eval('#strategy-body .idea .idea-head .kind', (els) => els.slice(0, 3).map((e) => e.textContent.trim()));
+    check(kinds.join(',') === 'Value,Basket,Hole', 'the new kinds have badges: ' + kinds.join(','));
+    const facts = await page.evaluate(() => Array.from(document.querySelectorAll('#strategy-body .idea')).slice(0, 3).map((card) => {
+      const out = {};
+      for (const div of card.querySelectorAll('.facts > div')) out[div.querySelector('dt').textContent] = div.querySelector('dd').textContent.replace(/\s+/g, ' ').trim();
+      return out;
+    }));
+    const [v, b, ho] = facts;
+    check(v['Fair value'] === '0.580 (Polymarket and Kalshi, ± 1.0 cents)', 'fair value with its uncertainty: ' + v['Fair value']);
+    check(v.Order === 'Limit 0.535 (keeps the full required edge)', 'taker order: ' + v.Order);
+    check(v['If filled at the limit'] === '+0.035/share', 'edge at the limit: ' + v['If filled at the limit']);
+    check(/^Sell when the YES bid reaches 0\.565/.test(v['Exit plan'] || ''), 'exit plan');
+    check(v['National swing'] === 'A 3-point national swing toward the Republicans costs 0.17 per share', 'national swing: ' + v['National swing']);
+    check(/Conservative sizing: 2,400 shares/.test(v.Sizing || '') && /^Chaser sizing \(chase\): 9,100 shares/.test(v['Chaser sizing'] || ''), 'sizing and the chaser alternative');
+    check(v['Per day of capital'] === '0.21%', 'per day of capital: ' + v['Per day of capital']);
+    check(b['Set type'] === 'Bounded: a refund on one leg could lose 0.55 per set' && /^Limit 0\.970 per set \(legs 0\.410 \/ 0\.560\)$/.test(b.Order || ''), 'basket set type and leg limits: ' + JSON.stringify(b));
+    check(/^Resting limit at 0\.695 until /.test(ho.Order || '') && !('National swing' in b), 'maker order; sets carry no swing line');
+    const card = await text(page, '#strategy-body .idea:nth-child(2)');
+    check(/Buy 2 legs @ 0\.950 per full set/.test(card) && /800 sets/.test(card) && /BUY NO @ 0\.400/.test(card) && !/BUY NO YES/.test(card), 'a basket is a set of legs: ' + card.slice(0, 200));
+    const sz = await text(page, '#strategy-body section[aria-labelledby="h-sizing"]');
+    check(/^Sizing: Conservative: quarter-Kelly/.test(sz) && /221,500/.test(sz) && /Settlement rule assumed: unknown, valued conservatively/.test(sz) && /The other policy: Chaser/.test(sz), 'the sizing panel: ' + sz.slice(0, 200));
+    await gotoView(page, 'overview');
+    await page.waitForSelector('#look-ideas li a');
+    const hrefs = await page.$$eval('#look-ideas li a', (as) => as.map((a) => a.getAttribute('href')));
+    check(/^#strategy\//.test(hrefs[1]) && hrefs[0] === '#exchange/9026', 'a basket links to its card, a value idea to its outcome: ' + hrefs.slice(0, 3).join(' '));
+  });
+
+  await page.context().close();
+
+  // phone: the Simulation view never scrolls the page sideways; wide tables scroll in their own box
+  const phone = await newPage(browser, { viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, deviceScaleFactor: 2 });
+  await run('sim-390', phone, async () => {
+    await simRoutes(phone);
+    await openSim(phone);
+    await phone.waitForSelector('#sim-body .portfolios-table');
+    await phone.waitForTimeout(300);
+    const r = await phone.evaluate(() => ({
+      page: document.documentElement.scrollWidth - innerWidth,
+      table: (function () { const w = document.querySelector('#sim-body .portfolios-table').closest('.table-wrap'); return w.scrollWidth > w.clientWidth; })(),
+      chart: document.querySelector('#sim-body .sim-chart svg').getBoundingClientRect().width <= innerWidth,
+    }));
+    check(r.page <= 1 && r.table && r.chart, 'no sideways page scroll at 390 px; tables scroll in their box: ' + JSON.stringify(r));
+  });
+  await phone.context().close();
+}
+
 // ------------------------------------------------------------------ phone checks (touch)
 
 async function phoneChecks(browser) {
@@ -944,6 +1337,7 @@ async function main() {
   const browser = await launch();
   try {
     await desktopChecks(browser);
+    await simChecks(browser);
     await phoneChecks(browser);
     await forcedColorChecks(browser);
     await timerChecks(browser);

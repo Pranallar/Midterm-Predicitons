@@ -11,6 +11,11 @@ See docs/DESIGN.md (Web section).
   Content-Security-Policy and no secrets in any response.
 * :func:`run_dashboard` wires everything together for the CLI.
 
+Paper trading (docs/PAPER_TRADING.md §7.4): ``/api/paper`` (``?run=previous``), ``POST /api/paper/reset``,
+``/api/backtest`` (run in one background thread on a separate read-only database connection) and
+``/api/fairvalue``. Every Super Market client the builders create carries the GET-only guard
+(:func:`readonly.enforce_get_only`).
+
 Nothing here places orders.
 """
 
@@ -34,10 +39,12 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, TextIO, Tuple
 from urllib.parse import parse_qs, unquote, urlsplit
 
-from . import analytics, strategy
+from . import analytics, pipeline, strategy
 from . import models as _models
 from .books import Book, parse_time
 from .models import SURGE_OPEN, HighBand, PricePoint, Surge
+from .pipeline import context_summary  # noqa: F401  (moved to pipeline; re-exported under the old name, D58)
+from .readonly import enforce_get_only
 
 # Set by the tracker when a surge's market leaves the open-market list (closed or settled).
 # Read with a default so this module also works with a models.py that predates the status.
@@ -88,6 +95,13 @@ STRATEGY_TTL_S = 30.0
 STRATEGY_ERROR_TTL_S = 5.0
 BACKTEST_TTL_S = 600.0
 BACKTEST_RETRY_S = 60.0
+PAPER_BACKTEST_TTL_S = 1800.0  # the dashboard's replay backtest is re-run when its report is older than this
+PAPER_BACKTEST_HOURS = 24.0
+PAPER_RESET_MAX_CAPITAL = 10_000_000.0
+PAPER_RESET_MAX_HOURS = 720.0
+FAIRVALUE_TTL_S = 15.0  # /api/fairvalue is rebuilt at most this often
+PAPER_OFF_ERROR = "The paper trader is off (started with --no-paper)."
+NO_PREVIOUS_RUN = "No earlier simulation run has ended yet."
 BOOK_TTL_S = 15.0  # a fetched order book (or its error) is reused for this long
 BOOK_WAIT_S = 0.4  # a request waits at most this long for a background book fetch, then answers "pending"
 BOOK_STALE_S = 120.0  # while a refresh runs, an expired book younger than this is still shown (marked stale)
@@ -287,76 +301,6 @@ def _cup_end_ts(tournament: Optional[Mapping[str, Any]]) -> float:
     return 0.0  # unreachable: the default always parses
 
 
-def context_summary(raw: Any) -> Dict[str, Any]:
-    """Normalise the tracker's ``view()["context"]`` (balance, leaderboard, constraints, overround)."""
-    ctx = _plain(raw) if raw is not None else {}
-    if not isinstance(ctx, Mapping):
-        ctx = {}
-    tournament = ctx.get("tournament") if isinstance(ctx.get("tournament"), Mapping) else {}
-    board_raw = ctx.get("leaderboard")
-    board_leader_value: Optional[float] = None
-    if isinstance(board_raw, Mapping):
-        # The tracker stores {"top": [...], "my_rank", "leader_value"}; the raw API uses "leaderboard".
-        entries = (
-            board_raw.get("top") or board_raw.get("leaderboard") or board_raw.get("entries") or board_raw.get("data") or []
-        )
-        board_rank = board_raw.get("myRank", board_raw.get("my_rank"))
-        board_leader_value = _finite(board_raw.get("leader_value"))
-    elif isinstance(board_raw, list):
-        entries, board_rank = board_raw, None
-    else:
-        entries, board_rank = [], None
-    leaders = []
-    for entry in entries[:3] if isinstance(entries, list) else []:
-        if isinstance(entry, Mapping):
-            leaders.append(
-                {
-                    "rank": entry.get("rank"),
-                    "username": entry.get("username") or entry.get("name"),
-                    "pnl": _finite(entry.get("pnl")),
-                    "value": _finite(_pick(entry, "value", "finalTotalValue", "totalValue")),
-                }
-            )
-    balance = _finite(_pick(ctx, "balance", "my_balance", "myBalance"))
-    if balance is None:
-        balance = _finite(tournament.get("myBalance"))
-    initial = _finite(_pick(ctx, "initial_balance", "initialBalance"))
-    if initial is None:
-        initial = _finite(tournament.get("initialBalance"))
-    my_rank = _pick(ctx, "my_rank", "myRank")
-    if my_rank is None:
-        my_rank = board_rank
-    my_rank = int(my_rank) if isinstance(my_rank, (int, float)) and not isinstance(my_rank, bool) else None
-    leader_value = _finite(ctx.get("leader_value"))
-    if leader_value is None:
-        leader_value = board_leader_value
-    if leader_value is None and leaders:
-        top = leaders[0]
-        if top["value"] is not None:
-            leader_value = top["value"]
-        elif top["pnl"] is not None:
-            leader_value = (initial if initial is not None else DEFAULT_INITIAL_BALANCE) + top["pnl"]
-    constraints = ctx.get("constraints")
-    if isinstance(constraints, list):
-        constraints = {"data": constraints, "violationsCount": len(constraints)}
-    elif not isinstance(constraints, Mapping):
-        constraints = None
-    overround = _pick(ctx, "overround", "overround_rows", "markets", default=[])
-    if not isinstance(overround, list):
-        overround = []
-    return {
-        "balance": balance,
-        "initial_balance": initial,
-        "my_rank": my_rank,
-        "leader_value": leader_value,
-        "leaders": leaders,
-        "constraints": constraints,
-        "overround": [row for row in overround if isinstance(row, Mapping)],
-        "tournament": dict(tournament),
-        "updated_at": _epoch(_pick(ctx, "updated_at", "refreshed_at", "fetched_at")),
-    }
-
-
 def _clip(text: str, limit: int = MAX_PROBLEM_TEXT) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
@@ -524,9 +468,12 @@ def _match_terms(text: str, terms: Sequence[str]) -> bool:
 class DashboardApp:
     """The dashboard's data layer: one method per endpoint, each returning a plain dict.
 
-    ``tracker`` needs ``view()`` (and ``request_analysis(surge_id)`` for re-analysis);
-    ``store`` is a :class:`~supermarket_bot.store.TrackerStore`; ``client`` (optional) reads
-    live order books; ``context`` is the trading :class:`~supermarket_bot.bot.Context`.
+    ``tracker`` needs ``view()`` (and ``request_analysis(surge_id)`` for re-analysis; ``paper_view`` /
+    ``paper_reset`` for the Simulation view); ``store`` is a :class:`~supermarket_bot.store.TrackerStore`;
+    ``client`` (optional) reads live order books; ``context`` is the trading
+    :class:`~supermarket_bot.bot.Context`; ``fair_values`` (optional) the tracker's FairValueService;
+    ``regime`` and ``sizing`` the settlement regime and sizing policy the Strategy view and the dashboard
+    backtest assume.
     """
 
     def __init__(
@@ -544,8 +491,14 @@ class DashboardApp:
         news_enabled: bool = True,
         llm_enabled: bool = False,
         book_wait: float = BOOK_WAIT_S,
+        fair_values: Any = None,
+        regime: str = "unknown",
+        sizing: str = "conservative",
     ) -> None:
         self.tracker = tracker
+        self.fair_values = fair_values
+        self.regime = str(regime or "unknown")
+        self.sizing = str(sizing or "conservative")
         self.store = store
         self.client = client
         self.context = context
@@ -571,6 +524,15 @@ class DashboardApp:
         self.view_error: Optional[str] = None
         self._last_view: Optional[Mapping[str, Any]] = None  # the last view() that worked
         self.view_updated_at: Optional[float] = None
+        # The replay backtest (/api/backtest): one background thread at a time on a read-only connection.
+        self._pbt_report: Any = None
+        self._pbt_status: Optional[str] = None  # last finished run: "ready" | "error" | "unavailable" | "no_data"
+        self._pbt_error: Optional[str] = None
+        self._pbt_started_at: Optional[float] = None
+        self._pbt_generated_at: Optional[float] = None
+        self._pbt_finished_at: Optional[float] = None
+        self._pbt_thread: Optional[threading.Thread] = None
+        self._fv_cache: Optional[Tuple[float, Dict[str, Any]]] = None
 
     # ------------------------------------------------------------------ inputs
     def _view(self) -> Dict[str, Any]:
@@ -734,6 +696,16 @@ class DashboardApp:
             "label": getattr(ctx, "label", None),
         }
 
+    def _paper_enabled(self) -> bool:
+        """Whether the tracker runs a paper trader (it has ``paper_view`` and it answers a dict)."""
+        view_fn = getattr(self.tracker, "paper_view", None)
+        if not callable(view_fn):
+            return False
+        try:
+            return isinstance(view_fn(), Mapping)
+        except Exception:
+            return False
+
     # ------------------------------------------------------------------ endpoints
     def health(self) -> Dict[str, Any]:
         return {"ok": True, "now": self.clock()}
@@ -748,11 +720,13 @@ class DashboardApp:
         view_error = self.view_error
         budget = tracker["read_budget"]
         limiter = getattr(self.client, "read_limiter", None)
+        extras = {k: budget[k] for k in ("paper", "reserve", "projected_per_min", "warning") if k in budget}
         if limiter is not None and _finite(budget.get("used")) is None:
             try:
                 budget = {"used": limiter.used, "limit": limiter.limit, "window_s": getattr(limiter, "window", 60.0)}
             except Exception:
                 budget = {}
+            budget.update(extras)  # the tracker's paper budget, reserve and projection (§10.5) pass through
             tracker["read_budget"] = budget
         problems = list(tracker["problems"])
         paused_for = _limiter_pause(limiter)
@@ -803,7 +777,12 @@ class DashboardApp:
             },
             "cup_end": cup_end,
             "days_left": max(0.0, (cup_end - now) / DAY_S),
-            "features": {"analysis": self.analysis_enabled, "news": self.news_enabled, "llm": self.llm_enabled},
+            "features": {
+                "analysis": self.analysis_enabled, "news": self.news_enabled, "llm": self.llm_enabled,
+                "paper": self._paper_enabled(),
+                "fair_value": (getattr(self.fair_values, "mode", None) or "off") if self.fair_values is not None else "off",
+                "sizing": self.sizing, "regime": self.regime,
+            },
             "counts": {
                 "outcomes": len(rows),
                 "markets": len({r.get("market_id") for r in rows if r.get("market_id") is not None}),
@@ -1097,46 +1076,18 @@ class DashboardApp:
             "cup_end": cup_end,
         }
         try:
-            # Only outcomes on the current open-market list: a closed or settled market keeps its
-            # last stored price and its "open" surges, and must never yield a trade idea.
-            open_ids = {r["exchange_id"] for r in self._rows(view)}
-            infos = {str(e.exchange_id): e for e in self.store.exchanges() if str(e.exchange_id) in open_ids}
-            latest: Dict[str, PricePoint] = {}
-            for eid in infos:
-                point = self.store.latest(eid)
-                if point is not None:
-                    latest[eid] = point
-            surges = [
-                s
-                for s in self.store.surges(since=now - 2 * DAY_S, limit=200)
-                if str(s.exchange_id) in open_ids and s.status != SURGE_CLOSED
-            ]
-            bands = []
-            for raw in view.get("high_band") or []:
-                if isinstance(raw, HighBand):
-                    bands.append(raw)
-                    continue
-                band = _plain(raw)
-                if isinstance(band, Mapping):
-                    try:
-                        bands.append(HighBand(**_known(HighBand, band)))
-                    except TypeError:
-                        log.debug("skipping malformed high band %r", band)
-            report = strategy.build_report(
-                now=now,
-                surges=surges,
-                bands=bands,
-                latest=latest,
-                infos=infos,
-                balance=ctx["balance"],
-                initial_balance=ctx["initial_balance"],
-                leader_value=ctx["leader_value"],
-                my_rank=ctx["my_rank"],
-                cup_end=cup_end,
-                constraints=ctx["constraints"],
-                overround_rows=ctx["overround"],
-                backtest=backtest,
+            # Only outcomes on the current open-market list: a closed or settled market keeps its last stored
+            # price and its "open" surges, and must never yield a trade idea (pipeline.assemble_inputs).
+            recent = getattr(self.tracker, "recent_mids", None)
+            try:
+                mids = recent(pipeline.RECENT_MIDS_S) if callable(recent) else None
+            except Exception:
+                mids = None
+            inputs = pipeline.assemble_inputs(
+                now=now, view=view, store=self.store, fair_values=self.fair_values, backtest=backtest,
+                regime=self.regime, cup_end=cup_end, recent_mids=mids if isinstance(mids, Mapping) else None,
             )
+            report = strategy.report_from_inputs(inputs, sizing=self.sizing, fair_value_status=self._fv_status_compact())
         except NotImplementedError:
             base.update({"available": False, "error": "The strategy engine is not available yet."})
             return base, STRATEGY_ERROR_TTL_S
@@ -1158,6 +1109,18 @@ class DashboardApp:
             raw = data.get("assumptions")
             data["assumptions"] = [str(a) for a in raw if a] if isinstance(raw, (list, tuple)) else []
         return data, STRATEGY_TTL_S
+
+    def _fv_status_compact(self) -> Optional[Dict[str, Any]]:
+        """``{"mode", "usable", "total", "providers"}`` for the strategy report (None without fair values)."""
+        if self.fair_values is None:
+            return None
+        try:
+            st = self.fair_values.status()
+        except Exception as exc:
+            log.debug("fair value status failed: %s", exc)
+            return None
+        return {"mode": st.get("mode"), "usable": st.get("usable"), "total": st.get("total"),
+                "providers": st.get("providers") or {}}
 
     def ensure_backtest(self) -> Optional[threading.Thread]:
         """Start the fade backtest in the background when it is missing or older than 10 minutes."""
@@ -1182,7 +1145,14 @@ class DashboardApp:
             infos = self.store.exchanges()
             series = {e.exchange_id: self.store.series(e.exchange_id, started - SERIES_WINDOW_S) for e in infos}
             market_of = {e.exchange_id: e.market_id for e in infos}
-            result = strategy.backtest_fade(series, market_of=market_of)
+            # Stored surges with their attribution let the result measure the participant-only reversion
+            # rate that caps a fade's win chance (§5.5); without them it stays unmeasured.
+            try:
+                surges = self.store.surges(since=started - SERIES_WINDOW_S, limit=100_000)
+            except Exception as exc:
+                log.debug("stored surges for the fade backtest failed: %s", exc)
+                surges = None
+            result = strategy.backtest_fade(series, market_of=market_of, surges=surges)
         except NotImplementedError:
             error = "The backtest is not available yet."
         except Exception as exc:
@@ -1250,6 +1220,332 @@ class DashboardApp:
             return 500, {"queued": False, "error": f"Could not queue the analysis: {self._short(exc)}"}
         message = "Queued for analysis." if queued else "Already queued; the analysis will update shortly."
         return 200, {"queued": queued, "surge_id": sid, "message": message}
+
+    # ------------------------------------------------------------------ simulation (docs/PAPER_TRADING.md §10)
+    def _paper_disabled(self, now: float, error: str = PAPER_OFF_ERROR, enabled: bool = False) -> Dict[str, Any]:
+        return {
+            "now": now, "enabled": enabled, "available": False, "error": error, "demo": self.demo, "run": None,
+            "has_previous": False, "headline": None, "table_warning": "", "model_label": "", "portfolios": [],
+            "equity": {}, "positions": [], "baskets": [], "orders": [], "fills": [], "trades": [], "signals": None,
+            "study": None, "budget": None, "fair_value": None, "caveats": [], "last_step": None,
+        }
+
+    @staticmethod
+    def _paper_defaults(body: Dict[str, Any]) -> Dict[str, Any]:
+        """Every §10.1 key present (the runner fills them; this only guards against a partial body)."""
+        for key, default in (
+            ("run", None), ("has_previous", False), ("headline", None), ("table_warning", ""), ("model_label", ""),
+            ("portfolios", []), ("equity", {}), ("positions", []), ("baskets", []), ("orders", []), ("fills", []),
+            ("trades", []), ("signals", None), ("study", None), ("budget", None), ("fair_value", None),
+            ("caveats", []), ("last_step", None),
+        ):
+            if key not in body:
+                body[key] = copy.deepcopy(default)
+        return body
+
+    def paper(self, run: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """``GET /api/paper`` (§10.1): the paper runner's published summary. ``run="previous"``: the newest
+        ENDED run's final snapshot in the same shape, or None (the server answers 404)."""
+        now = self.clock()
+        view_fn = getattr(self.tracker, "paper_view", None)
+        if not callable(view_fn):
+            return None if run == "previous" else self._paper_disabled(now)
+        try:
+            body = view_fn("previous") if run == "previous" else view_fn()
+        except NotImplementedError:
+            return None if run == "previous" else self._paper_disabled(
+                now, "The paper trader is not available in this build.", enabled=True)
+        except Exception as exc:
+            log.warning("paper summary failed: %s", exc, exc_info=log.isEnabledFor(logging.DEBUG))
+            return None if run == "previous" else self._paper_disabled(
+                now, f"The paper trader failed: {self._short(exc)}", enabled=True)
+        if run == "previous":
+            return self._previous_body(body, now) if isinstance(body, Mapping) else None
+        if not isinstance(body, Mapping):
+            reason = getattr(self.tracker, "paper_error", None)
+            if isinstance(reason, str) and reason:
+                return self._paper_disabled(now, reason, enabled=True)
+            return self._paper_disabled(now)
+        out = self._paper_defaults(dict(body))
+        out["now"] = now
+        out["enabled"] = True
+        out.setdefault("demo", self.demo)
+        out["available"] = True
+        out["error"] = None
+        return out
+
+    def _previous_body(self, raw: Mapping[str, Any], now: float) -> Dict[str, Any]:
+        """``?run=previous``: the runner's body for the ended run, or a bare final snapshot wrapped in §10.1."""
+        body = dict(raw)
+        if "portfolios" not in body and "verdicts" in body:  # a bare final snapshot {"at", "reason", ...}
+            final = dict(body)
+            body = {"run": {"run_id": final.get("run_id"), "final": final, "ended_at": final.get("at"),
+                            "end_reason": final.get("reason")},
+                    "portfolios": list(final.get("portfolios") or []), "study": final.get("study")}
+        out = self._paper_defaults(body)
+        run = out.get("run")
+        if isinstance(run, Mapping):
+            run = dict(run)
+            final = run.get("final") if isinstance(run.get("final"), Mapping) else None
+            if final is not None:
+                run.setdefault("ended_at", final.get("at"))
+                run.setdefault("end_reason", final.get("reason"))
+            out["run"] = run
+        out["now"] = now
+        out["enabled"] = True
+        out.setdefault("demo", self.demo)
+        out["available"] = True
+        out["error"] = None
+        return out
+
+    @staticmethod
+    def _bounded_number(data: Mapping[str, Any], key: str, low: float, high: float) -> Tuple[bool, Optional[float]]:
+        if key not in data or data[key] is None:
+            return True, None
+        value = _finite(data[key])
+        if value is None or not (low <= value <= high):
+            return False, None
+        return True, value
+
+    def paper_reset(self, data: Optional[Mapping[str, Any]] = None) -> Tuple[int, Dict[str, Any]]:
+        """``POST /api/paper/reset`` (§10.2). Returns (HTTP status, body)."""
+        data = data if isinstance(data, Mapping) else {}
+        if data.get("confirm") is not True:
+            return 400, {"reset": False, "error": 'Send {"confirm": true} to reset the simulation.'}
+        ok, capital = self._bounded_number(data, "start_capital", 1.0, PAPER_RESET_MAX_CAPITAL)
+        if not ok:
+            return 400, {"reset": False, "error": "start_capital must be a number between 1 and 10,000,000."}
+        ok, hours = self._bounded_number(data, "target_hours", 1.0, PAPER_RESET_MAX_HOURS)
+        if not ok:
+            return 400, {"reset": False, "error": "target_hours must be a number between 1 and 720."}
+        reset_fn = getattr(self.tracker, "paper_reset", None)
+        view_fn = getattr(self.tracker, "paper_view", None)
+        if not callable(reset_fn) or not callable(view_fn):
+            return 409, {"reset": False, "error": PAPER_OFF_ERROR}
+        try:
+            before = view_fn()
+        except Exception:
+            before = None
+        if not isinstance(before, Mapping):
+            reason = getattr(self.tracker, "paper_error", None)
+            return 409, {"reset": False, "error": reason if isinstance(reason, str) and reason else PAPER_OFF_ERROR}
+        previous = (before.get("run") or {}).get("run_id") if isinstance(before.get("run"), Mapping) else None
+        try:
+            run_id = reset_fn(start_capital=capital, target_hours=hours)
+        except Exception as exc:
+            log.warning("paper reset failed: %s", exc, exc_info=log.isEnabledFor(logging.DEBUG))
+            return 500, {"reset": False, "error": f"Could not reset the simulation: {self._short(exc)}"}
+        if not run_id:
+            return 409, {"reset": False, "error": PAPER_OFF_ERROR}
+        try:
+            after = view_fn() or {}
+        except Exception:
+            after = {}
+        run = after.get("run") if isinstance(after.get("run"), Mapping) else {}
+        shown_hours = _finite(run.get("target_hours")) or hours or 24.0
+        shown_capital = _finite(run.get("start_capital")) or capital or DEFAULT_INITIAL_BALANCE
+        message = (f"Started a new {shown_hours:g}-hour simulation with {shown_capital:,.0f} SUSQies per portfolio. "
+                   "The previous run's result is kept under Previous run.")
+        return 200, {"reset": True, "run_id": str(run_id), "previous_run_id": previous, "message": message}
+
+    def backtest(self) -> Dict[str, Any]:
+        """``GET /api/backtest`` (§10.3): the replay backtest's status and newest report. The first request
+        (and one after the report is 30 minutes old) starts it in a background thread; this never waits."""
+        now = self.clock()
+        self.ensure_paper_backtest()
+        with self._lock:
+            running = self._pbt_thread is not None and self._pbt_thread.is_alive()
+            report, status, error = self._pbt_report, self._pbt_status, self._pbt_error
+            started, generated = self._pbt_started_at, self._pbt_generated_at
+        if running and status != "no_data":
+            status, error = "pending", None
+        elif status is None:
+            status = "pending"
+        # (a periodic re-check of a store with too little data keeps saying so: it takes milliseconds, and
+        # "Replaying the stored history" would be wrong)
+        return {"now": now, "status": status, "error": error, "started_at": started, "generated_at": generated,
+                "report": _plain(report) if report is not None else None}
+
+    def ensure_paper_backtest(self) -> Optional[threading.Thread]:
+        """Start the replay backtest when it never ran, or its result is due (30 min; 1 min after a failure)."""
+        now = self.clock()
+        with self._lock:
+            if self._pbt_thread is not None and self._pbt_thread.is_alive():
+                return self._pbt_thread
+            if self._pbt_finished_at is not None:
+                ttl = PAPER_BACKTEST_TTL_S if self._pbt_status == "ready" else BACKTEST_RETRY_S
+                if now - self._pbt_finished_at < ttl:
+                    return None
+            thread = threading.Thread(target=self._run_paper_backtest, name="dashboard-replay-backtest", daemon=True)
+            self._pbt_thread = thread
+            self._pbt_started_at = now
+        thread.start()
+        return thread
+
+    def _live_run_started_at(self) -> Optional[float]:
+        view_fn = getattr(self.tracker, "paper_view", None)
+        if not callable(view_fn):
+            return None
+        try:
+            body = view_fn()
+        except Exception:
+            return None
+        run = body.get("run") if isinstance(body, Mapping) else None
+        return _finite(run.get("started_at")) if isinstance(run, Mapping) else None
+
+    def _run_paper_backtest(self) -> None:
+        """Background thread: one replay over the last 24 h on a SEPARATE read-only connection (D52)."""
+        report: Any = None
+        status, error = "error", None
+        try:
+            from .backtest import DASHBOARD_TIME_BUDGET_S, run_backtest
+            from .models import BacktestConfig, PaperConfig, default_portfolios
+            from .store import TrackerStore
+
+            path = str(getattr(self.store, "path", "") or "")
+            if not path or path == ":memory:":
+                status, error = "unavailable", "The backtest needs the tracker's database file."
+            else:
+                ro = TrackerStore.open_read_only(path)
+                try:
+                    bounds = ro.tick_bounds()
+                    if bounds is None or bounds[1] - bounds[0] < 3600.0:
+                        status, error = "no_data", "Less than 1 hour of prices is stored yet: nothing to replay."
+                    else:
+                        config = BacktestConfig(
+                            hours=PAPER_BACKTEST_HOURS,
+                            paper=PaperConfig(regime=self.regime, sizing=self.sizing,
+                                              portfolios=default_portfolios(self.sizing), demo=self.demo),
+                            time_budget_s=DASHBOARD_TIME_BUDGET_S,
+                            live_run_started_at=self._live_run_started_at(),
+                        )
+                        report = run_backtest(ro, config, progress=lambda done, total: time.sleep(0))
+                        status = "ready"
+                finally:
+                    ro.close()
+        except NotImplementedError:
+            status, error = "unavailable", "The backtest is not available yet."
+        except Exception as exc:
+            log.warning("replay backtest failed: %s", exc, exc_info=log.isEnabledFor(logging.DEBUG))
+            status, error = "error", f"The backtest failed: {self._short(exc)}"
+        finished = self.clock()
+        with self._lock:
+            if report is not None:
+                self._pbt_report = report
+                self._pbt_generated_at = finished
+            self._pbt_status = status
+            self._pbt_error = error
+            self._pbt_finished_at = finished
+
+    def wait_paper_backtest(self, timeout: float = 30.0) -> None:
+        thread = self._pbt_thread
+        if thread is not None:
+            thread.join(timeout)
+
+    def fairvalue(self) -> Dict[str, Any]:
+        """``GET /api/fairvalue`` (§10.4): matches, fair values, Cup quotes and fix-a-match snippets per outcome."""
+        now = self.clock()
+        with self._lock:
+            cached = self._fv_cache
+        if cached is not None and now - cached[0] < FAIRVALUE_TTL_S and now >= cached[0]:
+            out = dict(cached[1])
+            out["now"] = now
+            return out
+        payload = self._build_fairvalue(now)
+        with self._lock:
+            self._fv_cache = (now, payload)
+        return payload
+
+    def _build_fairvalue(self, now: float) -> Dict[str, Any]:
+        history = None
+        stats = getattr(self.store, "fair_value_source_stats", None)
+        if callable(stats):
+            try:
+                history = stats("history")
+            except Exception:
+                history = None
+        quotes = {r["exchange_id"]: r for r in self._rows(self._view())} if self.fair_values is not None else {}
+        return fairvalue_payload(self.fair_values, quotes, now, history=history)
+
+
+def fairvalue_payload(fv: Any, quotes: Mapping[str, Mapping[str, Any]], now: float, *,
+                      history: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+    """The ``GET /api/fairvalue`` body (§10.4) for a FairValueService (or None) and the Cup's current quotes
+    (exchange id -> {"bid", "ask"}); also what ``fairvalue`` prints. Rows sorted by |gap| (nulls last), title."""
+    from .fairvalue import FV_CAVEATS, override_snippet
+
+    counts = {"outcomes": 0, "matched": 0, "usable": 0, "manual": 0, "no_external": 0, "suspect": 0, "near": 0}
+    base: Dict[str, Any] = {
+        "now": now, "enabled": False, "mode": "off", "last_refresh_at": None, "providers": [], "manual": None,
+        "map": None, "history": None, "counts": counts, "rows": [], "caveats": list(FV_CAVEATS),
+    }
+    if fv is None:
+        return base
+    try:
+        st = fv.status()
+    except Exception as exc:
+        log.warning("fair value status failed: %s", exc)
+        return base
+    base.update({"enabled": bool(st.get("enabled")), "mode": st.get("mode") or "off",
+                 "last_refresh_at": st.get("last_refresh_at"), "manual": st.get("manual"), "map": st.get("map")})
+    base["providers"] = [
+        {"name": name, **{k: (info or {}).get(k) for k in ("status", "last_ok_at", "last_error", "requests", "matched",
+                                                            "quoted", "next_try_at")}}
+        for name, info in sorted((st.get("providers") or {}).items())
+    ]
+    base["history"] = dict(history) if isinstance(history, Mapping) and history.get("records") else None
+    if not base["enabled"]:
+        return base
+    try:
+        match_rows = list(fv.matches())
+        targets = {t.exchange_id: t for t in fv.targets()}
+    except Exception as exc:
+        log.warning("fair value matches failed: %s", exc)
+        return base
+    rows: List[Dict[str, Any]] = []
+    for m in match_rows:
+        eid = str(m.exchange_id)
+        q = quotes.get(eid) or {}
+        bid, ask = _finite(q.get("bid")), _finite(q.get("ask"))
+        mid = round((bid + ask) / 2, 6) if bid is not None and ask is not None else None
+        fair = m.fair.to_dict() if m.fair is not None else None
+        value = _finite(fair.get("value")) if fair else None
+        if fair is not None:
+            as_of = _finite(fair.get("as_of"))
+            fair["age_s"] = round(now - as_of, 3) if as_of is not None else None
+        matches = [vm.to_dict() for vm in m.matches]
+        near = bool(fair and fair.get("match_kind") == "NEAR") or any(vm.kind == "NEAR" for vm in m.matches)
+        suspect = bool(fair and fair.get("suspect"))
+        target = targets.get(eid)
+        external = {vm.venue: vm.external_id for vm in m.matches if vm.venue in ("polymarket", "kalshi")}
+        snippets: Dict[str, Optional[str]] = {"disable": f'"{eid}": {{"disabled": true, "note": "wrong match"}}',
+                                              "pin": None, "confirm": None, "trade_near": None}
+        if target is not None:
+            snippets["disable"] = override_snippet(target, "disable")
+            snippets["pin"] = override_snippet(target, "pin", external or None)
+            if suspect:
+                snippets["confirm"] = override_snippet(target, "confirm")
+            if near:
+                snippets["trade_near"] = override_snippet(target, "trade_near")
+        rows.append({
+            "exchange_id": eid, "market_id": str(m.market_id), "title": m.title, "option": m.option,
+            "race_key": m.race_key, "party": m.party, "sm_bid": bid, "sm_ask": ask, "sm_mid": mid, "fair": fair,
+            "matches": matches,
+            "gap": round(value - mid, 6) if value is not None and mid is not None else None,
+            "edge_yes": round(value - ask, 6) if value is not None and ask is not None else None,
+            "edge_no": round(bid - value, 6) if value is not None and bid is not None else None,
+            "near": near, "suspect": suspect, "snippets": snippets, "unmatched_reason": m.unmatched_reason,
+        })
+        counts["outcomes"] += 1
+        counts["matched"] += 1 if matches else 0
+        counts["usable"] += 1 if fair and fair.get("usable") and value is not None else 0
+        counts["manual"] += 1 if fair and fair.get("source") == "manual" else 0
+        counts["no_external"] += 0 if any(vm.venue != "manual" for vm in m.matches) else 1
+        counts["suspect"] += 1 if suspect else 0
+        counts["near"] += 1 if near else 0
+    rows.sort(key=lambda r: (r["gap"] is None, -abs(r["gap"] or 0.0), r["title"] or "", r["exchange_id"]))
+    base["rows"] = rows
+    return base
 
 
 # --------------------------------------------------------------------------- HTTP
@@ -1604,6 +1900,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.close_connection = True
             return self._error(413, "Request body too large (16 KB maximum).")
         body = self.rfile.read(length) if length else b""
+        data: Dict[str, Any] = {}
         if body.strip():
             try:
                 data = json.loads(body.decode("utf-8"))
@@ -1611,6 +1908,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 return self._error(400, "The request body is not valid JSON.")
             if not isinstance(data, dict):
                 return self._error(400, "The request body must be a JSON object.")
+        if re.fullmatch(r"/api/paper/reset", path):
+            # Local only: ends this process's simulated run and starts a new one (nothing leaves the machine).
+            try:
+                status, payload = self.server.app.paper_reset(data)
+            except Exception:
+                log.warning("dashboard POST %s failed", path, exc_info=True)
+                return self._error(500, "Internal error; see the dashboard's log.")
+            return self._json(status, payload)
         match = re.fullmatch(r"/api/surges/([^/]+)/analyze", path)
         if match:
             try:
@@ -1663,7 +1968,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if name == "markets":
                 q = (query.get("q") or [""])[0][:200]
                 return self._json(200, app.markets(q))
+            if name == "paper":
+                which = (query.get("run") or [""])[0].strip().lower()
+                if which == "previous":
+                    previous = app.paper(run="previous")
+                    if previous is None:
+                        return self._error(404, NO_PREVIOUS_RUN)
+                    return self._json(200, previous)
+                return self._json(200, app.paper())
             return self._json(200, getattr(app, name)())
+        if path == "/api/paper/reset":
+            return self._error(405, "Use POST to reset the simulation.", (("Allow", "POST"),))
         if path.startswith("/api/exchange/"):
             eid = unquote(path[len("/api/exchange/") :])
             data = app.exchange(eid)
@@ -1692,6 +2007,9 @@ _GET_ROUTES: Dict[str, str] = {
     "/api/surges": "surges",
     "/api/highband": "highband",
     "/api/strategy": "strategy",
+    "/api/paper": "paper",
+    "/api/backtest": "backtest",
+    "/api/fairvalue": "fairvalue",
 }
 
 
@@ -1742,6 +2060,8 @@ class Runtime:
     context: Any
     news: Any = None
     demo_market: Any = None
+    fair_values: Any = None  # the tracker's FairValueService (None with --fair-value off)
+    clock: Any = None  # the SimClock of a fast demo run (None: real time)
 
     def start(self) -> None:
         self.tracker.start()
@@ -1750,6 +2070,7 @@ class Runtime:
         for step, fn in (
             ("tracker", lambda: self.tracker.stop()),
             ("news", lambda: self.news.close() if self.news is not None and hasattr(self.news, "close") else None),
+            ("fair values", lambda: self.fair_values.close() if self.fair_values is not None else None),
             ("client", lambda: self.client.close()),
             ("store", lambda: self.store.close()),
         ):
@@ -1765,6 +2086,32 @@ def _remove_db(path: Path) -> None:
             Path(str(path) + suffix).unlink()
         except FileNotFoundError:
             pass
+
+
+def _refuse_if_tracked(db: Path, interval: float) -> None:
+    """Raise ``tracker.TrackerBusy`` when another live process holds ``db``'s tracker lease (its heartbeat is
+    younger than 3 intervals of wall time), so a demo start never deletes a running demo's database."""
+    if not db.is_file():
+        return
+    from .store import TrackerStore
+    from .tracker import LEASE_NAME, TrackerBusy
+
+    try:
+        st = TrackerStore.open_read_only(db)
+    except Exception:  # an older or broken file: nothing can be tracking it with this code
+        return
+    try:
+        holder = st.lease(LEASE_NAME)
+    except Exception:
+        holder = None
+    finally:
+        st.close()
+    if not holder:
+        return
+    beat = _finite(holder.get("heartbeat_at"))
+    ttl = 3.0 * max(float(interval), 30.0)
+    if beat is not None and -ttl < time.time() - beat < ttl:  # like store.acquire_lease (a far-future beat is a SimClock's)
+        raise TrackerBusy(holder, str(db))
 
 
 def _judge(enabled: bool, out: TextIO) -> Any:
@@ -1784,6 +2131,43 @@ def _judge(enabled: bool, out: TextIO) -> Any:
     return None
 
 
+# Read budgets of the simulated API (docs/PAPER_TRADING.md §9). Real time: the demo reads faster than a live key
+# may (the simulation has no real budget). Fast mode (a demo.SimClock): above the per-step demand x steps per
+# simulated minute, so no limiter ever needs to wait (a wait raises demo.SimClockStall instead, D42).
+DEMO_READS_PER_MIN = 600
+DEMO_BACKFILL_READS_PER_MIN = 240
+DEMO_ANALYZE_READS_PER_MIN = 120
+DEMO_PAPER_READS_PER_MIN = 60
+FAST_READS_PER_MIN = 10_000
+FAST_PAPER_READS_PER_MIN = 600
+DEMO_T0_STATE_KEY = "demo.t0"  # the demo's scripted start, kept in its store (a rebuild on a kept store continues it)
+FV_AUTO_NOTICE = "Outside fair values: reading Polymarket and Kalshi (GET only, no account); use --fair-value manual to stop."
+
+
+def _fair_value_mode(value: Any) -> str:
+    mode = str(value or "auto").strip().lower()
+    if mode not in ("auto", "manual", "off"):
+        raise ValueError(f"--fair-value must be auto, manual or off, not {value!r}")
+    return mode
+
+
+def _paper_config(*, demo: bool, sizing: str, regime: str, all_collateral: bool, start_capital: Optional[float],
+                  reads_per_min: Optional[int], interval: float, target_hours: Optional[float]) -> Any:
+    """The PaperConfig the builders and the ``paper`` command use (§7.4)."""
+    from .models import PaperConfig, default_portfolios
+
+    kwargs: Dict[str, Any] = dict(
+        demo=bool(demo), sizing=sizing, portfolios=default_portfolios(sizing), regime=str(regime or "unknown"),
+        all_collateral=bool(all_collateral), start_capital=float(start_capital) if start_capital else None,
+        interval_s=float(interval),
+    )
+    if reads_per_min is not None:
+        kwargs["reads_per_min"] = int(reads_per_min)
+    if target_hours is not None:
+        kwargs["target_hours"] = float(target_hours)
+    return PaperConfig(**kwargs)
+
+
 def build_demo(
     data_dir: Path,
     interval: float = 30.0,
@@ -1792,49 +2176,123 @@ def build_demo(
     news: bool = True,
     out: TextIO = sys.stderr,
     seed: int = 7,
+    paper: bool = True,
+    fair_value: str = "auto",
+    regime: str = "unknown",
+    sizing: str = "conservative",
+    all_collateral: bool = False,
+    paper_capital: Optional[float] = None,
+    clock: Optional[Callable[[], float]] = None,
+    fresh_db: bool = True,
+    target_hours: Optional[float] = None,
+    fair_value_providers: Optional[Callable[[Any], Sequence[Any]]] = None,
 ) -> Runtime:
-    """A dashboard over the simulated market (no API key, no network)."""
+    """A dashboard over the simulated market (no API key, no network).
+
+    ``paper`` runs the paper trader (§7.4), ``fair_value`` "auto" uses the demo's scripted outside prices
+    (``demo.DemoFairValueProvider``), "manual" only ``<data_dir>/demo/fair_values.json``, "off" none.
+    ``clock`` (optional) is injected into every time-aware piece; a :class:`demo.SimClock` also switches
+    to **fast mode** (D42): every limiter runs on the SimClock with budgets above the per-step demand and a
+    ``sleep`` (:func:`demo.no_wait`) that raises ``SimClockStall`` instead of waiting. ``fresh_db=False``
+    keeps an existing ``<data_dir>/demo/tracker.sqlite3`` (restart continuity, D47). ``fair_value_providers``
+    (tests) builds the "auto" providers from the DemoMarket instead of ``[DemoFairValueProvider(market)]``."""
     from .attribution import Attributor
     from .bot import resolve_context
     from .client import SuperMarketClient
-    from .demo import DEMO_SLUG, DemoMarket, DemoNewsProvider
+    from .demo import DEMO_SLUG, DemoFairValueProvider, DemoMarket, DemoNewsProvider, SimClock, no_wait
     from .news import NewsSearcher
     from .store import TrackerStore
     from .tracker import Tracker
 
-    market = DemoMarket(seed=seed)
-    # The simulated API has no real budget, so the demo reads faster than a live key may.
-    client = SuperMarketClient(
-        api_key="demo", base_url="https://demo.invalid/api/v1", transport=market.transport(), reads_per_min=600
-    )
-    store: Any = None
-    try:
-        context = resolve_context(client, slug=DEMO_SLUG)
-        db = Path(data_dir) / "demo" / "tracker.sqlite3"
-        db.parent.mkdir(parents=True, exist_ok=True)
+    fv_mode = _fair_value_mode(fair_value)
+    fast = isinstance(clock, SimClock)
+    timed: Dict[str, Any] = {"clock": clock} if clock is not None else {}
+    db = Path(data_dir) / "demo" / "tracker.sqlite3"
+    db.parent.mkdir(parents=True, exist_ok=True)
+    if fresh_db:
+        _refuse_if_tracked(db, interval)  # never delete the database of a running demo (D46)
         _remove_db(db)
-        store = TrackerStore(db)
-        searcher = NewsSearcher([DemoNewsProvider(market)], store=store) if news else None
+    store: Any = TrackerStore(db, **timed)
+    client: Any = None
+    fair_values: Any = None
+    searcher: Any = None
+    try:
+        # A kept database continues its demo: the scripted events keep their original start (D47).
+        saved_t0 = None if fresh_db else _finite(store.get_state(DEMO_T0_STATE_KEY))
+        if clock is not None:
+            market = DemoMarket(seed=seed, now=float(clock()), clock=clock, start=saved_t0)
+        else:
+            market = DemoMarket(seed=seed, start=saved_t0)
+        store.set_state(DEMO_T0_STATE_KEY, market.t0)
+        limiter_kw: Dict[str, Any] = {"clock": clock, "sleep": no_wait} if fast else {}
+        client = SuperMarketClient(
+            api_key="demo", base_url="https://demo.invalid/api/v1", transport=market.transport(),
+            reads_per_min=FAST_READS_PER_MIN if fast else DEMO_READS_PER_MIN, **limiter_kw,
+        )
+        enforce_get_only(client)  # D20: the simulator never sends anything but GET (the tracker's copy shares it)
+        context = resolve_context(client, slug=DEMO_SLUG)
+        searcher = NewsSearcher([DemoNewsProvider(market)], store=store, **timed) if news else None
         judge = _judge(llm, out)
-        attributor = Attributor(client, context, store, searcher, judge=judge)
+        attributor = Attributor(client, context, store, searcher, judge=judge, **timed)
+        holder: List[Any] = []  # the tracker, once built (its lock-free mids feed the fair-value suspect check)
+        if fv_mode != "off":
+            from .fairvalue import FairValueService
+
+            if fv_mode != "auto":
+                providers: List[Any] = []
+            elif fair_value_providers is not None:
+                providers = list(fair_value_providers(market))
+            else:
+                providers = [DemoFairValueProvider(market)]
+            fair_values = FairValueService(
+                db.parent, mode=fv_mode, providers=providers,
+                recorder=store.add_fair_values, refresh_recorder=store.add_fair_value_refresh,
+                cup_mids=lambda: holder[0].cup_mids() if holder else {}, **timed,
+            )
+        paper_rpm = FAST_PAPER_READS_PER_MIN if fast else DEMO_PAPER_READS_PER_MIN
+        engine: Any = None
+        if paper:
+            from .paper import PaperEngine
+
+            engine = PaperEngine(
+                _paper_config(demo=True, sizing=sizing, regime=regime, all_collateral=all_collateral,
+                              start_capital=paper_capital, reads_per_min=paper_rpm, interval=interval,
+                              target_hours=target_hours),
+                persistence=store, code_version=pipeline.code_version(), **timed,
+            )
+        tracker_kw: Dict[str, Any] = dict(timed)
+        if fast:
+            tracker_kw.update(limiter_clock=clock, limiter_sleep=no_wait)
         tracker = Tracker(
             client,
             context,
             store,
             interval=interval,
             attributor=attributor,
-            backfill_reads_per_min=240,
-            analyze_reads_per_min=120,
+            backfill_reads_per_min=FAST_READS_PER_MIN if fast else DEMO_BACKFILL_READS_PER_MIN,
+            analyze_reads_per_min=FAST_READS_PER_MIN if fast else DEMO_ANALYZE_READS_PER_MIN,
+            fair_values=fair_values,
+            paper=engine,
+            paper_reads_per_min=paper_rpm,
+            regime=regime,
+            lease=True,
+            **tracker_kw,
         )
+        holder.append(tracker)
         app = DashboardApp(
-            tracker, store, client, context, demo=True, interval=interval, news_enabled=news, llm_enabled=judge is not None
+            tracker, store, client, context, demo=True, interval=interval, news_enabled=news, llm_enabled=judge is not None,
+            fair_values=fair_values, regime=regime, sizing=sizing, **timed,
         )
     except BaseException:  # including Ctrl-C while starting
-        if store is not None:
-            store.close()
-        client.close()
+        for thing in (searcher, fair_values, store, client):
+            if thing is not None and hasattr(thing, "close"):
+                try:
+                    thing.close()
+                except Exception as exc:
+                    log.debug("closing %r after a failed start failed: %s", thing, exc)
         raise
-    return Runtime(app, tracker, store, client, context, news=searcher, demo_market=market)
+    return Runtime(app, tracker, store, client, context, news=searcher, demo_market=market, fair_values=fair_values,
+                   clock=clock if fast else None)
 
 
 # Startup against the real API: when the first read (the tournament) fails with a temporary
@@ -1996,9 +2454,13 @@ def build_live(
     from .tracker import Tracker
 
     client = SuperMarketClient.from_settings(settings)
+    enforce_get_only(client)  # D20: GET only, whatever any component tries (the tracker's copy shares the guard)
     store: Any = None
     searcher: Any = None
+    fair_values: Any = None
     try:
+        options = simulation_options(args)
+        fv_mode, sizing, regime = options["fair_value"], options["sizing"], options["regime"]
         slug = getattr(args, "tournament", None) or settings.tournament
         data_dir = Path(settings.data_dir)
         print("Connecting to the Super Market API…", file=out, flush=True)
@@ -2021,7 +2483,38 @@ def build_live(
         judge = _judge(llm, out)
         attributor = Attributor(client, context, store, searcher, judge=judge)
         interval = float(getattr(args, "interval", 30.0))
-        tracker = Tracker(client, context, store, interval=interval, attributor=attributor)
+        holder: List[Any] = []
+        if fv_mode != "off":
+            from .fairvalue import FairValueService, default_providers
+
+            fair_values = FairValueService(
+                data_dir / context.label, mode=fv_mode, providers=default_providers(fv_mode),
+                recorder=store.add_fair_values, refresh_recorder=store.add_fair_value_refresh,
+                cup_mids=lambda: holder[0].cup_mids() if holder else {},
+            )
+        engine: Any = None
+        if options["paper"]:
+            from .paper import PaperEngine
+
+            engine = PaperEngine(
+                _paper_config(demo=False, sizing=sizing, regime=regime, all_collateral=options["all_collateral"],
+                              start_capital=options["paper_capital"], reads_per_min=None, interval=interval,
+                              target_hours=getattr(args, "hours", None)),
+                persistence=store, code_version=pipeline.code_version(),
+            )
+        tracker = Tracker(client, context, store, interval=interval, attributor=attributor, fair_values=fair_values,
+                          paper=engine, paper_reads_per_min=engine.config.reads_per_min if engine is not None else 20,
+                          paper_reads_per_min_during_backfill=(
+                              engine.config.reads_per_min_during_backfill if engine is not None else 6),
+                          regime=regime, lease=True)
+        holder.append(tracker)
+        if fv_mode == "auto":
+            print(FV_AUTO_NOTICE, file=out, flush=True)
+        projected = (tracker.status().get("read_budget") or {}).get("projected_per_min")
+        if projected is not None:
+            print(f"Projected Super Market reads: about {float(projected):.0f} per minute before the market list is read "
+                  "(the status shows the live projection; the account allows 100 per minute across all keys).",
+                  file=out, flush=True)
         app = DashboardApp(
             tracker,
             store,
@@ -2032,9 +2525,12 @@ def build_live(
             secrets=[settings.api_key],
             news_enabled=not no_news,
             llm_enabled=judge is not None,
+            fair_values=fair_values,
+            regime=regime,
+            sizing=sizing,
         )
     except BaseException:  # including Ctrl-C while connecting: release what was opened
-        for thing in (searcher, store, client):
+        for thing in (searcher, fair_values, store, client):
             close = getattr(thing, "close", None)
             if callable(close):
                 try:
@@ -2042,7 +2538,7 @@ def build_live(
                 except Exception as exc:
                     log.debug("closing %r after a failed start failed: %s", thing, exc)
         raise
-    return Runtime(app, tracker, store, client, context, news=searcher)
+    return Runtime(app, tracker, store, client, context, news=searcher, fair_values=fair_values)
 
 
 def _bind(
@@ -2112,6 +2608,29 @@ def _restore_sigterm(previous: Any) -> None:
         pass
 
 
+def regime_option(args: Any) -> str:
+    """``--regime``, else ``SUPERMARKET_SETTLEMENT_REGIME``, else "unknown" (the Cup's end rule is unknown, §13)."""
+    from .models import REGIMES
+
+    raw = getattr(args, "regime", None) or os.environ.get("SUPERMARKET_SETTLEMENT_REGIME", "").strip() or "unknown"
+    value = str(raw).strip().lower()
+    return value if value in REGIMES else "unknown"
+
+
+def simulation_options(args: Any) -> Dict[str, Any]:
+    """The dashboard's paper / fair-value / sizing options as ``build_demo`` keywords (§7.5)."""
+    fv = "off" if getattr(args, "no_fair_value", False) else _fair_value_mode(getattr(args, "fair_value", None) or "auto")
+    capital = getattr(args, "paper_capital", None)
+    return {
+        "paper": not bool(getattr(args, "no_paper", False)),
+        "fair_value": fv,
+        "regime": regime_option(args),
+        "sizing": str(getattr(args, "sizing", None) or "conservative"),
+        "all_collateral": bool(getattr(args, "all_collateral", False)),
+        "paper_capital": float(capital) if capital else None,
+    }
+
+
 def run_dashboard(settings: Any, args: Any, out: Optional[TextIO] = None, err: Optional[TextIO] = None) -> int:
     """``python -m supermarket_bot dashboard``: build, serve until Ctrl-C, shut down cleanly."""
     out = out or sys.stdout
@@ -2158,7 +2677,8 @@ def run_dashboard(settings: Any, args: Any, out: Optional[TextIO] = None, err: O
             if demo:
                 data_dir = Path(getattr(args, "data_dir", None) or "data")
                 runtime = build_demo(
-                    data_dir, interval, llm=bool(getattr(args, "llm", False)), news=not getattr(args, "no_news", False), out=err
+                    data_dir, interval, llm=bool(getattr(args, "llm", False)), news=not getattr(args, "no_news", False), out=err,
+                    **simulation_options(args),
                 )
             else:
                 if settings is None:
@@ -2208,6 +2728,8 @@ def _serve(
         except KeyboardInterrupt:
             pass
         return code or 1
+    from .tracker import TrackerBusy
+
     try:
         try:
             runtime.start()
@@ -2232,6 +2754,9 @@ def _serve(
             server.serve_forever(poll_interval=0.5)
         except KeyboardInterrupt:
             print("\nStopping the dashboard…", file=out, flush=True)
+        except TrackerBusy as exc:  # another live process tracks this store (D46): refuse, exit 2
+            print(f"error: {exc}", file=err, flush=True)
+            code = 2
         finally:
             stopping.set()
             try:

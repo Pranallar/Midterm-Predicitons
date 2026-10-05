@@ -57,6 +57,7 @@
       <li><a href="#surges" data-view="surges">Surges <span class="nav-count" id="nav-count-surges"></span></a></li>
       <li><a href="#high" data-view="high">High 90s <span class="nav-count" id="nav-count-high"></span></a></li>
       <li><a href="#strategy" data-view="strategy">Strategy</a></li>
+      <li><a href="#sim" data-view="sim">Simulation</a></li>
     </ul>
   </nav>
 </header>
@@ -282,6 +283,17 @@
     <div id="strategy-body"></div>
   </section>
 
+  <section class="view" id="view-sim" data-view="sim" aria-labelledby="h-sim" hidden>
+    <div class="view-errors" id="view-errors-sim" hidden></div>
+    <div class="view-head">
+      <h2 id="h-sim" tabindex="-1">Simulation</h2>
+      <p class="view-sub">Paper trading on live data. Nothing is traded: every order here is simulated.</p>
+      <span class="badge badge-demo" id="sim-demo-badge" hidden title="Simulated market: the demo's mispricings are scripted">DEMO</span>
+    </div>
+    <p class="sim-status" id="sim-status" role="status" aria-live="polite" aria-atomic="true"></p>
+    <div id="sim-body"></div>
+  </section>
+
 </main>
 
 <footer class="app-footer">
@@ -302,6 +314,15 @@
     </header>
     <div class="sr-only" id="drawer-announcer" role="status" aria-live="polite" aria-atomic="true"></div>
     <div class="drawer-body" id="drawer-body"></div>
+  </div>
+</dialog>
+
+<dialog class="confirm-dialog" id="sim-reset-dialog" aria-labelledby="sim-reset-title" aria-describedby="sim-reset-text">
+  <h2 id="sim-reset-title">Reset the simulation?</h2>
+  <p id="sim-reset-text">Every portfolio goes back to its start capital and the 24-hour clock restarts. The current run's result is kept under "Previous run". Nothing real is affected.</p>
+  <div class="dialog-actions">
+    <button type="button" class="btn" id="sim-reset-cancel">Cancel</button>
+    <button type="button" class="btn btn-primary" id="sim-reset-confirm">Reset simulation</button>
   </div>
 </dialog>
 

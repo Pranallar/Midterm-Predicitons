@@ -12,6 +12,7 @@ import csv
 import io
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -1247,3 +1248,341 @@ def test_live_api_12_tournament_flag_works_after_the_command(run, fake, monkeypa
     fake.add("GET", "/tournaments", tournament_page([tournament(slug="cup-a", tid="a"), tournament(slug="cup-b", tid="b")]))
     code, _ = run("markets")
     assert code == 1 and "dashboard --tournament <slug>" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------- simulation commands (docs/PAPER_TRADING.md §7.5)
+
+
+@pytest.fixture
+def methods(monkeypatch: pytest.MonkeyPatch) -> List[Tuple[str, str]]:
+    """Every request any MockTransport answers (the demo's simulated API and the FakeAPI): (method, path)."""
+    seen: List[Tuple[str, str]] = []
+    original = httpx.MockTransport.handle_request
+
+    def recording(self: httpx.MockTransport, request: httpx.Request) -> httpx.Response:
+        seen.append((request.method, request.url.path))
+        return original(self, request)
+
+    monkeypatch.setattr(httpx.MockTransport, "handle_request", recording)
+    return seen
+
+
+def assert_get_only(seen: List[Tuple[str, str]]) -> None:
+    assert seen, "no request was recorded"
+    for method, path in seen:
+        assert method == "GET", (method, path)
+        assert not any(word in path for word in ("/orders", "cancel", "multi-leg", "realtime/token")), path
+
+
+def test_dashboard_simulation_options_parse() -> None:
+    from supermarket_bot import web
+
+    parse = cli.build_parser().parse_args
+    args = parse(["dashboard", "--demo", "--no-paper", "--fair-value", "manual", "--regime", "vwap_closeout",
+                  "--sizing", "chaser", "--all-collateral", "--paper-capital", "50000"])
+    assert (args.no_paper, args.fair_value, args.regime, args.sizing, args.all_collateral, args.paper_capital) == (
+        True, "manual", "vwap_closeout", "chaser", True, 50000.0)
+    assert web.simulation_options(args) == {"paper": False, "fair_value": "manual", "regime": "vwap_closeout",
+                                            "sizing": "chaser", "all_collateral": True, "paper_capital": 50000.0}
+    plain = parse(["dashboard"])
+    assert (plain.no_paper, plain.fair_value, plain.no_fair_value, plain.sizing, plain.all_collateral, plain.paper_capital) == (
+        False, "auto", False, "conservative", False, None)
+    assert web.simulation_options(parse(["dashboard", "--no-fair-value"]))["fair_value"] == "off"
+    for bad in (["--fair-value", "always"], ["--regime", "guess"], ["--sizing", "yolo"], ["--paper-capital", "-5"],
+                ["--paper-capital", "nan"]):
+        with pytest.raises(SystemExit) as caught:
+            parse(["dashboard", *bad])
+        assert caught.value.code == 2, bad
+
+
+def test_regime_defaults_to_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    from supermarket_bot import web
+
+    parse = cli.build_parser().parse_args
+    assert web.regime_option(parse(["dashboard"])) == "unknown"
+    monkeypatch.setenv("SUPERMARKET_SETTLEMENT_REGIME", "resolved_outcomes")
+    assert web.regime_option(parse(["dashboard"])) == "resolved_outcomes"
+    assert web.regime_option(parse(["dashboard", "--regime", "vwap_closeout"])) == "vwap_closeout"
+    monkeypatch.setenv("SUPERMARKET_SETTLEMENT_REGIME", "nonsense")
+    assert web.regime_option(parse(["paper"])) == "unknown"
+
+
+def test_paper_backtest_and_fairvalue_options_parse() -> None:
+    parse = cli.build_parser().parse_args
+    paper = parse(["paper"])
+    assert (paper.hours, paper.summary_every, paper.interval, paper.step) == (24.0, 60.0, 30.0, 30.0)
+    assert not (paper.reset or paper.keep_running or paper.demo or paper.fast or paper.no_news or paper.json)
+    paper = parse(["paper", "--hours", "2", "--summary-every", "15", "--interval", "10", "--reset", "--keep-running",
+                   "--demo", "--fast", "--step", "60", "--no-news", "--json", "--fair-value", "off", "--regime",
+                   "resolved_outcomes", "--sizing", "chaser", "--all-collateral", "--paper-capital", "2000",
+                   "--data-dir", "elsewhere"])
+    assert (paper.hours, paper.summary_every, paper.interval, paper.step, paper.reset, paper.keep_running) == (
+        2.0, 15.0, 10.0, 60.0, True, True)
+    assert (paper.demo, paper.fast, paper.no_news, paper.json, paper.data_dir) == (True, True, True, True, "elsewhere")
+    assert (paper.fair_value, paper.regime, paper.sizing, paper.all_collateral, paper.paper_capital) == (
+        "off", "resolved_outcomes", "chaser", True, 2000.0)
+    bt = parse(["backtest"])
+    assert (bt.store, bt.hours, bt.since, bt.until, bt.step, bt.latency, bt.spread) == (None, None, None, None, 300.0, 60.0, 0.02)
+    assert (bt.touch_qty, bt.volume_share, bt.candle_cap, bt.sweep, bt.sizing, bt.regime, bt.demo_hours) == (
+        100.0, 0.1, 50.0, [], "conservative", None, 6.0)
+    bt = parse(["backtest", "--store", "x.sqlite3", "--hours", "12", "--since", "2026-10-01T00:00:00Z", "--until",
+                "2026-10-02T00:00:00Z", "--step", "600", "--latency", "120", "--spread", "0.03", "--touch-qty", "50",
+                "--volume-share", "0.2", "--candle-cap", "25", "--no-books", "--no-fair-values", "--no-history",
+                "--sweep", "min_value_edge=0.01,0.02", "--sweep", "latency_s=30,60", "--latency-sweep", "--sizing",
+                "chaser", "--regime", "vwap_closeout", "--json", "--demo", "--demo-hours", "2"])
+    assert (bt.store, bt.hours, bt.step, bt.latency, bt.spread, bt.touch_qty, bt.volume_share, bt.candle_cap) == (
+        "x.sqlite3", 12.0, 600.0, 120.0, 0.03, 50.0, 0.2, 25.0)
+    assert bt.no_books and bt.no_fair_values and bt.no_history and bt.latency_sweep and bt.json and bt.demo
+    assert bt.sweep == ["min_value_edge=0.01,0.02", "latency_s=30,60"] and bt.demo_hours == 2.0
+    fv = parse(["fairvalue"])
+    assert (fv.demo, fv.fair_value, fv.template, fv.only_usable, fv.show_override, fv.import_history, fv.days) == (
+        False, "auto", False, False, None, False, 7.0)
+    fv = parse(["fairvalue", "--demo", "--fair-value", "manual", "--template", "--only-usable", "--show-override", "9026",
+                "--import-history", "--days", "3", "--json"])
+    assert (fv.demo, fv.fair_value, fv.template, fv.only_usable, fv.show_override, fv.import_history, fv.days) == (
+        True, "manual", True, True, "9026", True, 3.0)
+    for bad in (["paper", "--hours", "0"], ["paper", "--sizing", "max"], ["backtest", "--step", "-1"],
+                ["fairvalue", "--fair-value", "off"], ["backtest", "--regime", "maybe"]):
+        with pytest.raises(SystemExit) as caught:
+            parse(bad)
+        assert caught.value.code == 2, bad
+
+
+def test_paper_demo_fast_runs_in_a_temporary_directory(monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+                                                       methods: List[Tuple[str, str]], capsys: Any) -> None:
+    from supermarket_bot.paper import CAVEATS, TABLE_WARNING, VERDICT_CAVEATS
+
+    import tempfile
+
+    made: List[str] = []
+    real_mkdtemp = tempfile.mkdtemp
+
+    def mkdtemp(*args: Any, **kwargs: Any) -> str:
+        made.append(real_mkdtemp(*args, **kwargs))
+        return made[-1]
+
+    monkeypatch.setattr(tempfile, "mkdtemp", mkdtemp)
+    out = io.StringIO()
+    code = cli.main(["paper", "--demo", "--fast", "--hours", "1", "--summary-every", "30", "--no-news"], out=out)
+    text = out.getvalue()
+    assert code == 0, capsys.readouterr().err
+    assert len(made) == 1 and not Path(made[0]).exists()  # its own temporary directory, removed at exit
+    assert not (tmp_path / "data").exists()  # never the dashboard's data/demo (D46)
+    lines = _lines(text)
+    assert lines[0].startswith("Fast demo simulation: 1 simulated hours in 30-second steps")
+    summaries = [line for line in lines if line.startswith("[paper] ")]
+    assert len(summaries) >= 2 and "0.5 h observed of 1 h" in summaries[0] and "1.0 h observed of 1 h" in summaries[1]
+    assert "steps 61" in summaries[0] and "reads " in summaries[0]
+    assert any(line.startswith("  You, acting by hand ~4 min late") and " at liquidation  fills " in line for line in lines)
+    assert any(line.startswith("  Verdict (You, acting by hand") and "Not enough evidence yet" in line for line in lines)
+    assert any(line.startswith("  Signal study (value, +30 min): ") for line in lines)
+    assert re.search(r"Run run-\d+ ended \(completed\)\.", text)
+    assert TABLE_WARNING.format(n=9) in text
+    for i in VERDICT_CAVEATS:
+        assert CAVEATS[i] in text
+    assert_get_only(methods)
+
+
+def test_paper_keep_running_json_and_data_dir(tmp_path: Path, capsys: Any) -> None:
+    from supermarket_bot.store import TrackerStore
+
+    data = tmp_path / "sim"
+    out = io.StringIO()
+    code = cli.main(["paper", "--demo", "--fast", "--hours", "0.25", "--keep-running", "--json", "--no-news",
+                     "--data-dir", str(data)], out=out)
+    assert code == 0, capsys.readouterr().err
+    body = json.loads(out.getvalue())
+    assert body["enabled"] is True and body["run"]["ended_at"] is None and body["run"]["end_reason"] is None
+    # the target was reached (its final snapshot is kept, §6.2 step 9) but the run itself stays open
+    assert body["run"]["complete"] is True and body["run"]["final"] is not None
+    assert body["run"]["steps"] == 31 and body["has_previous"] is False
+    db = data / "demo" / "tracker.sqlite3"
+    assert db.is_file()  # --data-dir keeps the database
+    store = TrackerStore.open_read_only(db)
+    try:
+        [run] = store.paper_runs()
+        assert run["ended_at"] is None  # --keep-running: the run stays open for the next start
+    finally:
+        store.close()
+    out = io.StringIO()
+    assert cli.main(["paper", "--demo", "--fast", "--hours", "0.1", "--json", "--no-news", "--data-dir", str(data)], out=out) == 0
+    ended = json.loads(out.getvalue())
+    assert ended["has_previous"] is True  # without --keep-running the run ends ("completed") with its final snapshot
+    store = TrackerStore.open_read_only(db)
+    try:
+        last = store.paper_last_ended_run()
+        assert last is not None and last["state"]["final"]["reason"] == "completed"
+    finally:
+        store.close()
+
+
+def test_paper_refuses_a_store_another_process_is_tracking(tmp_path: Path, capsys: Any) -> None:
+    import time
+
+    from supermarket_bot.store import TrackerStore
+
+    data = tmp_path / "busy"
+    db = data / "demo" / "tracker.sqlite3"
+    db.parent.mkdir(parents=True)
+    store = TrackerStore(db)
+    try:
+        assert store.acquire_lease("tracker", {"owner_id": "my-laptop:1234:1", "pid": 1234, "host": "my-laptop"},
+                                   time.time(), ttl_s=90.0) is None
+    finally:
+        store.close()
+    code = cli.main(["paper", "--demo", "--fast", "--hours", "0.1", "--no-news", "--data-dir", str(data)], out=io.StringIO())
+    err = capsys.readouterr().err
+    assert code == 2
+    assert (f"Another process (pid 1234 on my-laptop) is already running the tracker on {db}: stop it, or use --data-dir "
+            "for a separate copy. Running two would double the API reads; the account allows 100 per minute across all "
+            "keys.") in err
+    assert db.is_file()  # the other process's database was not deleted
+
+
+def test_live_paper_lease_conflict_exits_2(monkeypatch: pytest.MonkeyPatch, capsys: Any) -> None:
+    from supermarket_bot import web
+    from supermarket_bot.tracker import TrackerBusy
+
+    closed: List[bool] = []
+
+    class BusyRuntime:
+        tracker = type("T", (), {"paper_runner": object()})()
+
+        def start(self) -> None:
+            raise TrackerBusy({"pid": 1234, "host": "my-laptop"}, "data/cup/tracker.sqlite3")
+
+        def close(self) -> None:
+            closed.append(True)
+
+    monkeypatch.setattr(web, "build_live", lambda settings, args, out=None: BusyRuntime())
+    assert cli.main(["paper", "--hours", "1"], out=io.StringIO()) == 2
+    assert ("error: Another process (pid 1234 on my-laptop) is already running the tracker on data/cup/tracker.sqlite3: "
+            "stop it, or use --data-dir for a separate copy.") in capsys.readouterr().err
+    assert closed == [True]
+
+
+def test_paper_usage_errors(capsys: Any) -> None:
+    assert cli.main(["paper", "--fast", "--hours", "1"], out=io.StringIO()) == 2
+    assert "--fast needs --demo" in capsys.readouterr().err
+
+
+def test_backtest_demo_prints_the_testability_table_first(methods: List[Tuple[str, str]], capsys: Any) -> None:
+    out = io.StringIO()
+    code = cli.main(["backtest", "--demo", "--demo-hours", "1"], out=out)
+    assert code == 0, capsys.readouterr().err
+    lines = _lines(out.getvalue())
+    assert lines[0].startswith("Simulating the demo market for 1 h")
+    assert lines[1] == "What this replay can test (per idea kind):"
+    kinds = [line.split()[0] for line in lines[2:8]]
+    assert kinds == ["value", "basket", "hole", "fade", "carry", "arbitrage"]
+    order = [next(i for i, line in enumerate(lines) if line.startswith(prefix))
+             for prefix in ("What this replay can test", "Window:", "Coverage:", "Assumptions:", "PORTFOLIO", "Headline verdict")]
+    assert order == sorted(order)
+    assert any("not replayable" in line for line in lines[2:8])
+    assert any(line.startswith("Headline verdict (human:conservative): Not enough evidence yet") for line in lines)
+    assert_get_only(methods)
+
+
+def test_backtest_on_a_store_json_sweep_and_errors(tmp_path: Path, capsys: Any) -> None:
+    data = tmp_path / "sim"
+    assert cli.main(["paper", "--demo", "--fast", "--hours", "1.2", "--json", "--no-news", "--data-dir", str(data)],
+                    out=io.StringIO()) == 0
+    db = data / "demo" / "tracker.sqlite3"
+    out = io.StringIO()
+    assert cli.main(["backtest", "--store", str(db), "--hours", "1", "--json"], out=out) == 0, capsys.readouterr().err
+    report = json.loads(out.getvalue())
+    assert {"testability", "window", "coverage", "assumptions", "portfolios", "verdicts", "study", "warnings"} <= set(report)
+    assert report["window"]["end"] - report["window"]["start"] == pytest.approx(3600.0)
+    out = io.StringIO()
+    assert cli.main(["backtest", "--store", str(db), "--hours", "1", "--step", "600", "--latency-sweep", "--json"], out=out) == 0
+    swept = json.loads(out.getvalue())
+    assert sorted(row["label"] for row in swept["sweep"]) == ["latency_s=120", "latency_s=30", "latency_s=300"]
+    assert cli.main(["backtest", "--store", str(db), "--sweep", "no_such_knob=1,2"], out=io.StringIO()) == 2
+    assert "no_such_knob" in capsys.readouterr().err
+    assert cli.main(["backtest", "--store", str(tmp_path / "missing.sqlite3")], out=io.StringIO()) == 2
+    assert "no such database" in capsys.readouterr().err
+
+
+def test_backtest_finds_the_only_store(tmp_path: Path, capsys: Any) -> None:
+    from supermarket_bot.store import TrackerStore
+
+    data = tmp_path / "data"
+    assert cli.main(["backtest", "--data-dir", str(data)], out=io.StringIO()) == 2
+    assert "no tracker database under" in capsys.readouterr().err
+    (data / "demo").mkdir(parents=True)
+    TrackerStore(data / "demo" / "tracker.sqlite3").close()  # the demo's database is never picked
+    (data / "cup").mkdir()
+    TrackerStore(data / "cup" / "tracker.sqlite3").close()
+    out = io.StringIO()
+    assert cli.main(["backtest", "--data-dir", str(data), "--json"], out=out) == 0, capsys.readouterr().err
+    assert json.loads(out.getvalue())["coverage"] is not None
+    (data / "other").mkdir()
+    TrackerStore(data / "other" / "tracker.sqlite3").close()
+    assert cli.main(["backtest", "--data-dir", str(data)], out=io.StringIO()) == 2
+    assert "several tracker databases" in capsys.readouterr().err
+    out = io.StringIO()
+    assert cli.main(["backtest", "--data-dir", str(data), "--tournament", "cup", "--json"], out=out) == 0
+
+
+def test_fairvalue_demo_lists_matches_and_override_snippets(methods: List[Tuple[str, str]], capsys: Any) -> None:
+    out = io.StringIO()
+    assert cli.main(["fairvalue", "--demo"], out=out) == 0, capsys.readouterr().err
+    lines = _lines(out.getvalue())
+    assert lines[0].startswith("Outside fair values (auto, demo feed): 33 outcomes, ")
+    tx = lines.index(next(line for line in lines if line.startswith("Will the Democratic Party win the Texas Senate?")))
+    assert "[2026:SENATE:TX]" in lines[tx] and "(exchange 9026)" in lines[tx]
+    assert "fair 0.580 (demo, high" in lines[tx + 1] and "venues: demo" in lines[tx + 1]
+    assert "Providers:" in lines and any(line.startswith("  demo: ok") for line in lines)
+    assert any(line.startswith("Map file: ") for line in lines)
+    out = io.StringIO()
+    assert cli.main(["fairvalue", "--demo", "--show-override", "9026"], out=out) == 0
+    text = out.getvalue()
+    assert '"9026": {"disabled": true, "note": "wrong match"}' in text and "fair_value_map.json" in text
+    assert "the bot reloads it within a minute" in text
+    out = io.StringIO()
+    assert cli.main(["fairvalue", "--demo", "--only-usable", "--json"], out=out) == 0
+    payload = json.loads(out.getvalue())
+    assert payload["rows"] and all(r["fair"]["usable"] for r in payload["rows"])
+    assert cli.main(["fairvalue", "--demo", "--show-override", "424242"], out=io.StringIO()) == 2
+    assert "no open outcome with exchange id 424242" in capsys.readouterr().err
+    assert_get_only(methods)
+
+
+def test_fairvalue_live_manual_file_and_template(run: Any, cup: Any, fake: Any, data_dir: Path) -> None:
+    fake.add("GET", T_MARKETS, market_page([market("m1", "Will the Democratic Party win the Texas Senate?", [("e1", None, 0.5)])]))
+    fake.add("GET", "/exchanges/prices", {"data": [price("e1", "m1", 0.5, 0.49, 0.51)], "missingIds": []})
+    code, text = run("--tournament", TOURNAMENT_SLUG, "fairvalue", "--fair-value", "manual", "--template")
+    assert code == 0 and "Wrote " in text and "fair_values.json with 1 outcomes" in text
+    path = data_dir / TOURNAMENT_SLUG / "fair_values.json"
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    assert [v["exchange_id"] for v in doc["values"]] == ["e1"] and doc["values"][0]["probability"] is None
+    code, text = run("--tournament", TOURNAMENT_SLUG, "fairvalue", "--fair-value", "manual", "--template")
+    assert code == 0 and "already exists" in text  # never overwritten
+    doc["values"][0]["probability"] = 0.58
+    doc["values"][0]["updated_at"] = "2099-01-01T00:00:00Z"
+    path.write_text(json.dumps(doc), encoding="utf-8")
+    code, text = run("--tournament", TOURNAMENT_SLUG, "fairvalue", "--fair-value", "manual", "--json")
+    assert code == 0
+    payload = json.loads(text)
+    assert payload["mode"] == "manual" and payload["counts"]["manual"] == 1
+    [row] = payload["rows"]
+    assert row["fair"]["source"] == "manual" and row["fair"]["value"] == pytest.approx(0.58)
+    assert row["sm_bid"] == 0.49 and row["gap"] == pytest.approx(0.08)
+    assert all(c.method == "GET" for c in fake.calls)  # Super Market reads only; manual mode reads no outside host
+
+
+def test_paper_final_lines_name_the_settlements() -> None:
+    """[integration] §12: the final `paper` output shows the settlements seen during the run (from the trades)."""
+    body = {
+        "now": 0.0, "run": {"run_id": "run-1", "end_reason": "completed", "hours_run": 2.0, "target_hours": 2.0},
+        "portfolios": [], "headline": None, "table_warning": "", "caveats": [],
+        "trades": [
+            {"portfolio_id": "human:conservative", "exit_reason": "settled", "title": "Will the Maine debate happen?"},
+            {"portfolio_id": "kind:value", "exit_reason": "settled", "title": "Will the Maine debate happen?"},
+            {"portfolio_id": "kind:value", "exit_reason": "target", "title": "Other"},
+        ],
+    }
+    lines = cli.paper_final_lines(body)
+    assert "  Settled while running: 2 positions in 2 portfolios (Will the Maine debate happen?)." in lines
+    body["trades"] = [t for t in body["trades"] if t["exit_reason"] != "settled"]
+    assert not any(line.startswith("  Settled while running") for line in cli.paper_final_lines(body))

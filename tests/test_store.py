@@ -112,7 +112,7 @@ def sample_attribution() -> Attribution:
 
 
 def test_schema_created_and_versioned(store: TrackerStore) -> None:
-    assert store.schema_version == SCHEMA_VERSION == 1
+    assert store.schema_version == SCHEMA_VERSION == 2  # schema v2: docs/PAPER_TRADING.md §7.1
     tables = {r[0] for r in store._query("SELECT name FROM sqlite_master WHERE type = 'table'")}
     assert {"markets", "exchanges", "ticks", "candles", "trades", "surges", "news_cache", "state"} <= tables
     indexes = {r[0] for r in store._query("SELECT name FROM sqlite_master WHERE type = 'index'")}
@@ -132,7 +132,7 @@ def test_file_database_uses_wal_and_persists(tmp_path) -> None:
 
     again = TrackerStore(str(path))
     try:
-        assert again.schema_version == 1
+        assert again.schema_version == 2
         assert again.tick_count() == 1
         assert again.get_state("k") == {"a": 1}
     finally:

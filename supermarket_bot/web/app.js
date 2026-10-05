@@ -47,14 +47,15 @@
   const REQUEST_TIMEOUT_MS = 15000;
   const BOOK_PENDING_POLL_MS = 2000; // the server is still fetching the order book: ask again soon
   const ANALYZE_MSG_MS = 60000; // how long a Re-analyze confirmation or error stays on the card
-  const VIEWS = ['overview', 'markets', 'surges', 'high', 'strategy'];
-  const VIEW_TITLES = { overview: 'Overview', markets: 'Markets', surges: 'Surges', high: 'High 90s', strategy: 'Strategy' };
+  const VIEWS = ['overview', 'markets', 'surges', 'high', 'strategy', 'sim'];
+  const VIEW_TITLES = { overview: 'Overview', markets: 'Markets', surges: 'Surges', high: 'High 90s', strategy: 'Strategy', sim: 'Simulation' };
   const VIEW_DATA = {
     overview: ['strategy', 'surges'],
     markets: ['markets'],
     surges: ['surges'],
     high: ['high'],
     strategy: ['strategy'],
+    sim: ['paper', 'fairvalue', 'backtest'],
   };
   const ENDPOINTS = {
     status: '/api/status',
@@ -62,10 +63,18 @@
     surges: '/api/surges',
     high: '/api/highband',
     strategy: '/api/strategy',
+    paper: '/api/paper',
+    fairvalue: '/api/fairvalue',
+    backtest: '/api/backtest',
   };
+  // Endpoints refreshed less often than the 5 s poll (the backtest and the fair values change slowly).
+  const ENDPOINT_EVERY_MS = { fairvalue: 30000, backtest: 30000 };
   const RANGES = { '6h': 6 * 3600, '24h': 24 * 3600, '7d': 7 * 24 * 3600 };
   const RANGE_LABELS = { '6h': '6 hours', '24h': '24 hours', '7d': '7 days' };
-  const DATA_LABELS = { markets: 'the markets list', surges: 'the surges', high: 'the high-90s list', strategy: 'the strategy ideas' };
+  const DATA_LABELS = {
+    markets: 'the markets list', surges: 'the surges', high: 'the high-90s list', strategy: 'the strategy ideas',
+    paper: 'the simulation', fairvalue: 'the fair values', backtest: 'the backtest',
+  };
   const DASH = '—';
   const MINUS = '−';
   const ARROW = '→';
@@ -77,7 +86,7 @@
   const S = {
     view: 'overview',
     viewShown: false,
-    data: { status: null, markets: null, surges: null, high: null, strategy: null },
+    data: { status: null, markets: null, surges: null, high: null, strategy: null, paper: null, fairvalue: null, backtest: null },
     offset: 0, // server clock minus browser clock, in seconds
     failures: 0,
     failureText: '',
@@ -86,6 +95,7 @@
     inflight: {}, // view endpoint name -> true while its request is out
     viewErrors: {}, // view endpoint name -> {message, status, since}
     loadedAt: {}, // view endpoint name -> server time of the last successful load
+    triedAt: {}, // view endpoint name -> browser ms of the last request (slow endpoints wait ENDPOINT_EVERY_MS)
     startedAt: null, // the server's started_at: a change means the dashboard restarted
     liveState: null,
     bannerShown: {},
@@ -537,6 +547,11 @@
     calendar: [['rect', { x: 2, y: 3, width: 12, height: 11, rx: 1.5 }], ['path', { d: 'M2 6.5h12M5.5 1.5v3M10.5 1.5v3' }]],
     chevron: [['path', { d: 'M6 3.5l4.5 4.5L6 12.5' }]],
     closed: [['circle', { cx: 8, cy: 8, r: 6.5 }], ['path', { d: 'M5 8h6' }]],
+    target: [['circle', { cx: 8, cy: 8, r: 6.5 }], ['circle', { cx: 8, cy: 8, r: 3 }], ['circle', { class: 'f', cx: 8, cy: 8, r: 1 }]],
+    basket: [['path', { d: 'M1.8 6.5h12.4l-1.6 7H3.4z' }], ['path', { d: 'M5 6.5l2.2-4.5M11 6.5L8.8 2M6 9v2.5M10 9v2.5' }]],
+    hole: [['path', { d: 'M8 1.8v7.4M5.2 6.6L8 9.4l2.8-2.8' }], ['path', { d: 'M2.5 11v2.5h11V11' }]],
+    trendDown: [['path', { d: 'M2.5 4.5l3 3 2.5-2 5.5 6' }], ['path', { d: 'M10 11.5h3.5V8' }]],
+    copy: [['rect', { x: 5.5, y: 5.5, width: 8, height: 8, rx: 1.5 }], ['path', { d: 'M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2' }]],
   };
 
   function icon(name, cls) {
@@ -624,6 +639,9 @@
   }
 
   const KINDS = {
+    value: ['target', 'Value', 'The Cup price differs from the outside fair value'],
+    basket: ['basket', 'Basket', 'Outcomes that cannot all win are priced above 1 (or below 1): a set that pays whatever happens at a 1/0 settlement'],
+    hole: ['hole', 'Hole', 'A resting order far below a liquid favourite, to catch a liquidity hole'],
     fade: ['fade', 'Fade', 'Bet that a participant-driven move gives part of itself back'],
     carry: ['carry', 'Carry', 'Buy a stable high-90s favourite and hold it to settlement'],
     arbitrage: ['arb', 'Arbitrage', 'Prices that do not add up: a near-riskless set of trades'],
@@ -846,6 +864,18 @@
    *  instead of waiting out the backoff (which can reach a minute). */
   function serverAnswered() {
     if (!isOffline() || S.polling) return;
+    // at most one early re-poll every 3 s: when only /api/status fails, every successful view load
+    // would otherwise start the next status request at once (a request storm); within the 3 s the
+    // retry moves up to the end of the window instead of waiting out the backoff
+    const since = S.answeredPollAt ? Date.now() - S.answeredPollAt : Infinity;
+    if (since < 3000) {
+      if (!S.nextRetryAt || S.nextRetryAt > S.answeredPollAt + 3000) {
+        schedule(3000 - since);
+        S.nextRetryAt = S.answeredPollAt + 3000;
+      }
+      return;
+    }
+    S.answeredPollAt = Date.now();
     S.nextRetryAt = 0;
     clearTimeout(S.pollTimer);
     S.pollTimer = null;
@@ -910,8 +940,11 @@
   }
 
   /** Fetch one view endpoint; on failure keep the last good data and remember the error for that view only. */
-  async function loadView(name) {
+  async function loadView(name, force) {
     if (S.inflight[name] || !ENDPOINTS[name]) return;
+    const every = ENDPOINT_EVERY_MS[name];
+    if (every && !force && S.triedAt[name] != null && Date.now() - S.triedAt[name] < every) return;
+    S.triedAt[name] = Date.now();
     S.inflight[name] = true;
     let ok = false;
     try {
@@ -1030,6 +1063,7 @@
     else if (view === 'surges') renderSurges();
     else if (view === 'high') renderHigh();
     else if (view === 'strategy') renderStrategy();
+    else if (view === 'sim') renderSim();
   }
 
   /** The error to show for a view endpoint (none while the whole dashboard is offline: the banner
@@ -1042,7 +1076,12 @@
 
   /** The empty-state text while a view endpoint has no data yet: loading, or the reason it failed. */
   function loadingMsg(name, text) {
-    return viewError(name) ? 'Could not load ' + DATA_LABELS[name] + '. Retrying every ' + fmtSpan(POLL_MS / 1000) + '.' : text;
+    return viewError(name) ? 'Could not load ' + DATA_LABELS[name] + '. Retrying every ' + retryEvery(name) + '.' : text;
+  }
+
+  /** How often a view endpoint is asked again ("5 s"; "30 s" for the slow simulation endpoints). */
+  function retryEvery(name) {
+    return fmtSpan((ENDPOINT_EVERY_MS[name] || POLL_MS) / 1000);
   }
 
   /** Inline errors at the top of a view: one line per failing endpoint, the rest of the page is unaffected. */
@@ -1063,7 +1102,7 @@
           h('strong', null, (has ? 'Could not refresh ' : 'Could not load ') + DATA_LABELS[n] + ': '),
           e.message,
           has ? [' Showing what was loaded ', timeEl(S.loadedAt[n], 'ago'), '.'] : null,
-          ' Retrying every ' + fmtSpan(POLL_MS / 1000) + '.'));
+          ' Retrying every ' + retryEvery(n) + '.'));
     }));
     if (names.length && !wasShown) announce('Could not refresh ' + names.map(function (n) { return DATA_LABELS[n]; }).join(' or ') + '.');
   }
@@ -1518,9 +1557,9 @@
     return [str(o.kind), hasId(o.exchange_id) ? 'x' + o.exchange_id : 'm' + str(o.market_id), str(o.side), str(o.surge_id)].join(':');
   }
 
-  /** An arbitrage idea is a set of trades: its legs (newer servers), or "every outcome" of its market. */
+  /** An arbitrage or basket idea is a set of trades: its legs (newer servers), or "every outcome" of its market. */
   function isSet(o) {
-    return str(o.kind) === 'arbitrage';
+    return str(o.kind) === 'arbitrage' || str(o.kind) === 'basket';
   }
 
   function ideaLegs(o) {
@@ -1528,7 +1567,10 @@
   }
 
   function legText(l) {
-    return 'BUY ' + (str(l.side).toUpperCase() || '?') + (str(l.option) ? ' ' + str(l.option) : '') + ' @ ' + fmtPrice(l.price);
+    // a binary outcome's option is just "YES": "BUY NO YES" would misread, so only real option labels are named
+    const opt = str(l.option);
+    const named = opt && !/^(yes|no)$/i.test(opt.trim());
+    return 'BUY ' + (str(l.side).toUpperCase() || '?') + (named ? ' ' + opt : '') + ' @ ' + fmtPrice(l.price);
   }
 
   function actionText(o) {
@@ -2418,6 +2460,141 @@
     }));
   }
 
+  const FV_SOURCE_LABELS = {
+    manual: 'your fair-value file', polymarket: 'Polymarket', kalshi: 'Kalshi', blend: 'Polymarket and Kalshi', demo: 'the demo feed',
+    history: 'imported history',
+  };
+
+  function fvSourceLabel(src) {
+    const k = str(src);
+    return FV_SOURCE_LABELS[k] || k || 'unknown source';
+  }
+
+  /** A fair value's uncertainty (a probability) in cents: "± 1.0 cents". */
+  function fmtCents(v) {
+    v = num(v);
+    return v == null ? DASH : '± ' + (v * 100).toFixed(1) + ' cents';
+  }
+
+  /** A small amount per share with 2-3 decimals ("0.17", "0.055"). */
+  function fmtSmall(v) {
+    v = num(v);
+    return v == null ? DASH : nf(2, 3).format(v);
+  }
+
+  /** Expected profit per unit of a bet shape (BetShape.to_dict()); null for a fixed-size passive order. */
+  function betEdge(b) {
+    b = obj(b);
+    const p = num(b.p), gain = num(b.gain), loss = num(b.loss);
+    if (b.kind === 'riskless') return gain;
+    if (b.kind === 'fixed' || p == null || gain == null || loss == null) return null;
+    if (b.kind === 'bounded') {
+      const tail = num(b.tail_prob) != null ? b.tail_prob : 1 - p;
+      return (1 - tail) * gain - tail * loss;
+    }
+    return p * gain - (1 - p) * loss;
+  }
+
+  const REGIME_TEXT = {
+    unknown: 'Settlement rule assumed: unknown, valued conservatively',
+    resolved_outcomes: 'Settlement rule assumed: unresolved markets wait for the real outcome and pay 1/0',
+    vwap_closeout: 'Settlement rule assumed: unresolved markets are cashed at a ~5-hour VWAP at the Cup end',
+  };
+
+  function regimeText(regime) {
+    const k = str(regime) || 'unknown';
+    return REGIME_TEXT[k] || 'Settlement rule assumed: ' + k.replace(/_/g, ' ');
+  }
+
+  /** A line list as a fact value (one sentence per item). */
+  function lineList(lines) {
+    const t = texts(lines);
+    return t.length ? h('ul', { class: 'fact-lines' }, t.map(function (x) { return h('li', null, x); })) : null;
+  }
+
+  /** The paper-trading facts of an idea (docs/PAPER_TRADING.md §8.3), each only when the server sent it. */
+  function ideaPaperFacts(o) {
+    const per = sizeUnit(o, 1);
+    const out = [];
+    const fv = num(o.fair_value);
+    if (fv != null) {
+      out.push(['Fair value', fmtPrice(fv) + ' (' + fvSourceLabel(o.fair_source) + (num(o.fv_uncertainty) != null ? ', ' + fmtCents(o.fv_uncertainty) : '') + ')',
+        'The outside fair value of the contract bought, and its own uncertainty', 'wide']);
+    }
+    const limit = num(o.limit_price);
+    if (limit != null) {
+      let order;
+      if (str(o.order_type) === 'maker') {
+        order = 'Resting limit at ' + fmtPrice(limit) + (num(o.expires_at) != null ? ' until ' + fmtClock(o.expires_at) : '');
+      } else if (isSet(o)) {
+        const legs = ideaLegs(o).map(function (l) { return num(l.limit) != null ? fmtPrice(l.limit) : null; }).filter(Boolean);
+        order = 'Limit ' + fmtPrice(limit) + ' per set' + (legs.length ? ' (legs ' + legs.join(' / ') + ')' : '');
+      } else {
+        order = 'Limit ' + fmtPrice(limit) + (str(o.kind) === 'value' ? ' (keeps the full required edge)' : ' (gives away at most half the edge)');
+      }
+      out.push(['Order', order, str(o.order_type) === 'maker' ? 'A passive order: it fills only if prices trade through it' : 'The worst price the order accepts', 'wide']);
+    }
+    if (o.bet_limit) {
+      const b = obj(o.bet_limit);
+      const e = betEdge(b);
+      if (e != null) out.push(['If filled at the limit', fmtSigned(e) + '/' + per, 'The expected profit per ' + per + ' if the whole order fills at its limit']);
+      else if (b.kind === 'fixed' && num(b.gain) != null) out.push(['If filled at the limit', 'up to ' + fmtSigned(b.gain) + '/' + per + ' at the target', null, 'wide']);
+    }
+    if (o.exit_plan && str(obj(o.exit_plan).note)) out.push(['Exit plan', str(obj(o.exit_plan).note), null, 'full']);
+    const fd = num(o.factor_delta);
+    if (fd != null && Math.abs(fd) >= 0.0005 && !isSet(o)) {
+      out.push(['National swing', 'A 3-point national swing toward the ' + (fd > 0 ? 'Republicans' : 'Democrats') + ' costs ' + fmtSmall(3 * Math.abs(fd)) + ' per ' + per,
+        'Races share one national polling error', 'full']);
+    }
+    if (isSet(o) && o.bet) {
+      const b = obj(o.bet);
+      if (b.kind === 'riskless') out.push(['Set type', 'Riskless at a 1/0 settlement', null, 'full']);
+      else if (b.kind === 'bounded') out.push(['Set type', 'Bounded: a refund on one leg could lose ' + fmtSmall(b.loss) + ' per set', null, 'full']);
+    }
+    const sizing = o.sizing ? obj(o.sizing) : null;
+    if (sizing && texts(sizing.lines).length) out.push(['Sizing', lineList(sizing.lines), null, 'full']);
+    const alt = o.alt_sizing ? obj(o.alt_sizing) : null;
+    if (alt) {
+      const first = texts(alt.lines)[0];
+      const units = num(alt.units);
+      out.push([str(alt.policy) === 'conservative' ? 'Conservative sizing' : 'Chaser sizing',
+        first || (units == null ? DASH : fmtInt(units) + ' ' + sizeUnit(o, units)), 'What the other sizing policy would buy', 'full']);
+    }
+    if (num(o.profit_per_capital_day) != null) out.push(['Per day of capital', fmtPctOf(o.profit_per_capital_day, 2), 'Expected profit per day the capital stays tied up']);
+    return out;
+  }
+
+  /** The Strategy view's sizing panel: the report policy, the bar, M, the Markov bound and every line. */
+  function sizingFacts(sz) {
+    const bar = sz.bar ? obj(sz.bar) : null;
+    const lo = bar ? num(bar.low) : null, hi = bar ? num(bar.high) : null;
+    const range = lo != null && hi != null && Math.round(lo) !== Math.round(hi) ? ' (range ' + fmtInt(lo) + '–' + fmtInt(hi) + ')' : '';
+    const m = num(sz.M);
+    return factList([
+      str(sz.mode) ? ['Mode', str(sz.mode).replace(/_/g, ' ') + (sz.kept_by_hysteresis ? ' (kept by hysteresis)' : ''), null, 'wide'] : null,
+      ['Top-3 bar', bar && num(bar.value) != null ? fmtInt(bar.value) + ' ' + currency() + range : 'unknown', 'Sized from the lower end of the range', 'wide'],
+      ['M', m == null ? DASH : m.toFixed(1), m == null ? null : 'The bar divided by the portfolio value (' + m.toFixed(3) + ')'],
+      ['Chance ceiling', num(sz.markov_ceiling) == null ? DASH : fmtPct0(sz.markov_ceiling), 'Markov bound: the most likely a strategy with this expected multiple reaches the bar'],
+    ]);
+  }
+
+  function sizingPanel(d) {
+    const sz = obj(d.sizing);
+    const alt = sz.alternative ? obj(sz.alternative) : null;
+    const panel = h('section', { class: 'panel', 'aria-labelledby': 'h-sizing' },
+      h('h3', { class: 'panel-title', id: 'h-sizing' }, 'Sizing: ' + (str(sz.label) || str(sz.policy) || 'conservative')),
+      sizingFacts(sz),
+      texts(sz.lines).length ? h('ul', { class: 'notes sizing-lines' }, texts(sz.lines).map(function (t) { return h('li', null, t); })) : null,
+      h('p', { class: 'muted-note regime-note' }, icon('info'), sentence(regimeText(d.settlement_regime))));
+    if (alt) {
+      panel.appendChild(h('details', { class: 'alt-sizing' },
+        h('summary', null, icon('chevron', 'chev'), 'The other policy: ' + (str(alt.label) || str(alt.policy))),
+        sizingFacts(alt),
+        texts(alt.lines).length ? h('ul', { class: 'notes sizing-lines' }, texts(alt.lines).map(function (t) { return h('li', null, t); })) : null));
+    }
+    return panel;
+  }
+
   function ideaCard(o, i) {
     o = obj(o);
     const key = ideaKey(o);
@@ -2441,11 +2618,11 @@
       ['Edge per ' + per, num(o.edge) == null ? DASH : fmtSigned(o.edge), 'Expected profit per ' + per + ' after the stop'],
       ['Expected return', fmtPctOf(o.expected_return), 'Edge as a share of the entry price'],
       ['Suggested size', sizeText, null, 'wide'],
-      ['Score', fmtScore(o.score), 'Expected return × confidence, adjusted for the risk mode'],
+      ['Score', fmtScore(o.score), 'Expected growth: the profit in % of equity at the conservative size × confidence, adjusted for the risk mode'],
       ['Confidence', fmtPct0(o.confidence)],
       num(o.horizon_hours) != null ? ['Horizon', fmtSpan(o.horizon_hours * 3600)] : null,
       ['Settles before Cup end', o.settles_before_cup_end === true ? 'Yes' : o.settles_before_cup_end === false ? 'No' : 'Unknown'],
-    ]);
+    ].concat(ideaPaperFacts(o)));
     const details = h('details', { 'data-idea': key },
       h('summary', { 'data-focus-key': 'st:' + key + ':why' }, icon('chevron', 'chev'), 'Why this idea, and the risks',
         h('span', { class: 'sr-only' }, ' — ' + outcomeLabel(titleText, option))), // every disclosure names its idea
@@ -2650,13 +2827,15 @@
     } else {
       let note = ideasPanel.querySelector('.empty');
       if (!note) note = ideasPanel.appendChild(emptyNote(''));
-      setText(note, noDataMsg() || 'No trade ideas right now. Ideas appear when the bot sees a participant-driven surge, a stable high-90s favourite or prices that do not add up.');
+      setText(note, noDataMsg() || 'No trade ideas right now. Ideas appear when the bot sees a Cup price away from its outside fair value, prices that do not add up, a liquid favourite to rest a deep order under, a participant-driven surge or a stable high-90s favourite.');
     }
+    const sizing = d.sizing && typeof d.sizing === 'object'
+      ? strategyPart('sizing', sig([d.sizing, d.settlement_regime, cur]), function () { return sizingPanel(d); }) : null;
     const backtest = strategyPart('backtest', sig([d.backtest_status, d.backtest_error, d.backtest]), function () { return backtestPanel(d); });
     const disclaimer = strategyPart('disclaimer', sig([d.disclaimer]), function () {
       return h('p', { class: 'disclaimer' }, icon('lock'), str(d.disclaimer) || 'Read-only analysis. Nothing is traded automatically.');
     });
-    const wanted = [risk, principles, ideasPanel, backtest, disclaimer];
+    const wanted = [risk, sizing, principles, ideasPanel, backtest, disclaimer].filter(Boolean);
     if (root.children.length !== wanted.length || !root.querySelector(':scope > .risk-banner')) {
       rebuild(root, wanted);
     } else {
@@ -2697,6 +2876,1562 @@
     setTimeout(function () { card.classList.remove('is-target'); }, 2500);
   }
 
+  // ---------------------------------------------------------------- render: simulation (paper trading)
+  //
+  // docs/PAPER_TRADING.md §8: every number about a simulated result is at liquidation value unless it
+  // says otherwise; the pre-registered headline portfolio (you, acting by hand) is the only one judged
+  // in full; no text names or highlights a "best" portfolio. Panels are built once and their bodies are
+  // rebuilt only when the data they show changed (focus, open disclosures and selections survive polls).
+
+  const SIM = {
+    mode: null, // the layout on screen: 'loading' | 'off' | 'failed' | 'waiting' | 'run'
+    panels: {}, // name -> {el, body, key, ...}
+    note: null, // the one-line state note (loading, off, failed, no run yet)
+    top: null, // the headline + signal study row
+    hidden: new Set(), // portfolio ids whose equity line is toggled off
+    table: false, // the equity curves show as a table
+    posFilter: null, // open positions: portfolio filter (null = not chosen yet: the headline; '' = every portfolio)
+    fvQuery: '',
+    fvUsable: false,
+    fillsAll: false,
+    open: new Set(), // keys of open <details>
+    previousOpen: false,
+    previous: null, // the ?run=previous body
+    previousState: '', // '' | 'loading' | 'error' | 'ready'
+    previousError: '',
+    previousGen: 0,
+    resetBusy: false,
+    chart: null,
+    chartKey: null,
+    chartWidth: 0,
+    ro: null,
+    hoverTs: null,
+    liveTimer: null,
+  };
+
+  const SIM_LEVELS = {
+    insufficient: ['clock', 'Not enough evidence', 'A threshold is not met yet: 12 covered hours, 30 ideas and 20 independent groups'],
+    inconclusive: ['question', 'Inconclusive', 'The interval includes zero, or a guard fired (one idea, one race, one national swing or unknown depth)'],
+    promising: ['carry', 'Promising, not proof', 'The strongest verdict one day can reach: confirm it on a second day before acting'],
+    positive: ['checkCircle', 'Profitable so far', 'At least 48 covered hours on two days, positive on each of the last two'],
+    negative: ['trendDown', 'Losing so far', 'The interval for the average idea lies entirely below zero'],
+  };
+
+  const SIM_GROUPS = [
+    ['human:', 'Your headline (decided before the run)'],
+    ['policy:', 'Bot speed: an upper bound for acting by hand'],
+    ['kind:', 'By strategy (equal capital, conservative sizing, exploratory)'],
+  ];
+
+  const HORIZON_LABELS = { '5m': '+5 min', '30m': '+30 min', '2h': '+2 h', '6h': '+6 h' };
+
+  // The equity chart also starts minutes into a run: allow minute steps before the shared 15-minute ones.
+  const SIM_TICK_STEPS = [60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 14400, 21600, 43200, 86400, 172800];
+
+  const EXIT_REASONS = {
+    target: 'Reached its target', stop: 'Stopped out', time: 'Time limit reached', settled: 'Settled', refund: 'Refunded',
+    converged: 'Converged: the gap closed', fair_value: 'The fair value moved', regime: 'Closed before the Cup end (settlement rule)',
+    legging: 'Legging: the other legs did not fill', replaced: 'Replaced by a stronger idea', reset: 'Simulation reset',
+    'settings changed': 'Settings changed, run ended', completed: 'Run completed',
+  };
+
+  const POSITION_FLAGS = {
+    depth_stale: 'depth from an older book', depth_unknown: 'depth unknown: valued with a haircut',
+    closed_no_ruling: 'market closed, no ruling yet (not counted)', stale_quote: 'quote stale', post_cup: 'after the Cup end',
+    synthetic: 'filled from candles (replay)',
+  };
+
+  const PROVIDER_STATUS = {
+    ok: 'answering', partial: 'partly answering', offline: 'offline from this machine', backoff: 'backing off after errors',
+    disabled: 'off', error: 'failing',
+  };
+
+  const PROVIDER_NAMES = { polymarket: 'Polymarket', kalshi: 'Kalshi', manual: 'Your fair-value file', demo: 'Demo feed' };
+
+  const TESTABILITY = {
+    testable: ['checkCircle', 'Testable'], partial: ['pulse', 'Partly testable'], not_testable: ['warn', 'Not testable yet'],
+    not_replayable: ['closed', 'Not replayable'],
+  };
+
+  const SNIPPETS = [
+    ['disable', 'Turn this match off'], ['pin', 'Pin the right outside market'], ['confirm', 'Confirm this match'],
+    ['trade_near', 'Trade this near match'],
+  ];
+
+  // Equity line styles: the headline (you, by hand) is the one emphasised line, the bot-speed portfolios
+  // share the second hue, and the per-kind portfolios are recessive grey lines told apart by dash pattern.
+  const EQ_DASH = {
+    'policy:conservative': '', 'policy:chaser': '7 4',
+    'kind:value': '6 3', 'kind:basket': '2 3', 'kind:hole': '10 3 2 3', 'kind:fade': '1.5 4', 'kind:carry': '12 4',
+    'kind:arbitrage': '5 2 1.5 2',
+  };
+
+  /** A signed whole amount with thousands separators: "+1,234", "−412", "0". */
+  function fmtSignedMoney(v, dp) {
+    v = num(v);
+    if (v == null) return DASH;
+    const d = dp == null ? 0 : dp;
+    const r = Number(v.toFixed(d));
+    if (r === 0) return nf(d, d).format(0);
+    return (r > 0 ? '+' : MINUS) + nf(d, d).format(Math.abs(r));
+  }
+
+  /** A signed percentage of a fraction: 0.0041 -> "+0.41%". */
+  function fmtSignedPct(v, dp) {
+    v = num(v);
+    if (v == null) return DASH;
+    return fmtSigned(v * 100, dp == null ? 2 : dp) + '%';
+  }
+
+  function fmtHours(v) {
+    v = num(v);
+    return v == null ? DASH : v.toFixed(1) + ' h';
+  }
+
+  /** "24" for 24 hours, "1.5" for 1.5 (the "24-hour test"). */
+  function fmtCount(v) {
+    v = num(v);
+    return v == null ? DASH : nf(0, 1).format(v);
+  }
+
+  function plural(n, one, many) {
+    return fmtInt(n) + ' ' + (Math.round(num(n) || 0) === 1 ? one : many || one + 's');
+  }
+
+  /** A P&L amount with an up/down marker (the marker is decoration; the sign says it in text). */
+  function pnlEl(v) {
+    v = num(v);
+    if (v == null) return h('span', { class: 'nil' }, DASH);
+    const r = Math.round(v);
+    const dir = r > 0 ? 'up' : r < 0 ? 'down' : 'flat';
+    return h('span', { class: 'pnl delta ' + dir, title: fmtSignedMoney(v, 2) + ' ' + currency() },
+      h('span', { class: 'arrow', 'aria-hidden': 'true' }, dir === 'up' ? '▲' : dir === 'down' ? '▼' : '●'), fmtSignedMoney(v));
+  }
+
+  function levelBadge(v) {
+    v = obj(v);
+    const key = SIM_LEVELS[str(v.level)] ? str(v.level) : 'unknown';
+    const lv = SIM_LEVELS[key] || ['question', str(v.level) || 'No verdict yet', ''];
+    const label = v.exploratory === true ? 'Exploratory: ' + lv[1].charAt(0).toLowerCase() + lv[1].slice(1) : lv[1];
+    return h('span', { class: 'verdict-level level-' + key + (v.exploratory === true ? ' is-exploratory' : ''), title: lv[2] || null },
+      icon(lv[0]), label);
+  }
+
+  function shortPortfolio(pid, label) {
+    const id = str(pid);
+    if (id.indexOf('human:') === 0) return 'You, by hand (headline)';
+    if (id === 'policy:conservative') return 'Bot speed: conservative';
+    if (id === 'policy:chaser') return 'Bot speed: chaser';
+    if (id.indexOf('kind:') === 0) {
+      const k = KINDS[id.slice(5)];
+      return (k ? k[1] : id.slice(5)) + ' only';
+    }
+    return str(label) || id || 'Portfolio';
+  }
+
+  function simPortfolios(d) {
+    return objs(d && d.portfolios).filter(function (p) { return str(p.portfolio_id); });
+  }
+
+  function headlinePid(d) {
+    const hl = obj(d && d.headline);
+    if (str(hl.portfolio_id)) return str(hl.portfolio_id);
+    const ps = simPortfolios(d);
+    for (const p of ps) if (p.headline === true) return str(p.portfolio_id);
+    for (const p of ps) if (str(p.portfolio_id).indexOf('human:') === 0) return str(p.portfolio_id);
+    return ps.length ? str(ps[0].portfolio_id) : '';
+  }
+
+  function portfolioLabels(d) {
+    const out = {};
+    for (const p of simPortfolios(d)) out[str(p.portfolio_id)] = shortPortfolio(p.portfolio_id, p.label);
+    return out;
+  }
+
+  function simInterval(d) {
+    const run = obj(d && d.run);
+    return num(run.interval) || num(S.data.status && S.data.status.interval) || 30;
+  }
+
+  /** A details disclosure whose open state survives the panel being rebuilt. */
+  function simDetails(key, summary, content, cls) {
+    const el = h('details', { class: 'sim-details' + (cls ? ' ' + cls : ''), 'data-key': key },
+      h('summary', { 'data-focus-key': 'sd:' + key }, icon('chevron', 'chev'), summary), content);
+    if (SIM.open.has(key)) el.open = true;
+    el.addEventListener('toggle', function () {
+      if (el.open) SIM.open.add(key);
+      else SIM.open.delete(key);
+    });
+    return el;
+  }
+
+  /** A panel of the Simulation view, built once: a heading, optional persistent controls, a body. */
+  function simPanel(name, title, controls, cls) {
+    let p = SIM.panels[name];
+    if (p) return p;
+    const hid = 'h-sim-' + name;
+    const head = h('div', { class: 'section-head' }, h('h3', { class: 'panel-title', id: hid }, title));
+    if (controls && controls.length) head.appendChild(h('div', { class: 'controls' }, controls));
+    const body = h('div', { class: 'sim-panel-body' });
+    const el = h('section', { class: 'panel sim-panel sim-' + name + (cls ? ' ' + cls : ''), 'aria-labelledby': hid, 'data-panel': name }, head, body);
+    p = { el: el, body: body, key: null, head: head };
+    SIM.panels[name] = p;
+    return p;
+  }
+
+  /** Rebuild a panel's body when its key changed (and the user is not selecting text in it). */
+  function fillPanel(p, key, build) {
+    if (p.key === key) return;
+    if (p.key != null && selectionInside(p.body)) return;
+    p.key = key;
+    rebuild(p.body, build());
+  }
+
+  function tableWrap(label, table, cls) {
+    return h('div', { class: 'table-wrap sim-table-wrap' + (cls ? ' ' + cls : ''), tabindex: '0', role: 'region', 'aria-label': label }, table);
+  }
+
+  function simNote(text, warn, title) {
+    if (warn) {
+      return h('div', { class: 'banner banner-warning' }, icon('warn', 'icon-lg'),
+        h('div', { class: 'banner-body' }, h('h3', { class: 'banner-title' }, title || 'The simulation is not available'), h('p', null, text)));
+    }
+    return h('p', { class: 'empty' }, text);
+  }
+
+  function renderSim() {
+    const d = S.data.paper;
+    const root = $('sim-body');
+    if (!root) return;
+    show($('sim-demo-badge'), !!(d && d.demo === true));
+    let mode;
+    if (!d) mode = 'loading';
+    else if (d.enabled === false) mode = 'off';
+    else if (d.available === false) mode = 'failed';
+    else if (!d.run || typeof d.run !== 'object' || !(num(d.run.steps) > 0)) mode = 'waiting';
+    else mode = 'run';
+    if (!SIM.note) SIM.note = h('div', { class: 'sim-note' });
+    const noteKey = sig([mode, d && d.error, mode === 'loading' ? loadingMsg('paper', '') : '', mode === 'waiting' && !(d && d.run) ? simInterval(d) : null]);
+    if (SIM.note.dataset.sig !== noteKey) {
+      SIM.note.dataset.sig = noteKey;
+      let note = null;
+      if (mode === 'loading') note = simNote(loadingMsg('paper', 'Loading the simulation…'));
+      else if (mode === 'off') note = simNote('The paper trader is off. Start the dashboard without --no-paper to simulate.');
+      else if (mode === 'failed') note = simNote(str(d.error) || 'The paper trader stopped. Restart the dashboard to simulate again.', true);
+      else if (mode === 'waiting' && !(d.run && typeof d.run === 'object')) note = simNote('Waiting for the first simulated step (every ' + fmtSpan(simInterval(d)) + ').');
+      rebuild(SIM.note, [note]);
+    }
+    const wanted = [];
+    if (mode === 'loading' || mode === 'off' || mode === 'failed' || (mode === 'waiting' && !(d.run && typeof d.run === 'object'))) wanted.push(SIM.note);
+    if (mode === 'waiting' && d.run && typeof d.run === 'object') wanted.push(safeSim('clock', function () { return renderSimClock(d); }));
+    if (mode === 'run') {
+      wanted.push(safeSim('clock', function () { return renderSimClock(d); }));
+      if (SIM.previousOpen) wanted.push(safeSim('previous', renderSimPrevious));
+      wanted.push(safeSim('top', function () { return renderSimTop(d); }));
+      wanted.push(safeSim('equity', function () { return renderSimEquity(d); }));
+      wanted.push(safeSim('portfolios', function () { return renderSimPortfolios(d); }));
+      wanted.push(safeSim('chaser', function () { return renderSimChaser(d); }));
+      wanted.push(safeSim('positions', function () { return renderSimPositions(d); }));
+      wanted.push(safeSim('fills', function () { return renderSimFills(d); }));
+      wanted.push(safeSim('trades', function () { return renderSimTrades(d); }));
+    }
+    if (mode !== 'loading') {
+      wanted.push(safeSim('backtest', renderSimBacktest));
+      wanted.push(safeSim('fairvalue', renderSimFairValue));
+      if (mode === 'run' || mode === 'waiting') wanted.push(safeSim('caveats', function () { return renderSimCaveats(d); }));
+    }
+    SIM.mode = mode;
+    placeChildren(root, wanted.filter(Boolean));
+  }
+
+  function safeSim(name, fn) {
+    return safe('sim-' + name, fn) || null;
+  }
+
+  // ---- run clock
+
+  function simButtons() {
+    if (SIM.buttons) return SIM.buttons;
+    const reset = h('button', { type: 'button', class: 'btn', id: 'sim-reset', 'aria-haspopup': 'dialog', onclick: openResetDialog }, icon('undo'), 'Reset');
+    const prev = h('button', {
+      type: 'button', class: 'btn btn-toggle', id: 'sim-previous-btn', 'aria-expanded': 'false', 'aria-controls': 'sim-previous',
+      onclick: togglePrevious,
+    }, icon('clock'), 'Previous run');
+    prev.hidden = true;
+    SIM.buttons = { reset: reset, prev: prev };
+    return SIM.buttons;
+  }
+
+  function clockText(run) {
+    const hours = num(run.hours_run) || 0;
+    const wall = num(run.wall_hours);
+    const target = num(run.target_hours) || 24;
+    const gaps = arr(run.gaps).length;
+    const extra = [];
+    if (gaps > 0) extra.push(plural(gaps, 'gap'));
+    if (wall != null && Math.abs(wall - hours) >= 0.05) extra.push(wall.toFixed(1) + ' h on the clock');
+    return hours.toFixed(1) + ' h observed of the ' + fmtCount(target) + '-hour test' + (extra.length ? ' (' + extra.join('; ') + ')' : '');
+  }
+
+  function renderSimClock(d) {
+    const btn = simButtons();
+    const p = simPanel('clock', 'Run clock', [btn.prev, btn.reset]);
+    const run = obj(d.run);
+    show(btn.prev, d.has_previous === true);
+    setAttr(btn.prev, 'aria-expanded', SIM.previousOpen ? 'true' : 'false');
+    setAttr(btn.prev, 'aria-pressed', SIM.previousOpen ? 'true' : 'false');
+    if (!p.progress) {
+      p.fill = h('span', { class: 'sim-progress-fill' });
+      p.text = h('p', { class: 'sim-clock-text', id: 'sim-clock-text' });
+      p.progress = h('div', { class: 'sim-progress', role: 'progressbar', 'aria-valuemin': '0', 'aria-labelledby': 'sim-clock-text' }, p.fill);
+      p.badge = h('p', { class: 'sim-complete' });
+      p.facts = h('div', { class: 'sim-clock-facts' });
+      p.body.append(p.badge, p.text, p.progress, p.facts);
+    }
+    const hours = num(run.hours_run) || 0;
+    const target = num(run.target_hours) || 24;
+    const text = clockText(run);
+    setText(p.text, text);
+    setAttr(p.progress, 'aria-valuemax', target);
+    setAttr(p.progress, 'aria-valuenow', Number(hours.toFixed(2)));
+    setAttr(p.progress, 'aria-valuetext', text);
+    const frac = clamp(num(run.progress) != null ? run.progress : hours / target, 0, 1);
+    p.fill.style.width = (frac * 100).toFixed(1) + '%';
+    const complete = run.complete === true;
+    const bkey = sig([complete, target]);
+    if (p.badge.dataset.sig !== bkey) {
+      p.badge.dataset.sig = bkey;
+      rebuild(p.badge, complete ? [h('span', { class: 'verdict-level level-complete' }, icon('checkCircle'), fmtCount(target) + '-hour test complete')] : []);
+      show(p.badge, complete);
+    }
+    const waiting = !(num(run.steps) > 0);
+    const settings = obj(run.settings);
+    const key = sig([waiting, run.run_id, run.started_at, run.last_step_at, run.steps, run.start_capital, run.capital_source, run.regime, run.sizing,
+      run.all_collateral, run.code_version, settings, run.last_step_seconds, simInterval(d), currency()]);
+    if (p.facts.dataset.sig === key || selectionInside(p.facts)) return p.el;
+    p.facts.dataset.sig = key;
+    const cap = num(run.start_capital);
+    const items = [
+      ['Started', num(run.started_at) == null ? DASH : [timeEl(run.started_at, 'short'), ' (', timeEl(run.started_at, 'ago'), ')'], null, 'wide'],
+      ['Last step', num(run.last_step_at) == null ? 'none yet' : [timeEl(run.last_step_at, 'ago'),
+        num(run.last_step_seconds) != null ? ' · took ' + (run.last_step_seconds < 10 ? Math.max(0.1, run.last_step_seconds).toFixed(1) + ' s' : fmtSpan(run.last_step_seconds)) : '']],
+      ['Steps', fmtInt(run.steps), 'One step every ' + fmtSpan(simInterval(d))],
+      ['Start capital', cap == null ? DASH : fmtInt(cap) + ' ' + currency() + (str(run.capital_source) ? ' (' + str(run.capital_source) + ')' : ''), 'Every portfolio starts with this', 'wide'],
+      ['Sizing', str(run.sizing) || DASH],
+    ];
+    const params = obj(settings.params_changed);
+    const pnames = Object.keys(params);
+    const settingsList = factList([
+      ['Sizing', str(settings.sizing || run.sizing) || DASH],
+      ['Settlement rule', str(settings.regime || run.regime).replace(/_/g, ' ') || DASH],
+      ['All collateral', (settings.all_collateral != null ? settings.all_collateral : run.all_collateral) === true ? 'On' : 'Off', 'Whether riskless sets need only cost minus floor in cash'],
+      ['Start capital', num(settings.start_capital) != null ? fmtInt(settings.start_capital) : cap == null ? DASH : fmtInt(cap)],
+      ['Code version', str(run.code_version) || DASH, null, 'wide'],
+      ['Changed settings', pnames.length ? pnames.map(function (n) { return n + ' = ' + str(params[n]); }).join(', ') : 'none (defaults)', null, 'full'],
+    ]);
+    rebuild(p.facts, [
+      waiting ? h('p', { class: 'pending-note' }, h('span', { class: 'spinner', 'aria-hidden': 'true' }),
+        'Waiting for the first simulated step (every ' + fmtSpan(simInterval(d)) + ').') : null,
+      factList(items, 'sim-facts'),
+      h('p', { class: 'muted-note regime-note' }, icon('info'), sentence(regimeText(run.regime))),
+      simDetails('settings', 'This run’s settings', h('div', { class: 'sim-details-body' }, settingsList,
+        h('p', { class: 'muted-note' }, 'A run continues after a restart only with the same settings and code; otherwise it ends ("settings changed") and a new one starts.'))),
+    ]);
+    return p.el;
+  }
+
+  // ---- previous run
+
+  function togglePrevious() {
+    SIM.previousOpen = !SIM.previousOpen;
+    if (SIM.previousOpen) loadPrevious();
+    safe('sim', renderSim);
+    if (SIM.previousOpen) {
+      const p = SIM.panels.previous;
+      if (p) p.el.scrollIntoView({ block: 'nearest' });
+    }
+  }
+
+  async function loadPrevious() {
+    const gen = ++SIM.previousGen;
+    SIM.previousState = 'loading';
+    SIM.previousError = '';
+    try {
+      const body = await getJSON(ENDPOINTS.paper + '?run=previous');
+      if (gen !== SIM.previousGen) return;
+      SIM.previous = body;
+      SIM.previousState = 'ready';
+      serverAnswered();
+    } catch (e) {
+      if (gen !== SIM.previousGen) return;
+      SIM.previous = null;
+      SIM.previousState = 'error';
+      SIM.previousError = sentence(e && e.message, 'Could not load the previous run.');
+    }
+    if (S.view === 'sim') safe('sim', renderSim);
+  }
+
+  function renderSimPrevious() {
+    const p = simPanel('previous', 'Previous run');
+    p.el.id = 'sim-previous';
+    const prev = SIM.previous;
+    fillPanel(p, sig([SIM.previousState, SIM.previousError, prev, currency()]), function () {
+      if (SIM.previousState === 'loading' || !SIM.previousState) {
+        return [h('p', { class: 'pending-note' }, h('span', { class: 'spinner', 'aria-hidden': 'true' }), 'Loading the previous run…')];
+      }
+      if (SIM.previousState === 'error' || !prev) return [h('p', { class: 'muted-note' }, SIM.previousError || 'No earlier simulation run has ended yet.')];
+      const run = obj(prev.run);
+      const final = obj(run.final);
+      const ended = num(run.ended_at) != null ? run.ended_at : num(final.at);
+      const reason = str(run.end_reason || final.reason);
+      const ports = objs(final.portfolios).length ? objs(final.portfolios) : simPortfolios(prev);
+      const verdicts = obj(final.verdicts);
+      let hid = headlinePid(prev);
+      if (!hid) for (const pt of ports) if (str(pt.portfolio_id).indexOf('human:') === 0) { hid = str(pt.portfolio_id); break; }
+      const hv = obj(prev.headline).verdict ? obj(obj(prev.headline).verdict) : obj(verdicts[hid] || (ports.filter(function (x) { return str(x.portfolio_id) === hid; })[0] || {}).verdict);
+      const rows = ports.map(function (pt) {
+        const v = obj(verdicts[str(pt.portfolio_id)] || pt.verdict);
+        return h('tr', null,
+          h('th', { scope: 'row' }, shortPortfolio(pt.portfolio_id, pt.label)),
+          h('td', { class: 'num' }, pnlEl(pt.pnl_liq)),
+          h('td', null, str(v.level) ? levelBadge(v) : DASH));
+      });
+      return [
+        h('p', null, 'Ended ', num(ended) == null ? DASH : timeEl(ended, 'short'), reason ? ' (' + (EXIT_REASONS[reason] || reason) + ')' : '',
+          str(run.run_id) ? h('span', { class: 'muted-note' }, ' · ' + str(run.run_id)) : null),
+        str(hv.level) ? h('div', { class: 'sim-verdict' }, levelBadge(hv), h('p', { class: 'verdict-sentence' }, str(hv.sentence))) : null,
+        rows.length ? tableWrap('Previous run portfolios', h('table', { class: 'data-table sim-table' },
+          h('caption', { class: 'sr-only' }, 'Each portfolio of the previous run at its end'),
+          h('thead', null, h('tr', null, h('th', { scope: 'col' }, 'Portfolio'), h('th', { scope: 'col', class: 'num' }, 'P&L at liquidation'), h('th', { scope: 'col' }, 'Verdict'))),
+          h('tbody', null, rows))) : null,
+      ];
+    });
+    return p.el;
+  }
+
+  // ---- headline and signal study
+
+  function renderSimTop(d) {
+    if (!SIM.top) SIM.top = h('div', { class: 'sim-top' });
+    const a = renderSimHeadline(d);
+    const b = renderSimStudy(d.study, 'study', 'Signal study');
+    placeChildren(SIM.top, [a, b].filter(Boolean));
+    return SIM.top;
+  }
+
+  function renderSimHeadline(d) {
+    const p = simPanel('headline', 'Headline: you, acting by hand');
+    const hl = obj(d.headline);
+    const v = obj(hl.verdict);
+    p.el.setAttribute('data-portfolio', str(hl.portfolio_id) || headlinePid(d));
+    fillPanel(p, sig([hl, currency()]), function () {
+      if (!str(hl.portfolio_id) && !str(v.level)) return [h('p', { class: 'muted-note' }, 'No headline portfolio yet.')];
+      const pnl = num(hl.pnl_liq);
+      const r = pnl == null ? 0 : Math.round(pnl);
+      const word = pnl == null ? '' : r > 0 ? 'profit' : r < 0 ? 'loss' : '(no profit or loss yet)';
+      const unvalued = num(hl.unvalued) || 0;
+      const nUnvalued = num(v.unvalued_positions) || 0;
+      const depth = num(hl.depth_unknown_share);
+      return [
+        h('p', { class: 'sim-label' }, str(hl.label) || shortPortfolio(hl.portfolio_id)),
+        h('p', { class: 'sim-pnl' }, pnlEl(pnl), ' ', h('span', { class: 'sim-pnl-unit' }, currency() + ' ' + word)),
+        h('p', { class: 'sim-pnl-sub' }, fmtSignedPct(hl.pnl_liq_pct) + ' at liquidation value ',
+          h('span', { class: 'muted-note' }, '(at mid marks: ' + fmtSignedMoney(hl.pnl_mark) + ')')),
+        h('div', { class: 'sim-verdict' }, str(v.level) ? levelBadge(v) : null,
+          h('p', { class: 'verdict-sentence' }, str(v.sentence) || 'No verdict yet.')),
+        texts(v.reasons).length ? h('ul', { class: 'reasons verdict-reasons' }, texts(v.reasons).map(function (t) { return h('li', null, t); })) : null,
+        texts(hl.verdict_caveats).length ? h('div', { class: 'verdict-caveats' },
+          h('h4', { class: 'card-section-title' }, icon('info'), 'What this result cannot tell you yet'),
+          h('ul', null, texts(hl.verdict_caveats).map(function (t) { return h('li', null, t); }))) : null,
+        unvalued > 0 || nUnvalued > 0 ? h('p', { class: 'muted-note sim-flag-line' }, icon('warn'),
+          (nUnvalued > 0 ? plural(nUnvalued, 'position') : 'Positions') + ' whose market closed without a ruling ' + (nUnvalued === 1 ? 'is' : 'are') +
+          ' left out of the result (last value ' + fmtMoney(unvalued, 0) + ' ' + currency() + ').') : null,
+        depth != null && depth > 0.0005 ? h('p', { class: 'muted-note sim-flag-line' }, icon('warn'),
+          fmtPctOf(depth, 0) + ' of the value is marked without a recent order book (valued with a haircut).') : null,
+        h('p', { class: 'muted-note' }, 'Latency: fills only from an order book read at least ' + fmtSpan(num(hl.latency_s) || 240) + ' after each signal.'),
+      ];
+    });
+    return p.el;
+  }
+
+  function studyCell(hz, unit) {
+    hz = obj(hz);
+    const n = num(hz.n) || 0;
+    if (!n) return h('span', { class: 'nil' }, 'No signals yet');
+    const lo = num(hz.ci_low), hi = num(hz.ci_high);
+    const parts = [plural(n, 'signal') + ': ' + fmtSigned(hz.mean) + (lo != null && hi != null ? ' (' + fmtSigned(lo) + ' to ' + fmtSigned(hi) + ')' : '') + ' per ' + unit];
+    const extra = [];
+    if (num(hz.share_converged) != null) extra.push('converged ' + fmtPct0(hz.share_converged));
+    if (num(hz.share_reversed) != null) extra.push('reversed ' + fmtPct0(hz.share_reversed));
+    return h('span', { title: lo != null ? Math.round((num(hz.ci_level) || 0.9) * 100) + '% interval over ' + plural(hz.clusters, 'independent group') : 'An interval needs 20 signals in 10 independent groups' },
+      parts[0] + (extra.length ? '; ' + extra.join(', ') : ''));
+  }
+
+  /** The signal-level event study (study.summary()): one row per kind, one column per horizon. */
+  function studyTable(st, caption) {
+    st = obj(st);
+    const kinds = obj(st.kinds);
+    const names = ['value', 'basket'].filter(function (k) { return kinds[k]; }).concat(Object.keys(kinds).filter(function (k) { return k !== 'value' && k !== 'basket'; }));
+    let horizons = [];
+    for (const k of names) for (const hz of Object.keys(obj(obj(kinds[k]).horizons))) if (horizons.indexOf(hz) === -1) horizons.push(hz);
+    if (!horizons.length) horizons = Object.keys(HORIZON_LABELS);
+    if (!names.length) return h('p', { class: 'muted-note' }, 'No value or basket signals have been recorded yet.');
+    return tableWrap(caption, h('table', { class: 'data-table sim-table study-table' },
+      h('caption', { class: 'sr-only' }, caption),
+      h('thead', null, h('tr', null, h('th', { scope: 'col' }, 'Kind'), horizons.map(function (hz) { return h('th', { scope: 'col' }, HORIZON_LABELS[hz] || hz); }))),
+      h('tbody', null, names.map(function (k) {
+        const kd = obj(kinds[k]);
+        const unit = k === 'basket' ? 'set' : 'share';
+        return h('tr', { 'data-kind': k },
+          h('th', { scope: 'row' }, kindBadge(k), h('span', { class: 'cell-sub' }, plural(kd.events, 'signal') + ', ' + fmtInt(kd.traded) + ' traded')),
+          horizons.map(function (hz) { return h('td', null, studyCell(obj(kd.horizons)[hz], unit)); }));
+      }))));
+  }
+
+  function renderSimStudy(st, name, title) {
+    const p = simPanel(name, title);
+    fillPanel(p, sig([st]), function () {
+      if (!st || typeof st !== 'object') return [h('p', { class: 'muted-note' }, 'The signal study starts with the first value or basket signal.')];
+      const pending = num(st.pending) || 0;
+      return [
+        str(st.can_show) ? h('p', { class: 'study-can' }, icon('checkCircle'), str(st.can_show)) : null,
+        str(st.cannot_show) ? h('p', { class: 'study-cannot' }, icon('warn'), str(st.cannot_show)) : null,
+        studyTable(st, 'What each signal would show after it, net of the spread, whether or not it was traded'),
+        h('p', { class: 'muted-note' }, 'Each cell: the average change per share (per set for baskets) from buying at the signal’s ask and selling into the bid then.' +
+          (pending > 0 ? ' ' + plural(pending, 'signal') + ' still wait for their later horizons.' : '')),
+      ];
+    });
+    return p.el;
+  }
+
+  // ---- equity curves
+
+  function eqStyle(p, hid) {
+    const pid = str(p.portfolio_id);
+    if (pid === hid) return { group: 'headline', dash: '' };
+    if (pid.indexOf('policy:') === 0) return { group: 'bot', dash: Object.prototype.hasOwnProperty.call(EQ_DASH, pid) ? EQ_DASH[pid] : '7 4' };
+    return { group: 'kind', dash: EQ_DASH[pid] || '3 3' };
+  }
+
+  function eqSeries(d) {
+    const eq = obj(d.equity);
+    const hid = headlinePid(d);
+    return simPortfolios(d).map(function (p) {
+      const pid = str(p.portfolio_id);
+      const pts = arr(eq[pid]).map(function (q) { return Array.isArray(q) ? [num(q[0]), num(q[1])] : [null, null]; })
+        .filter(function (q) { return q[0] != null && q[1] != null; })
+        .sort(function (a, b) { return a[0] - b[0]; });
+      return { pid: pid, label: shortPortfolio(pid, p.label), full: str(p.label), style: eqStyle(p, hid), pts: pts, headline: pid === hid };
+    });
+  }
+
+  function eqTimes(series) {
+    const all = [];
+    for (const s of series) for (const q of s.pts) all.push(q[0]);
+    all.sort(function (a, b) { return a - b; });
+    const out = [];
+    for (const t of all) if (!out.length || t - out[out.length - 1] > 0.5) out.push(t);
+    return out;
+  }
+
+  /** The series value at time t: its last point at or before t (null before its first point). */
+  function eqValueAt(pts, t) {
+    if (!pts.length || t < pts[0][0] - 0.5) return null;
+    let lo = 0, hi = pts.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1;
+      if (pts[mid][0] <= t + 0.5) lo = mid;
+      else hi = mid - 1;
+    }
+    return pts[lo][1];
+  }
+
+  function eqKey(style) {
+    const svg = svgEl('svg', { class: 'eq-key eq-' + style.group, viewBox: '0 0 28 8', width: 28, height: 8, 'aria-hidden': 'true', focusable: 'false' });
+    svg.appendChild(svgEl('line', { x1: 1, x2: 27, y1: 4, y2: 4, 'stroke-dasharray': style.dash || null }));
+    return svg;
+  }
+
+  function niceMoneyStep(span, maxTicks) {
+    const raw = span / Math.max(1, maxTicks);
+    const base = Math.pow(10, Math.floor(Math.log10(Math.max(raw, 1e-9))));
+    for (const m of [1, 2, 2.5, 5, 10]) if (raw <= m * base) return m * base;
+    return 10 * base;
+  }
+
+  function eqSummary(d) {
+    const n = simPortfolios(d).length;
+    const hl = obj(d.headline);
+    return plural(n, 'portfolio') + '; headline (you, by hand): ' + fmtSignedMoney(hl.pnl_liq) + ' at liquidation';
+  }
+
+  function renderSimEquity(d) {
+    let p = SIM.panels.equity;
+    if (!p) {
+      const toggle = h('button', {
+        type: 'button', class: 'btn btn-toggle', 'data-action': 'sim-table-toggle', 'aria-pressed': 'false',
+        title: 'Show the equity curves as a table', onclick: function () { SIM.table = !SIM.table; SIM.chartKey = null; safe('sim', renderSim); },
+      }, icon('table'), 'Show as table');
+      p = simPanel('equity', 'Equity at liquidation value', [toggle]);
+      p.toggle = toggle;
+      p.summary = h('p', { class: 'view-sub chart-summary' });
+      p.host = h('div', { class: 'chart sim-chart', tabindex: '0', role: 'group', 'aria-describedby': 'sim-chart-help' });
+      p.help = h('p', { class: 'sr-only', id: 'sim-chart-help' },
+        'Left and right arrow keys step through the times and read every portfolio’s equity. Show as table lists the same values.');
+      p.readout = h('p', { class: 'sr-only', role: 'status', 'aria-live': 'polite', 'aria-atomic': 'true' });
+      p.legend = h('ul', { class: 'eq-legend', 'aria-label': 'Portfolios: select one to show or hide its line' });
+      p.tableBox = h('div', { class: 'sim-eq-table' });
+      p.body.append(p.summary, p.host, p.help, p.readout, p.legend, p.tableBox);
+      p.host.addEventListener('keydown', simChartKey);
+      p.host.addEventListener('focus', function () { simChartFocus(true); });
+      p.host.addEventListener('blur', function () { simChartFocus(false); });
+      if (typeof ResizeObserver === 'function') {
+        SIM.ro = new ResizeObserver(function () {
+          const w = Math.floor(p.host.clientWidth);
+          if (w && w !== SIM.chartWidth && S.data.paper && !SIM.table) {
+            SIM.chartWidth = w;
+            requestAnimationFrame(function () { safe('sim-chart', drawSimChart); });
+          }
+        });
+        SIM.ro.observe(p.host);
+      }
+    }
+    setAttr(p.toggle, 'aria-pressed', SIM.table ? 'true' : 'false');
+    show(p.host, !SIM.table);
+    show(p.tableBox, SIM.table);
+    const series = eqSeries(d);
+    const summary = eqSummary(d);
+    setAttr(p.host, 'aria-label', 'Equity curves: ' + summary);
+    setText(p.summary, summary + '. Profit is the liquidation value: what selling every position into the visible bids would fetch.');
+    // legend: one toggle button per portfolio (the headline listed first, as in the table)
+    const lkey = sig([series.map(function (s) { return [s.pid, s.label, s.style]; }), Array.from(SIM.hidden).sort()]);
+    if (p.legend.dataset.sig !== lkey) {
+      p.legend.dataset.sig = lkey;
+      rebuild(p.legend, series.map(function (s) {
+        const on = !SIM.hidden.has(s.pid);
+        return h('li', null, h('button', {
+          type: 'button', class: 'eq-toggle', 'aria-pressed': on ? 'true' : 'false', 'data-pid': s.pid, 'data-focus-key': 'eq:' + s.pid,
+          title: s.full || null,
+          onclick: function () {
+            if (SIM.hidden.has(s.pid)) SIM.hidden.delete(s.pid);
+            else SIM.hidden.add(s.pid);
+            SIM.chartKey = null;
+            safe('sim', renderSim);
+          },
+        }, eqKey(s.style), s.label));
+      }));
+    }
+    const ckey = sig([series.map(function (s) { return [s.pid, s.pts.length, s.pts[0], s.pts[s.pts.length - 1], s.pts.length > 2 ? s.pts[s.pts.length >> 1] : null]; }),
+      Array.from(SIM.hidden).sort(), SIM.table, obj(d.run).start_capital, obj(d.headline).pnl_liq]);
+    if (SIM.chartKey !== ckey) {
+      SIM.chartKey = ckey;
+      if (SIM.table) renderSimEqTable(d);
+      else drawSimChart();
+    }
+    return p.el;
+  }
+
+  function drawSimChart() {
+    const p = SIM.panels.equity;
+    const d = S.data.paper;
+    if (!p || !d || SIM.table) return;
+    const host = p.host;
+    const prev = SIM.chart;
+    const restore = SIM.hoverTs != null && (!!(prev && prev.pointer) || document.activeElement === host);
+    const series = eqSeries(d);
+    const vis = series.filter(function (s) { return !SIM.hidden.has(s.pid) && s.pts.length; });
+    if (!series.some(function (s) { return s.pts.length >= 2; })) {
+      SIM.chart = null;
+      rebuild(host, [h('div', { class: 'chart-empty' }, h('p', null, 'The equity curves start once each portfolio has two recorded points (at most one a minute).'))]);
+      return;
+    }
+    if (!vis.length) {
+      SIM.chart = null;
+      rebuild(host, [h('div', { class: 'chart-empty' }, h('p', null, 'Every line is hidden: turn one back on in the list below the chart.'))]);
+      return;
+    }
+    const W = Math.max(260, Math.floor(host.clientWidth || 640));
+    const H = 300;
+    const narrow = W < 560;
+    const M = { l: 62, r: narrow ? 14 : 136, t: 16, b: 30 };
+    const plotW = W - M.l - M.r;
+    const plotH = H - M.t - M.b;
+    const start = num(obj(d.run).start_capital);
+    let t0 = Infinity, t1 = -Infinity;
+    for (const s of series) for (const q of s.pts) { t0 = Math.min(t0, q[0]); t1 = Math.max(t1, q[0]); }
+    if (t1 - t0 < 60) t1 = t0 + 60;
+    let lo = Infinity, hi = -Infinity;
+    for (const s of vis) for (const q of s.pts) { lo = Math.min(lo, q[1]); hi = Math.max(hi, q[1]); }
+    if (start != null) { lo = Math.min(lo, start); hi = Math.max(hi, start); }
+    if (hi - lo < 20) { const m = (hi + lo) / 2; lo = m - 10; hi = m + 10; }
+    const pad = (hi - lo) * 0.08;
+    lo -= pad; hi += pad;
+    const step = niceMoneyStep(hi - lo, narrow ? 4 : 5);
+    lo = Math.floor(lo / step) * step;
+    hi = Math.ceil(hi / step) * step;
+    const X = function (t) { return M.l + ((t - t0) / (t1 - t0)) * plotW; };
+    const Y = function (v) { return M.t + ((hi - v) / (hi - lo)) * plotH; };
+    const svg = svgEl('svg', { viewBox: '0 0 ' + W + ' ' + H, width: W, height: H, 'aria-hidden': 'true', focusable: 'false' });
+    svg.appendChild(svgEl('defs', null, svgEl('clipPath', { id: 'eq-clip' }, svgEl('rect', { x: M.l, y: M.t - 4, width: plotW, height: plotH + 8 }))));
+    const grid = svgEl('g', { class: 'grid' });
+    const labels = svgEl('g');
+    for (let v = lo, i = 0; v <= hi + step / 1000 && i < 20; v += step, i++) {
+      const y = Math.round(Y(v)) + 0.5;
+      if (i > 0) grid.appendChild(svgEl('line', { x1: M.l, x2: M.l + plotW, y1: y, y2: y }));
+      labels.appendChild(svgEl('text', { class: 'tick', x: M.l - 8, y: y + 4, 'text-anchor': 'end' }, fmtInt(v)));
+    }
+    svg.appendChild(grid);
+    const baseY = Math.round(Y(lo)) + 0.5;
+    svg.appendChild(svgEl('line', { class: 'baseline', x1: M.l, x2: M.l + plotW, y1: baseY, y2: baseY }));
+    svg.appendChild(labels);
+    const xl = svgEl('g');
+    for (const tk of timeTicks(t0, t1, X, M.l, M.l + plotW, SIM_TICK_STEPS)) xl.appendChild(svgEl('text', { class: 'tick', x: X(tk.t), y: H - 8, 'text-anchor': 'middle' }, tk.label));
+    svg.appendChild(xl);
+    if (start != null) {
+      const ry = Math.round(Y(start)) + 0.5;
+      svg.appendChild(svgEl('line', { class: 'ref-line', x1: M.l, x2: M.l + plotW, y1: ry, y2: ry }));
+      svg.appendChild(svgEl('text', { class: 'ref-label', x: M.l + 6, y: ry - 5 }, 'Start ' + fmtInt(start)));
+    }
+    const ordered = vis.filter(function (s) { return !s.headline; }).concat(vis.filter(function (s) { return s.headline; }));
+    for (const s of ordered) {
+      let dp = '';
+      s.pts.forEach(function (q, i) { dp += (i ? 'L' : 'M') + X(q[0]).toFixed(1) + ' ' + Y(q[1]).toFixed(1); });
+      if (s.pts.length === 1) dp += 'h0.1';
+      svg.appendChild(svgEl('path', { class: 'eq-line eq-' + s.style.group, d: dp, 'stroke-dasharray': s.style.dash || null, 'clip-path': 'url(#eq-clip)', 'data-pid': s.pid }));
+    }
+    const head = vis.filter(function (s) { return s.headline; })[0];
+    if (head) {
+      const last = head.pts[head.pts.length - 1];
+      const ex = X(last[0]), ey = Y(last[1]);
+      svg.appendChild(svgEl('circle', { class: 'end-dot eq-headline-dot', cx: ex.toFixed(1), cy: ey.toFixed(1), r: 4 }));
+      const pnl = start != null ? last[1] - start : null;
+      const text = 'You, by hand' + (pnl != null ? ' ' + fmtSignedMoney(pnl) : '');
+      if (narrow) svg.appendChild(svgEl('text', { class: 'end-label', x: (ex - 8).toFixed(1), y: (ey - 9).toFixed(1), 'text-anchor': 'end' }, text));
+      else svg.appendChild(svgEl('text', { class: 'end-label', x: (ex + 8).toFixed(1), y: (ey + 4).toFixed(1) }, text));
+    }
+    const cross = svgEl('g', { class: 'cross', visibility: 'hidden' });
+    const cline = svgEl('line', { class: 'crosshair', x1: 0, x2: 0, y1: M.t, y2: M.t + plotH });
+    cross.appendChild(cline);
+    const dots = {};
+    for (const s of vis) {
+      const c = svgEl('circle', { class: 'hover-dot eq-dot-' + s.style.group, cx: 0, cy: 0, r: s.headline ? 4.5 : 3.5 });
+      dots[s.pid] = c;
+      cross.appendChild(c);
+    }
+    svg.appendChild(cross);
+    const hit = svgEl('rect', { class: 'hit', x: M.l, y: M.t, width: plotW, height: plotH });
+    svg.appendChild(hit);
+    const tip = h('div', { class: 'tooltip eq-tooltip', hidden: true });
+    rebuild(host, [svg, tip]);
+    const times = eqTimes(vis);
+    const chart = { times: times, vis: vis, X: X, Y: Y, M: M, W: W, H: H, plotW: plotW, cross: cross, cline: cline, dots: dots, tip: tip, index: -1, pointer: false };
+    SIM.chart = chart;
+    function nearest(t) {
+      let a = 0, b = times.length - 1;
+      while (b - a > 1) {
+        const mid = (a + b) >> 1;
+        if (times[mid] < t) a = mid;
+        else b = mid;
+      }
+      return Math.abs(times[a] - t) <= Math.abs(times[b] - t) ? a : b;
+    }
+    chart.nearest = nearest;
+    function pointAt(ev) {
+      const rect = svg.getBoundingClientRect();
+      const scale = rect.width ? W / rect.width : 1;
+      const x = (ev.clientX - rect.left) * scale;
+      chart.pointer = true;
+      simShowPoint(chart, nearest(t0 + ((x - M.l) / plotW) * (t1 - t0)));
+    }
+    hit.addEventListener('pointermove', pointAt);
+    hit.addEventListener('pointerdown', function (ev) { chart.tapped = Date.now(); pointAt(ev); });
+    hit.addEventListener('pointerleave', function (ev) {
+      chart.pointer = false;
+      if (ev.pointerType && ev.pointerType !== 'mouse') return;
+      if (document.activeElement !== host) simHidePoint(chart);
+    });
+    if (restore && times.length) {
+      chart.pointer = !!(prev && prev.pointer);
+      simShowPoint(chart, nearest(SIM.hoverTs));
+    }
+  }
+
+  function simShowPoint(chart, i) {
+    if (!chart || i < 0 || i >= chart.times.length) return;
+    chart.index = i;
+    const t = chart.times[i];
+    SIM.hoverTs = t;
+    const x = chart.X(t);
+    chart.cline.setAttribute('x1', x.toFixed(1));
+    chart.cline.setAttribute('x2', x.toFixed(1));
+    let yHead = null;
+    const rows = [];
+    for (const s of chart.vis) {
+      const v = eqValueAt(s.pts, t);
+      const dot = chart.dots[s.pid];
+      if (v == null) {
+        dot.setAttribute('visibility', 'hidden');
+        continue;
+      }
+      const y = chart.Y(v);
+      dot.setAttribute('visibility', 'visible');
+      dot.setAttribute('cx', x.toFixed(1));
+      dot.setAttribute('cy', y.toFixed(1));
+      if (s.headline || yHead == null) yHead = y;
+      rows.push(h('div', { class: 'eq-tip-row' }, eqKey(s.style), h('strong', null, fmtInt(v)), h('span', { class: 'tooltip-sub' }, s.label)));
+    }
+    chart.cross.setAttribute('visibility', 'visible');
+    chart.tip.replaceChildren.apply(chart.tip, [h('div', { class: 'tooltip-sub', title: fmtAbs(t) }, fmtCompact(t))].concat(rows));
+    chart.tip.hidden = false;
+    placeTooltip(chart, chart.tip, x, yHead == null ? chart.M.t : yHead);
+  }
+
+  function simHidePoint(chart) {
+    if (!chart) return;
+    chart.index = -1;
+    chart.cross.setAttribute('visibility', 'hidden');
+    chart.tip.hidden = true;
+  }
+
+  function simChartFocus(focused) {
+    const chart = SIM.chart;
+    if (!chart || !chart.times.length) return;
+    if (focused) {
+      if (chart.tapped && Date.now() - chart.tapped < 1000 && chart.index >= 0) return;
+      simShowPoint(chart, chart.index >= 0 ? chart.index : chart.times.length - 1);
+    } else if (!chart.pointer) simHidePoint(chart);
+  }
+
+  function simChartKey(ev) {
+    const chart = SIM.chart;
+    if (!chart || !chart.times.length) return;
+    const n = chart.times.length;
+    let i = chart.index >= 0 ? chart.index : n - 1;
+    if (ev.key === 'ArrowLeft') i -= 1;
+    else if (ev.key === 'ArrowRight') i += 1;
+    else if (ev.key === 'PageUp') i -= 10;
+    else if (ev.key === 'PageDown') i += 10;
+    else if (ev.key === 'Home') i = 0;
+    else if (ev.key === 'End') i = n - 1;
+    else return;
+    ev.preventDefault();
+    simShowPoint(chart, clamp(i, 0, n - 1));
+    const t = chart.times[chart.index];
+    const parts = chart.vis.map(function (s) { const v = eqValueAt(s.pts, t); return v == null ? null : s.label + ' ' + fmtInt(v); }).filter(Boolean);
+    const text = fmtAbs(t) + ': ' + parts.join('; ') + '. Time ' + (chart.index + 1) + ' of ' + n + '.';
+    clearTimeout(SIM.liveTimer);
+    SIM.liveTimer = setTimeout(function () { const p = SIM.panels.equity; if (p) setText(p.readout, text); }, 250);
+  }
+
+  function renderSimEqTable(d) {
+    const p = SIM.panels.equity;
+    const series = eqSeries(d);
+    const times = eqTimes(series);
+    const k = Math.min(50, times.length);
+    const picked = [];
+    for (let i = 0; i < k; i++) {
+      const t = times[k === 1 ? times.length - 1 : Math.round(i * (times.length - 1) / (k - 1))];
+      if (picked[picked.length - 1] !== t) picked.push(t);
+    }
+    picked.reverse();
+    if (!picked.length) {
+      rebuild(p.tableBox, [h('p', { class: 'chart-empty' }, 'No equity points yet.')]);
+      return;
+    }
+    const table = h('table', { class: 'data-table sim-table eq-table' },
+      h('caption', { class: 'sr-only' }, 'Equity at liquidation value of every portfolio, up to 50 evenly spaced times, newest first'),
+      h('thead', null, h('tr', null, h('th', { scope: 'col', class: 'col-time' }, 'Time'),
+        series.map(function (s) { return h('th', { scope: 'col', class: 'num', title: s.full || null }, s.label); }))),
+      h('tbody', null, picked.map(function (t) {
+        return h('tr', null, h('th', { scope: 'row', class: 'col-time', title: fmtAbs(t) }, fmtTableTime(t)),
+          series.map(function (s) { const v = eqValueAt(s.pts, t); return h('td', { class: 'num' }, v == null ? DASH : fmtInt(v)); }));
+      })));
+    rebuild(p.tableBox, [tableWrap('Equity table', table, 'pin-first')]);
+  }
+
+  // ---- portfolios table
+
+  function execLines(ex) {
+    ex = obj(ex);
+    const kinds = Object.keys(ex);
+    if (!kinds.length) return h('p', { class: 'muted-note' }, 'No orders yet.');
+    return h('ul', { class: 'exec-lines' }, kinds.map(function (k) {
+      const e = obj(ex[k]);
+      const kk = KINDS[k];
+      const bits = [plural(e.entries, 'entry', 'entries') + ', ' + fmtInt(e.filled) + ' filled' + (num(e.fill_rate) != null ? ' (' + fmtPct0(e.fill_rate) + ')' : '')];
+      if (num(e.avg_slippage) != null) bits.push('average slippage ' + fmtSigned(e.avg_slippage) + ' per share');
+      if (num(e.unfilled) > 0) bits.push(plural(e.unfilled, 'signal') + ' that did not fill would show ' + fmtSignedMoney(e.unfilled_pnl_now) + ' now');
+      if (num(e.exits) > 0) bits.push(plural(e.exits, 'exit') + (num(e.avg_exit_slippage) != null ? ', exit slippage ' + fmtSigned(e.avg_exit_slippage) : ''));
+      return h('li', null, h('strong', null, (kk ? kk[1] : k) + ': '), bits.join('; '));
+    }));
+  }
+
+  function portfolioRow(pt, d) {
+    const pid = str(pt.portfolio_id);
+    const v = obj(pt.verdict);
+    const start = num(pt.start_capital);
+    const fv = num(pt.equity_fv);
+    const closed = num(v.closed_trades) != null ? v.closed_trades : pt.trades_closed;
+    const open = num(v.open_ideas) != null ? v.open_ideas : pt.positions_open;
+    const wr = num(pt.win_rate);
+    const exKey = 'exec:' + pid;
+    // "why no fills": one sentence per kind; the first under the label, the rest in the disclosure
+    const why = str(pt.no_trade_reason).split(/(?<=\.)\s+(?=[A-Z0-9])/).map(function (t) { return t.trim(); }).filter(Boolean);
+    return h('tr', { 'data-pid': pid, class: pt.headline === true || pid === headlinePid(d) ? 'is-headline' : null },
+      h('th', { scope: 'row', class: 'cell-title' },
+        h('span', { class: 'title-text', title: str(pt.label) || null }, shortPortfolio(pid, pt.label)),
+        why.length ? h('span', { class: 'cell-sub wrap no-trade' }, why[0] + (why.length > 1 ? ' (+' + plural(why.length - 1, 'more reason') + ' below)' : '')) : null,
+        simDetails(exKey, 'Execution by kind', [why.length > 1 ? h('ul', { class: 'exec-lines why-lines' }, why.slice(1).map(function (t) { return h('li', null, t); })) : null,
+          execLines(pt.execution)], 'exec-details')),
+      h('td', { class: 'num' }, pnlEl(pt.pnl_liq)),
+      h('td', { class: 'num' }, fmtSignedPct(pt.pnl_liq_pct)),
+      h('td', { class: 'num' }, fmtInt(closed) + ' / ' + fmtInt(open)),
+      h('td', { class: 'num' }, wr == null ? DASH : fmtPct0(wr), h('span', { class: 'cell-sub' }, fmtInt(pt.wins) + ' of ' + fmtInt(pt.trades_closed))),
+      h('td', { class: 'num' }, fmtPctOf(pt.max_drawdown), h('span', { class: 'cell-sub' }, fmtMoney(pt.max_drawdown_abs, 0))),
+      h('td', { class: 'num' }, fmtInt(pt.positions_open)),
+      h('td', { class: 'num' }, num(pt.latency_s) == null ? DASH : fmtSpan(pt.latency_s)),
+      h('td', { class: 'cell-verdict' }, str(v.level) ? levelBadge(v) : DASH),
+      h('td', { class: 'num' }, fv == null || start == null ? DASH : fmtSignedMoney(fv - start)));
+  }
+
+  function renderSimPortfolios(d) {
+    const p = simPanel('portfolios', 'Portfolios');
+    const ports = simPortfolios(d);
+    fillPanel(p, sig([ports, d.table_warning, d.model_label, headlinePid(d), currency()]), function () {
+      const groups = SIM_GROUPS.map(function (g) { return { title: g[1], rows: ports.filter(function (pt) { return str(pt.portfolio_id).indexOf(g[0]) === 0; }) }; });
+      const other = ports.filter(function (pt) { return !SIM_GROUPS.some(function (g) { return str(pt.portfolio_id).indexOf(g[0]) === 0; }); });
+      if (other.length) groups.push({ title: 'Other portfolios', rows: other });
+      const cols = 10;
+      const table = h('table', { class: 'data-table sim-table portfolios-table' },
+        h('caption', { class: 'sr-only' }, 'Every simulated portfolio at liquidation value'),
+        h('thead', null, h('tr', null,
+          h('th', { scope: 'col' }, 'Portfolio'),
+          h('th', { scope: 'col', class: 'num' }, 'P&L at liquidation'),
+          h('th', { scope: 'col', class: 'num' }, '%'),
+          h('th', { scope: 'col', class: 'num', title: 'Ideas entered: closed / still open' }, 'Ideas (closed / open)'),
+          h('th', { scope: 'col', class: 'num' }, 'Win rate', h('span', { class: 'cell-sub' }, 'closed trades only')),
+          h('th', { scope: 'col', class: 'num' }, 'Max drawdown'),
+          h('th', { scope: 'col', class: 'num' }, 'Open positions'),
+          h('th', { scope: 'col', class: 'num' }, 'Latency'),
+          h('th', { scope: 'col' }, 'Verdict'),
+          h('th', { scope: 'col', class: 'num' }, 'Model’s own valuation', h('span', { 'aria-hidden': 'true' }, ' *'), h('span', { class: 'sr-only' }, ' (see the note under the table)')))),
+        groups.filter(function (g) { return g.rows.length; }).map(function (g) {
+          return h('tbody', null,
+            h('tr', { class: 'group-row' }, h('th', { scope: 'rowgroup', colspan: String(cols) }, h('span', { class: 'group-label' }, g.title))),
+            g.rows.map(function (pt) { return portfolioRow(pt, d); }));
+        }));
+      return [
+        str(d.table_warning) ? h('p', { class: 'table-warning' }, icon('warn'), str(d.table_warning)) : null,
+        ports.length ? tableWrap('Portfolios table', table, 'pin-first') : h('p', { class: 'muted-note' }, 'No portfolios yet.'),
+        str(d.model_label) ? h('p', { class: 'muted-note footnote' }, '* ' + str(d.model_label)) : null,
+      ];
+    });
+    return p.el;
+  }
+
+  // ---- chaser sizing
+
+  function renderSimChaser(d) {
+    const hid = headlinePid(d);
+    const ports = simPortfolios(d).filter(function (pt) {
+      return pt.sizing && (str(pt.portfolio_id) === 'policy:chaser' || (str(pt.portfolio_id) === hid && str(pt.policy) === 'chaser'));
+    });
+    if (!ports.length) return null;
+    const p = simPanel('chaser', 'Chaser sizing');
+    fillPanel(p, sig([ports.map(function (pt) { return [pt.portfolio_id, pt.label, pt.sizing]; }), currency()]), function () {
+      return ports.map(function (pt) {
+        const sz = obj(pt.sizing);
+        return h('div', { class: 'chaser-block' },
+          ports.length > 1 ? h('h4', { class: 'card-section-title' }, shortPortfolio(pt.portfolio_id, pt.label)) : null,
+          sizingFacts(sz),
+          texts(sz.lines).length ? h('ul', { class: 'notes sizing-lines' }, texts(sz.lines).map(function (t) { return h('li', null, t); })) : null);
+      }).concat([h('p', { class: 'muted-note sim-flag-line' }, icon('warn'),
+        'The chaser accepts large, correlated swings to try to reach the top 3; it can also lose most of its capital.')]);
+    });
+    return p.el;
+  }
+
+  // ---- open positions and baskets
+
+  function sidePill(side) {
+    const s = str(side).toUpperCase() || '?';
+    return h('span', { class: 'side-pill' }, s);
+  }
+
+  function outcomeLink(eid, title, option, keyPrefix) {
+    const text = outcomeLabel(title, str(option));
+    if (!hasId(eid)) return document.createTextNode(text);
+    return h('a', { href: exchangeHref(eid), 'data-eid': String(eid), 'data-focus-key': (keyPrefix || 'sim') + ':' + eid }, text);
+  }
+
+  function positionFlags(pos) {
+    const keys = texts(pos.flags).slice();
+    if (str(pos.depth_state) === 'stale' && keys.indexOf('depth_stale') === -1) keys.push('depth_stale');
+    if (str(pos.depth_state) === 'unknown' && keys.indexOf('depth_unknown') === -1 && str(pos.status) !== 'frozen') keys.push('depth_unknown');
+    if (pos.bold === true) keys.push('bold');
+    const box = h('span', { class: 'flags' });
+    for (const k of keys) box.appendChild(h('span', { class: 'flag' }, icon(k === 'bold' ? 'flame' : k === 'closed_no_ruling' ? 'warn' : 'info'), k === 'bold' ? 'bold bet' : POSITION_FLAGS[k] || k.replace(/_/g, ' ')));
+    if (!box.childNodes.length) box.appendChild(h('span', { class: 'nil' }, h('span', { 'aria-hidden': 'true' }, DASH), h('span', { class: 'sr-only' }, 'None')));
+    return box;
+  }
+
+  function simFilterSelect() {
+    if (SIM.posSelect) return SIM.posSelect;
+    const sel = h('select', { id: 'sim-pos-filter' });
+    sel.addEventListener('change', function () { SIM.posFilter = sel.value; safe('sim', renderSim); });
+    SIM.posSelect = sel;
+    SIM.posFilterBox = h('div', { class: 'sim-filter' }, h('label', { for: 'sim-pos-filter' }, 'Portfolio'), sel);
+    return sel;
+  }
+
+  function renderSimPositions(d) {
+    const sel = simFilterSelect();
+    const p = simPanel('positions', 'Open positions', [SIM.posFilterBox]);
+    const labels = portfolioLabels(d);
+    const pids = Object.keys(labels);
+    const okey = sig(pids.map(function (k) { return [k, labels[k]]; }));
+    if (sel.dataset.sig !== okey) {
+      sel.dataset.sig = okey;
+      sel.replaceChildren.apply(sel, [h('option', { value: '' }, 'All portfolios')].concat(pids.map(function (k) { return h('option', { value: k }, labels[k]); })));
+    }
+    if (SIM.posFilter && pids.indexOf(SIM.posFilter) === -1) SIM.posFilter = '';
+    // Until the user picks one, show the headline (you, by hand): every portfolio at once is a long table.
+    let filter = SIM.posFilter == null ? headlinePid(d) : SIM.posFilter;
+    if (filter && pids.indexOf(filter) === -1) filter = '';
+    if (sel.value !== filter) sel.value = filter;
+    const all = objs(d.positions);
+    const pos = all.filter(function (x) { return !filter || str(x.portfolio_id) === filter; });
+    const baskets = objs(d.baskets).filter(function (x) { return !filter || str(x.portfolio_id) === filter; });
+    fillPanel(p, sig([pos, baskets, labels, filter, currency()]), function () {
+      const out = [];
+      if (!pos.length) out.push(h('p', { class: 'muted-note' }, filter ? 'No open positions in this portfolio.' : 'No open positions.'));
+      else {
+        out.push(tableWrap('Open positions table', h('table', { class: 'data-table sim-table positions-table' },
+          h('caption', { class: 'sr-only' }, 'Open simulated positions, valued at liquidation'),
+          h('thead', null, h('tr', null,
+            h('th', { scope: 'col' }, 'Portfolio'), h('th', { scope: 'col' }, 'Outcome'), h('th', { scope: 'col' }, 'Side'),
+            h('th', { scope: 'col', class: 'num' }, 'Shares'), h('th', { scope: 'col', class: 'num' }, 'Avg cost'),
+            h('th', { scope: 'col', class: 'num' }, 'Liquidation value'), h('th', { scope: 'col', class: 'num' }, 'Unrealised'),
+            h('th', { scope: 'col' }, 'Exit plan'), h('th', { scope: 'col' }, 'Flags'))),
+          h('tbody', null, pos.map(function (x) {
+            return h('tr', { 'data-pid': str(x.portfolio_id), 'data-eid': str(x.exchange_id) },
+              h('th', { scope: 'row', class: 'cell-portfolio' }, labels[str(x.portfolio_id)] || str(x.portfolio_id)),
+              h('td', { class: 'cell-outcome' }, outcomeLink(x.exchange_id, x.title, x.option, 'pos:' + str(x.portfolio_id)), h('span', { class: 'cell-sub' }, kindBadge(x.kind))),
+              h('td', null, sidePill(x.side)),
+              h('td', { class: 'num' }, fmtInt(x.qty)),
+              h('td', { class: 'num' }, fmtPrice(x.avg_cost)),
+              h('td', { class: 'num' }, fmtMoney(x.liq_value, 2)),
+              h('td', { class: 'num' }, pnlEl(x.unrealized_liq)),
+              h('td', { class: 'cell-wrap' }, str(x.exit_note) || str(obj(x.exit_plan).note) || DASH),
+              h('td', null, positionFlags(x)));
+          }))), 'pin-first'));
+      }
+      if (baskets.length) {
+        const byPos = {};
+        for (const x of all) byPos[str(x.portfolio_id) + ':' + str(x.exchange_id)] = x;
+        out.push(h('h4', { class: 'card-section-title sim-sub-title' }, 'Baskets'),
+          h('p', { class: 'muted-note' }, 'Right after entry a set is worth less at liquidation than its cost: that is the spread, not a loss of the locked edge.'),
+          tableWrap('Baskets table', h('table', { class: 'data-table sim-table baskets-table' },
+            h('caption', { class: 'sr-only' }, 'Open baskets: the floor they pay at a 1/0 settlement next to what selling them now would fetch'),
+            h('thead', null, h('tr', null, h('th', { scope: 'col' }, 'Portfolio'), h('th', { scope: 'col' }, 'Legs'), h('th', { scope: 'col', class: 'num' }, 'Sets'),
+              h('th', { scope: 'col', class: 'num' }, 'Cost'), h('th', { scope: 'col', class: 'num' }, 'Floor at settlement'), h('th', { scope: 'col', class: 'num' }, 'Now at liquidation'))),
+            h('tbody', null, baskets.map(function (b) {
+              const pid = str(b.portfolio_id);
+              return h('tr', null,
+                h('th', { scope: 'row', class: 'cell-portfolio' }, labels[pid] || pid),
+                h('td', null, h('ul', { class: 'legs' }, objs(b.legs).map(function (l) {
+                  const ps = byPos[pid + ':' + str(l.exchange_id)] || {};
+                  return h('li', null, h('span', { class: 'leg-action' }, str(l.side).toUpperCase() + ' ' + fmtInt(l.qty)), ' ',
+                    outcomeLink(l.exchange_id, ps.title || ('Outcome ' + str(l.exchange_id)), ps.option, 'leg:' + pid),
+                    h('span', { class: 'leg-market' }, ' · ' + fmtMoney(l.liq_value, 2) + ' now'));
+                }))),
+                h('td', { class: 'num' }, fmtInt(b.sets)),
+                h('td', { class: 'num' }, fmtMoney(b.cost, 2)),
+                h('td', { class: 'num' }, fmtMoney(b.floor_value, 2)),
+                h('td', { class: 'num' }, fmtMoney(b.liq_value, 2)));
+            }))), 'pin-first'));
+      }
+      return out;
+    });
+    return p.el;
+  }
+
+  // ---- recent fills and closed trades
+
+  function fillText(f) {
+    const act = str(f.action);
+    const verb = act === 'sell' ? 'Sold' : act === 'settle' ? 'Settled' : 'Bought';
+    return verb + ' ' + fmtInt(f.qty) + ' ' + (str(f.side).toUpperCase() || '?') + ' @ ' + fmtPrice(f.price);
+  }
+
+  function renderSimFills(d) {
+    const p = simPanel('fills', 'Recent fills');
+    const fills = objs(d.fills);
+    const labels = portfolioLabels(d);
+    fillPanel(p, sig([fills, labels, SIM.fillsAll]), function () {
+      if (!fills.length) return [h('p', { class: 'muted-note' }, 'No simulated fills yet. Orders wait for an order book read after the signal (about 4 minutes for the headline).')];
+      const shown = SIM.fillsAll ? fills : fills.slice(0, 20);
+      const out = [tableWrap('Recent fills table', h('table', { class: 'data-table sim-table fills-table' },
+        h('caption', { class: 'sr-only' }, 'Simulated fills, newest first'),
+        h('thead', null, h('tr', null, h('th', { scope: 'col' }, 'Time'), h('th', { scope: 'col' }, 'Portfolio'), h('th', { scope: 'col' }, 'Fill'),
+          h('th', { scope: 'col', class: 'num', title: 'Fill price minus the price seen at the decision (positive = worse)' }, 'Slippage'),
+          h('th', { scope: 'col' }, 'Kind'), h('th', { scope: 'col' }, 'Reason'))),
+        h('tbody', null, shown.map(function (f) {
+          const slip = num(f.slippage);
+          return h('tr', null,
+            h('th', { scope: 'row', class: 'col-time', title: fmtAbs(f.ts) }, fmtTableTime(f.ts)),
+            h('td', { class: 'cell-portfolio' }, labels[str(f.portfolio_id)] || str(f.portfolio_id)),
+            h('td', { class: 'cell-outcome' }, h('strong', { class: 'fill-text' }, fillText(f)),
+              h('span', { class: 'cell-sub wrap' }, outcomeLink(f.exchange_id, f.title, f.option, 'fill:' + str(f.fill_id))),
+              f.synthetic === true ? h('span', { class: 'cell-sub' }, 'from candles (assumed)') : null),
+            h('td', { class: 'num' }, str(f.action) === 'settle' || slip == null ? DASH : fmtSigned(slip),
+              slip == null || str(f.action) === 'settle' ? null : h('span', { class: 'cell-sub' }, Math.abs(slip) < 0.0005 ? 'at the decision price' : slip > 0 ? 'worse' : 'better')),
+            h('td', null, kindBadge(f.kind)),
+            h('td', { class: 'cell-wrap cell-reason' }, str(f.reason) || DASH));
+        }))), 'pin-first')];
+      if (fills.length > 20) {
+        out.push(h('button', {
+          type: 'button', class: 'btn btn-ghost', 'data-focus-key': 'fills-more', 'aria-expanded': SIM.fillsAll ? 'true' : 'false',
+          onclick: function () { SIM.fillsAll = !SIM.fillsAll; safe('sim', renderSim); },
+        }, SIM.fillsAll ? 'Show the newest 20' : 'Show all ' + fmtInt(fills.length) + ' fills'));
+      }
+      return out;
+    });
+    return p.el;
+  }
+
+  function renderSimTrades(d) {
+    const p = simPanel('trades', 'Closed trades');
+    const trades = objs(d.trades);
+    const labels = portfolioLabels(d);
+    fillPanel(p, sig([trades, labels]), function () {
+      if (!trades.length) return [h('p', { class: 'muted-note' }, 'No closed trades yet. Value and carry ideas often stay open until their target or the settlement.')];
+      return [tableWrap('Closed trades table', h('table', { class: 'data-table sim-table trades-table' },
+        h('caption', { class: 'sr-only' }, 'Closed simulated trades, newest first'),
+        h('thead', null, h('tr', null, h('th', { scope: 'col' }, 'Closed'), h('th', { scope: 'col' }, 'Kind'), h('th', { scope: 'col' }, 'Outcome'),
+          h('th', { scope: 'col' }, 'Portfolio'), h('th', { scope: 'col', class: 'num' }, 'P&L'), h('th', { scope: 'col' }, 'Exit reason'), h('th', { scope: 'col', class: 'num' }, 'Hold time'))),
+        h('tbody', null, trades.map(function (t) {
+          const eids = texts(t.exchange_ids);
+          const reason = str(t.exit_reason);
+          return h('tr', null,
+            h('th', { scope: 'row', class: 'col-time', title: fmtAbs(t.closed_at) }, fmtTableTime(t.closed_at)),
+            h('td', null, kindBadge(t.kind)),
+            h('td', { class: 'cell-outcome' }, eids.length === 1 ? outcomeLink(eids[0], t.title, null, 'trade:' + str(t.trade_id)) : str(t.title) || DASH,
+              eids.length > 1 ? h('span', { class: 'cell-sub' }, plural(eids.length, 'leg') + ', ' + fmtInt(t.qty) + ' sets') : null),
+            h('td', { class: 'cell-portfolio' }, labels[str(t.portfolio_id)] || str(t.portfolio_id)),
+            h('td', { class: 'num' }, pnlEl(t.pnl), num(t.return_pct) != null ? h('span', { class: 'cell-sub' }, fmtSignedPct(t.return_pct, 1)) : null),
+            h('td', null, EXIT_REASONS[reason] || reason.replace(/_/g, ' ') || DASH),
+            h('td', { class: 'num' }, num(t.hold_hours) == null ? DASH : fmtSpan(t.hold_hours * 3600)));
+        }))), 'pin-first')];
+    });
+    return p.el;
+  }
+
+  // ---- backtest
+
+  function coverageSentences(c) {
+    c = obj(c);
+    const out = [];
+    if (num(c.exchanges) != null || num(c.decision_steps) != null) out.push(plural(c.exchanges, 'outcome') + ', ' + plural(c.decision_steps, 'decision step') + '.');
+    if (num(c.tick_share) != null || num(c.candle_share) != null) {
+      out.push('Quotes: ' + fmtPct0(c.tick_share) + ' from live snapshots, ' + fmtPct0(c.candle_share) + ' from candles (spread assumed).');
+    }
+    if (num(c.book_snapshot_share) != null || num(c.synthetic_book_share) != null) {
+      out.push('Fills: ' + fmtPct0(c.book_snapshot_share) + ' from real order books, ' + fmtPct0(c.synthetic_book_share) + ' from synthetic books (left out of the verdict).');
+    }
+    if (num(c.fair_value_share) != null) {
+      out.push('Outside fair values usable on ' + fmtPct0(c.fair_value_share) + ' of steps' +
+        (num(c.fair_value_recorded_share) != null ? ' (' + fmtPct0(c.fair_value_recorded_share) + ' recorded, ' + fmtPct0(c.fair_value_imported_share) + ' imported)' : '') + '.');
+    }
+    if (num(c.maker_fills_tape) != null || num(c.maker_fills_candle) != null) {
+      out.push('Resting-order fills: ' + fmtInt(c.maker_fills_tape) + ' from the stored tape, ' + fmtInt(c.maker_fills_candle) + ' from candles (assumed).');
+    }
+    if (num(c.tape_share) != null) out.push('Stored tape for ' + fmtPct0(c.tape_share) + ' of the resting-order checks.');
+    if (num(c.set_tick_share) != null) out.push('Set ideas priced from one snapshot on ' + fmtPct0(c.set_tick_share) + ' of steps.');
+    if (num(c.guard_filtered) != null) out.push('The look-ahead guard held back ' + plural(c.guard_filtered, 'stored row') + ' newer than each decision.');
+    return out;
+  }
+
+  function testabilityTable(t) {
+    t = obj(t);
+    const order = ['value', 'basket', 'hole', 'fade', 'carry', 'arbitrage'];
+    const kinds = order.filter(function (k) { return t[k]; }).concat(Object.keys(t).filter(function (k) { return order.indexOf(k) === -1; }));
+    if (!kinds.length) return null;
+    return tableWrap('What this replay can test', h('table', { class: 'data-table sim-table testability-table' },
+      h('caption', { class: 'sr-only' }, 'What this replay can test, per kind of idea'),
+      h('thead', null, h('tr', null, h('th', { scope: 'col' }, 'Kind'), h('th', { scope: 'col' }, 'Can it be tested?'), h('th', { scope: 'col' }, 'Why'))),
+      h('tbody', null, kinds.map(function (k) {
+        const row = obj(t[k]);
+        const st = TESTABILITY[str(row.status)] || ['question', str(row.status).replace(/_/g, ' ') || 'Unknown'];
+        return h('tr', { 'data-kind': k },
+          h('th', { scope: 'row' }, kindBadge(k)),
+          h('td', null, h('span', { class: 'yes-no testable-' + (TESTABILITY[str(row.status)] ? str(row.status) : 'unknown') }, icon(st[0]), st[1])),
+          h('td', { class: 'cell-wrap' }, str(row.sentence) || DASH));
+      }))));
+  }
+
+  function backtestReport(r, labels) {
+    r = obj(r);
+    const out = [];
+    const testability = testabilityTable(r.testability);
+    if (testability) out.push(h('h4', { class: 'card-section-title' }, 'What this replay can test'), testability);
+    const w = obj(r.window);
+    const warnings = texts(r.warnings);
+    const overlap = warnings.filter(function (x) { return /independent check/i.test(x); });
+    const sweepWarn = warnings.filter(function (x) { return /optimistic estimate/i.test(x); });
+    const rest = warnings.filter(function (x) { return overlap.indexOf(x) === -1 && sweepWarn.indexOf(x) === -1; });
+    if (num(w.start) != null || num(w.end) != null) {
+      out.push(h('p', { class: 'bt-window' }, 'Window: ', timeEl(w.start, 'short'), ' – ', timeEl(w.end, 'short'),
+        ' (' + fmtHours(w.hours) + (num(w.steps) != null ? ', ' + plural(w.steps, 'step') : '') + ')' + (r.stopped_early === true ? ' · stopped early (time budget)' : '')));
+    }
+    if (overlap.length || num(r.overlap_hours) > 0) {
+      out.push(h('div', { class: 'banner banner-warning bt-overlap' }, icon('warn', 'icon-lg'), h('div', { class: 'banner-body' },
+        h('p', null, overlap[0] || fmtHours(r.overlap_hours) + ' of this window were also seen by the live paper run: a backtest over the same data is not an independent check, so agreement between the two is not evidence.'))));
+    }
+    const cov = coverageSentences(r.coverage);
+    if (cov.length) out.push(h('h4', { class: 'card-section-title' }, 'Coverage'), h('ul', { class: 'notes' }, cov.map(function (x) { return h('li', null, x); })));
+    if (texts(r.assumptions).length) out.push(h('h4', { class: 'card-section-title' }, 'Assumptions'), h('ul', { class: 'notes' }, texts(r.assumptions).map(function (x) { return h('li', null, x); })));
+    const ports = objs(r.portfolios);
+    const verdicts = obj(r.verdicts);
+    if (ports.length) {
+      out.push(h('h4', { class: 'card-section-title' }, 'Portfolios in the replay'),
+        tableWrap('Backtest portfolios', h('table', { class: 'data-table sim-table bt-table' },
+          h('caption', { class: 'sr-only' }, 'Each portfolio over the replayed window, at liquidation value'),
+          h('thead', null, h('tr', null, h('th', { scope: 'col' }, 'Portfolio'), h('th', { scope: 'col', class: 'num' }, 'P&L at liquidation'),
+            h('th', { scope: 'col', class: 'num' }, 'Ideas (closed / open)'), h('th', { scope: 'col' }, 'Verdict'))),
+          h('tbody', null, ports.map(function (pt) {
+            const v = obj(verdicts[str(pt.portfolio_id)] || pt.verdict);
+            return h('tr', null, h('th', { scope: 'row' }, labels[str(pt.portfolio_id)] || shortPortfolio(pt.portfolio_id, pt.label)),
+              h('td', { class: 'num' }, pnlEl(pt.pnl_liq)),
+              h('td', { class: 'num' }, fmtInt(num(v.closed_trades) != null ? v.closed_trades : pt.trades_closed) + ' / ' + fmtInt(num(v.open_ideas) != null ? v.open_ideas : pt.positions_open)),
+              h('td', null, str(v.level) ? levelBadge(v) : DASH));
+          }))), 'pin-first'));
+    }
+    if (r.study && typeof r.study === 'object') {
+      out.push(h('h4', { class: 'card-section-title' }, 'Signal study over the replay'), studyTable(r.study, 'Signal study over the replayed window'));
+    }
+    const sweep = objs(r.sweep);
+    if (sweep.length) {
+      out.push(h('h4', { class: 'card-section-title' }, 'Settings sweep (headline portfolio)'));
+      for (const x of sweepWarn) out.push(h('p', { class: 'table-warning' }, icon('warn'), x));
+      out.push(tableWrap('Settings sweep', h('table', { class: 'data-table sim-table sweep-table' },
+        h('caption', { class: 'sr-only' }, 'The headline portfolio under each combination of settings'),
+        h('thead', null, h('tr', null, h('th', { scope: 'col' }, 'Settings'), h('th', { scope: 'col', class: 'num' }, 'P&L at liquidation'),
+          h('th', { scope: 'col', class: 'num' }, 'Closed trades'), h('th', { scope: 'col' }, 'Verdict'), h('th', { scope: 'col', class: 'num' }, 'Max drawdown'))),
+        h('tbody', null, sweep.map(function (s) {
+          return h('tr', null, h('th', { scope: 'row', class: 'cell-wrap' }, str(s.label) || sig(s.params)), h('td', { class: 'num' }, pnlEl(s.pnl_liq)),
+            h('td', { class: 'num' }, fmtInt(s.trades_closed)), h('td', null, str(s.verdict_level) ? levelBadge({ level: s.verdict_level }) : DASH),
+            h('td', { class: 'num' }, fmtPctOf(s.max_drawdown)));
+        })))));
+    }
+    if (rest.length) out.push(h('h4', { class: 'card-section-title' }, 'Warnings'), h('ul', { class: 'notes bt-warnings' }, rest.map(function (x) { return h('li', null, x); })));
+    return out;
+  }
+
+  function renderSimBacktest() {
+    const p = simPanel('backtest', 'Backtest: the same simulator over stored history');
+    const b = S.data.backtest;
+    const labels = portfolioLabels(S.data.paper);
+    fillPanel(p, sig([b && b.status, b && b.error, b && b.generated_at, b && b.report, labels, !b && viewError('backtest') ? 'err' : '']), function () {
+      if (!b) return [h('p', { class: 'muted-note' }, loadingMsg('backtest', 'Loading the backtest…'))];
+      const status = str(b.status);
+      const out = [];
+      if (status === 'pending') {
+        out.push(h('p', { class: 'pending-note bt-status' }, h('span', { class: 'spinner', 'aria-hidden': 'true' }),
+          h('span', null, 'Replaying the stored history through the same simulator. This takes up to two minutes; the page checks again every 30 s.')));
+      } else if (status === 'ready') {
+        out.push(h('p', { class: 'bt-status' }, icon('checkCircle'), h('span', null, 'Ready', num(b.generated_at) != null ? [': generated ', timeEl(b.generated_at, 'ago')] : '',
+          '. A replay of the past is not a forecast.')));
+      } else if (status === 'no_data') {
+        out.push(h('p', { class: 'bt-status' }, icon('info'), h('span', null, str(b.error) || 'Less than 1 hour of prices is stored yet: nothing to replay.')));
+      } else if (status === 'unavailable') {
+        out.push(h('p', { class: 'bt-status' }, icon('info'), h('span', null, str(b.error) || 'The backtest is not available.')));
+      } else {
+        out.push(h('p', { class: 'bt-status' }, icon('warn'), h('span', null, (str(b.error) || 'The backtest failed.') + ' It retries in a minute.')));
+      }
+      if (b.report && typeof b.report === 'object') {
+        if (status !== 'ready') out.push(h('p', { class: 'muted-note' }, 'The previous result:'));
+        return out.concat(backtestReport(b.report, labels));
+      }
+      return out;
+    });
+    return p.el;
+  }
+
+  // ---- fair values
+
+  function raceText(key, party) {
+    const k = str(key);
+    const parts = k.split(':');
+    let t = k;
+    if (parts.length >= 3) {
+      const office = parts[1], where = parts.slice(2).join(':');
+      if (office === 'SENATE_CONTROL') t = 'Senate control';
+      else if (office === 'HOUSE_CONTROL') t = 'House control';
+      else t = where + ' ' + office.charAt(0) + office.slice(1).toLowerCase();
+    }
+    return (t || DASH) + (str(party) ? ' (' + str(party) + ')' : '');
+  }
+
+  function copySnippet(btn, pre) {
+    const text = pre.textContent;
+    const done = function (ok) {
+      if (ok) {
+        setText(btn.querySelector('.copy-label'), 'Copied');
+        announce('Copied to the clipboard.');
+        setTimeout(function () { if (btn.isConnected) setText(btn.querySelector('.copy-label'), 'Copy'); }, 2000);
+        return;
+      }
+      // no clipboard access (an http page, or permission denied): select the text so Ctrl+C copies it
+      const range = document.createRange();
+      range.selectNodeContents(pre);
+      const sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(range);
+      announce('Copying is blocked here: the text is selected, press Ctrl+C (or ⌘C) to copy it.');
+      setText(btn.querySelector('.copy-label'), 'Selected: press Ctrl+C');
+    };
+    try {
+      if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+        navigator.clipboard.writeText(text).then(function () { done(true); }, function () { done(false); });
+        return;
+      }
+    } catch (e) {
+      /* fall through to selecting the text */
+    }
+    done(false);
+  }
+
+  function snippetBlock(key, label, text) {
+    const pre = h('pre', { class: 'snippet' }, text);
+    const btn = h('button', { type: 'button', class: 'btn btn-copy', 'data-focus-key': 'copy:' + key },
+      icon('copy'), h('span', { class: 'copy-label' }, 'Copy'), h('span', { class: 'sr-only' }, ': ' + label));
+    btn.addEventListener('click', function () { copySnippet(btn, pre); });
+    return h('div', { class: 'snippet-block' }, h('div', { class: 'snippet-head' }, h('span', null, label), btn), pre);
+  }
+
+  function fvRow(r, mapPath) {
+    const fair = r.fair && typeof r.fair === 'object' ? obj(r.fair) : null;
+    const eid = str(r.exchange_id);
+    const snippets = obj(r.snippets);
+    const matches = objs(r.matches);
+    const fix = SNIPPETS.filter(function (s) { return str(snippets[s[0]]); });
+    const usable = fair ? fair.usable === true : false;
+    return h('tr', { 'data-eid': eid, class: r.suspect === true ? 'is-suspect' : null },
+      h('th', { scope: 'row', class: 'cell-title' }, outcomeLink(eid, r.title, r.option, 'fv')),
+      h('td', null, r.race_key ? raceText(r.race_key, r.party) : DASH),
+      h('td', { class: 'num' }, fair && num(fair.value) != null ? fmtPrice(fair.value) : DASH,
+        fair && num(fair.value) != null ? h('span', { class: 'cell-sub wrap' }, [fvSourceLabel(fair.source), str(fair.confidence) ? str(fair.confidence) + ' confidence' : '',
+          num(fair.uncertainty) != null ? fmtCents(fair.uncertainty) : '', num(fair.age_s) != null ? fmtSpan(fair.age_s) + ' old' : ''].filter(Boolean).join(' · ')) : null),
+      h('td', { class: 'num' }, fmtPrice(r.sm_bid) + ' / ' + fmtPrice(r.sm_ask)),
+      h('td', { class: 'num', title: 'Fair value minus the Cup mid (positive: the Cup is below the fair value)' }, num(r.gap) == null ? DASH : fmtSigned(r.gap),
+        num(r.edge_yes) != null || num(r.edge_no) != null ? h('span', { class: 'cell-sub' }, 'YES ' + fmtSigned(r.edge_yes) + ' · NO ' + fmtSigned(r.edge_no)) : null),
+      h('td', { class: 'cell-matches' },
+        matches.length ? h('ul', { class: 'match-list' }, matches.map(function (m) {
+          return h('li', null, h('strong', null, (PROVIDER_NAMES[str(m.venue)] || str(m.venue)) + ' ' + str(m.external_id)),
+            str(m.label) ? ' ' + str(m.label) : '', str(m.kind) === 'NEAR' ? ' (near match)' : '',
+            str(m.reason) ? h('span', { class: 'cell-sub wrap' }, str(m.reason)) : null);
+        })) : h('span', { class: 'muted-note' }, str(r.unmatched_reason) || 'No outside market matched.'),
+        fix.length ? simDetails('fix:' + eid, 'Fix this match', h('div', { class: 'sim-details-body' },
+          fix.map(function (s) { return snippetBlock(eid + ':' + s[0], s[1], str(snippets[s[0]])); }),
+          h('p', { class: 'muted-note' }, 'Paste it under "overrides" in ' + (mapPath || 'the match file') + '; it applies within a minute.')), 'fix-details') : null),
+      h('td', { class: 'cell-usable' }, fair ? yesNo(usable, 'Yes', 'No') : yesNo(false, 'Yes', 'No'),
+        fair && str(fair.reason) ? h('span', { class: 'cell-sub wrap' }, str(fair.reason)) : null,
+        r.suspect === true || r.near === true ? h('span', { class: 'flags' },
+          r.suspect === true ? h('span', { class: 'flag flag-suspect' }, icon('warn'), 'suspect match') : null,
+          r.near === true ? h('span', { class: 'flag' }, icon('info'), 'near match: shown, not traded') : null) : null));
+  }
+
+  function fvControls() {
+    if (SIM.fvControls) return SIM.fvControls;
+    const search = h('input', { type: 'search', id: 'sim-fv-search', placeholder: 'e.g. Texas, Senate', autocomplete: 'off', spellcheck: 'false' });
+    search.addEventListener('input', function () { SIM.fvQuery = search.value; safe('sim', renderSim); });
+    const usable = h('input', { type: 'checkbox', id: 'sim-fv-usable' });
+    usable.addEventListener('change', function () { SIM.fvUsable = usable.checked; safe('sim', renderSim); });
+    SIM.fvControls = [
+      h('div', { class: 'search sim-search' }, h('label', { for: 'sim-fv-search' }, 'Search outcomes'), search),
+      h('label', { class: 'check', for: 'sim-fv-usable' }, usable, 'Only usable'),
+    ];
+    return SIM.fvControls;
+  }
+
+  function providerLine(pv) {
+    pv = obj(pv);
+    const name = PROVIDER_NAMES[str(pv.name)] || str(pv.name) || 'Provider';
+    const st = str(pv.status);
+    const bits = [name + ': ' + (PROVIDER_STATUS[st] || st || 'unknown')];
+    const extra = [];
+    if (num(pv.matched) != null) extra.push(fmtInt(pv.matched) + ' matched, ' + fmtInt(pv.quoted) + ' quoted');
+    return h('li', { class: 'provider provider-' + (PROVIDER_STATUS[st] ? st : 'unknown') },
+      icon(st === 'ok' ? 'checkCircle' : st === 'partial' || st === 'backoff' ? 'pulse' : st === 'disabled' ? 'closed' : 'warn'),
+      h('span', null, h('strong', null, bits[0]), extra.length ? ' · ' + extra.join(', ') : '',
+        num(pv.last_ok_at) != null ? [' · last answer ', timeEl(pv.last_ok_at, 'ago')] : '',
+        num(pv.next_try_at) != null ? [' · next try ', timeEl(pv.next_try_at, 'ago')] : '',
+        str(pv.last_error) ? h('span', { class: 'cell-sub wrap' }, shortProblem(pv.last_error)) : null));
+  }
+
+  function renderSimFairValue() {
+    const p = simPanel('fairvalue', 'Outside fair values', null);
+    const f = S.data.fairvalue;
+    if (!p.controls) {
+      p.controls = h('div', { class: 'filter-row sim-fv-filters' }, fvControls(), h('p', { class: 'result-count', id: 'sim-fv-count' }));
+      p.list = h('div', { class: 'sim-fv-body' });
+      p.body.append(p.controls, p.list);
+      p.info = h('div', { class: 'sim-fv-info' });
+      p.body.insertBefore(p.info, p.controls);
+      p.foot = h('div', { class: 'sim-fv-foot' });
+      p.body.appendChild(p.foot);
+    }
+    const rows = f ? objs(f.rows) : [];
+    const terms = SIM.fvQuery.trim().toLowerCase().split(/\s+/).filter(Boolean);
+    const shown = rows.filter(function (r) {
+      if (SIM.fvUsable && !(r.fair && r.fair.usable === true)) return false;
+      if (!terms.length) return true;
+      const hay = [r.title, r.option, r.race_key, r.exchange_id, r.market_id].map(str).join(' ').toLowerCase();
+      return terms.every(function (t) { return hay.indexOf(t) !== -1; });
+    });
+    show(p.controls, rows.length > 0);
+    setText($('sim-fv-count'), rows.length ? 'Showing ' + fmtInt(shown.length) + ' of ' + plural(rows.length, 'outcome') : '');
+    const mapPath = f && f.map ? str(obj(f.map).path) : '';
+    const ikey = sig([f && f.enabled, f && f.mode, f && f.providers, f && f.manual, f && f.map, f && f.history, f && f.counts, f && f.last_refresh_at, !f && viewError('fairvalue') ? 'e' : '']);
+    if (p.info.dataset.sig !== ikey && !selectionInside(p.info)) {
+      p.info.dataset.sig = ikey;
+      const out = [];
+      if (!f) out.push(h('p', { class: 'muted-note' }, loadingMsg('fairvalue', 'Loading the fair values…')));
+      else if (f.enabled === false || str(f.mode) === 'off') out.push(h('p', { class: 'muted-note' }, 'Outside fair values are off: value ideas cannot trade.'));
+      else {
+        const c = obj(f.counts);
+        out.push(h('p', null, plural(c.outcomes, 'outcome') + ': ' + fmtInt(c.matched) + ' matched to an outside market, ' + fmtInt(c.usable) + ' usable' +
+          (num(c.manual) > 0 ? ', ' + fmtInt(c.manual) + ' from your file' : '') + (num(c.suspect) > 0 ? ', ' + fmtInt(c.suspect) + ' suspect' : '') +
+          (num(c.near) > 0 ? ', ' + plural(c.near, 'near match', 'near matches') : '') + '.',
+          h('span', { class: 'muted-note' }, ' Mode: ' + (str(f.mode) === 'manual' ? 'your file only' : 'automatic') +
+            (num(f.last_refresh_at) != null ? '; refreshed ' : ''), num(f.last_refresh_at) != null ? timeEl(f.last_refresh_at, 'ago') : '', '.')));
+        if (objs(f.providers).length) out.push(h('ul', { class: 'provider-list' }, objs(f.providers).map(providerLine)));
+        const man = f.manual && typeof f.manual === 'object' ? obj(f.manual) : null;
+        if (man) {
+          out.push(h('p', { class: 'muted-note file-line' }, 'Your fair-value file: ', h('code', null, str(man.path) || DASH),
+            man.exists === true ? ' (' + plural(man.entries, 'entry', 'entries') + ')' : ' (not created yet)'));
+          if (texts(man.errors).length) out.push(h('ul', { class: 'notes file-errors' }, texts(man.errors).map(function (x) { return h('li', null, x); })));
+        }
+        const map = f.map && typeof f.map === 'object' ? obj(f.map) : null;
+        if (map) {
+          out.push(h('p', { class: 'muted-note file-line' }, 'Match file: ', h('code', null, str(map.path) || DASH),
+            ' (' + plural(map.overrides, 'override') + (map.exists === true ? '' : ', not created yet') + ')',
+            num(map.loaded_at) != null ? [', read ', timeEl(map.loaded_at, 'ago')] : ''));
+          if (texts(map.errors).length) out.push(h('ul', { class: 'notes file-errors' }, texts(map.errors).map(function (x) { return h('li', null, x); })));
+        }
+        const hist = f.history && typeof f.history === 'object' ? obj(f.history) : null;
+        if (hist && num(hist.records) > 0) {
+          out.push(h('p', { class: 'muted-note' }, 'Imported outside history: ' + plural(hist.records, 'record') + ' from ', timeEl(hist.first, 'short'), ' to ', timeEl(hist.last, 'short'), ' (replays only, indicative).'));
+        }
+      }
+      rebuild(p.info, out);
+    }
+    const lkey = sig([shown, mapPath, rows.length]);
+    if (p.list.dataset.sig !== lkey && !selectionInside(p.list)) {
+      p.list.dataset.sig = lkey;
+      if (!rows.length) rebuild(p.list, f && f.enabled !== false && str(f.mode) !== 'off' ? [h('p', { class: 'muted-note' }, 'No outcomes to match yet.')] : []);
+      else if (!shown.length) rebuild(p.list, [h('p', { class: 'muted-note' }, 'No outcomes match these filters.')]);
+      else {
+        rebuild(p.list, [tableWrap('Fair values table', h('table', { class: 'data-table sim-table fv-table' },
+          h('caption', { class: 'sr-only' }, 'Outside fair value of every outcome next to its Cup price'),
+          h('thead', null, h('tr', null, h('th', { scope: 'col' }, 'Outcome'), h('th', { scope: 'col' }, 'Race'), h('th', { scope: 'col', class: 'num' }, 'Fair value'),
+            h('th', { scope: 'col', class: 'num' }, 'Cup bid / ask'), h('th', { scope: 'col', class: 'num' }, 'Gap'), h('th', { scope: 'col' }, 'Matched venues'),
+            h('th', { scope: 'col' }, 'Usable'))),
+          h('tbody', null, shown.map(function (r) { return fvRow(r, mapPath); }))), 'pin-first')]);
+      }
+    }
+    const fkey = sig([f && f.caveats]);
+    if (p.foot.dataset.sig !== fkey) {
+      p.foot.dataset.sig = fkey;
+      rebuild(p.foot, f && texts(f.caveats).length ? [h('ul', { class: 'notes' }, texts(f.caveats).map(function (x) { return h('li', null, x); }))] : []);
+    }
+    return p.el;
+  }
+
+  // ---- how to read this
+
+  function renderSimCaveats(d) {
+    const p = simPanel('caveats', 'How to read this');
+    fillPanel(p, sig([d.caveats]), function () {
+      const c = texts(d.caveats);
+      return c.length ? [h('ul', { class: 'reasons caveat-list' }, c.map(function (x) { return h('li', null, x); }))] : [h('p', { class: 'muted-note' }, 'Nothing was traded: every order here is simulated.')];
+    });
+    return p.el;
+  }
+
+  // ---- reset
+
+  function openResetDialog() {
+    const dlg = $('sim-reset-dialog');
+    if (!dlg) return;
+    const run = obj(S.data.paper && S.data.paper.run);
+    const hours = num(run.target_hours) || 24;
+    setText($('sim-reset-text'), 'Every portfolio goes back to its start capital and the ' + fmtCount(hours) + '-hour clock restarts. ' +
+      'The current run’s result is kept under "Previous run". Nothing real is affected.');
+    setAttr($('sim-reset-confirm'), 'aria-disabled', null);
+    if (typeof dlg.showModal === 'function') dlg.showModal();
+    else dlg.setAttribute('open', '');
+    $('sim-reset-cancel').focus();
+  }
+
+  function closeResetDialog() {
+    const dlg = $('sim-reset-dialog');
+    if (dlg && dlg.open) {
+      if (typeof dlg.close === 'function') dlg.close();
+      else dlg.removeAttribute('open');
+    }
+    const btn = $('sim-reset');
+    if (btn && btn.isConnected) btn.focus({ preventScroll: true });
+  }
+
+  async function confirmReset() {
+    if (SIM.resetBusy) return;
+    SIM.resetBusy = true;
+    setAttr($('sim-reset-confirm'), 'aria-disabled', 'true');
+    const ctrl = new AbortController();
+    const timer = setTimeout(function () { ctrl.abort(); }, REQUEST_TIMEOUT_MS);
+    let text;
+    let ok = false;
+    try {
+      const resp = await fetch('/api/paper/reset', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify({ confirm: true }),
+        cache: 'no-store',
+        credentials: 'same-origin',
+        signal: ctrl.signal,
+      });
+      let body = null;
+      try {
+        body = await resp.json();
+      } catch (e) {
+        body = null;
+      }
+      ok = resp.ok && !!(body && body.reset === true);
+      text = ok ? str(body && body.message) || 'Started a new simulation.' : str(body && body.error) || 'Could not reset the simulation (HTTP ' + resp.status + ').';
+    } catch (e) {
+      text = e && e.name === 'AbortError' ? 'The bot did not answer; the simulation was not reset.' : 'Could not reach the bot to reset the simulation.';
+    } finally {
+      clearTimeout(timer);
+      SIM.resetBusy = false;
+    }
+    closeResetDialog();
+    const status = $('sim-status');
+    setText(status, '');
+    setText(status, text);
+    status.className = 'sim-status' + (ok ? ' is-ok' : ' is-error');
+    if (ok) {
+      SIM.previous = null;
+      SIM.previousState = '';
+      SIM.chartKey = null;
+      SIM.hoverTs = null;
+      if (SIM.previousOpen) loadPrevious();
+      loadView('paper', true);
+      loadView('backtest', true);
+    }
+  }
+
   // ---------------------------------------------------------------- drawer
 
   const drawerEl = function () { return $('drawer'); };
@@ -2713,6 +4448,10 @@
       if (!isSet(o) && String(o.exchange_id) === sid) return pick(o.title, o.option);
       for (const l of objs(o.legs)) if (String(l.exchange_id) === sid) return pick(l.title || o.title, l.option);
     }
+    for (const x of objs(S.data.paper && S.data.paper.positions).concat(objs(S.data.paper && S.data.paper.fills))) {
+      if (String(x.exchange_id) === sid) return pick(x.title, x.option);
+    }
+    for (const r of objs(S.data.fairvalue && S.data.fairvalue.rows)) if (String(r.exchange_id) === sid) return pick(r.title, r.option);
     return null;
   }
 
@@ -3178,7 +4917,8 @@
    *  when there is room; on a narrow plot, where that leaves one label (or none), a smaller step is
    *  tried, thinned to every k-th tick (at least TICK_GAP apart) and phased to keep the most, so
    *  the axis always has a scale (2+ labels) where any fit. */
-  function timeTicks(t0, t1, X, left, right) {
+  function timeTicks(t0, t1, X, left, right, stepsIn) {
+    const STEPS = stepsIn || TICK_STEPS;
     const span = t1 - t0;
     if (!(span > 0)) return [];
     const width = right - left;
@@ -3190,8 +4930,8 @@
       return out;
     };
     const maxTicks = Math.max(2, Math.floor(width / 96));
-    let step = TICK_STEPS[TICK_STEPS.length - 1];
-    for (const s of TICK_STEPS) {
+    let step = STEPS[STEPS.length - 1];
+    for (const s of STEPS) {
       if (span / s <= maxTicks) {
         step = s;
         break;
@@ -3199,8 +4939,8 @@
     }
     let best = grid(step).filter(inside).map(function (t) { return { t: t, label: tickLabel(t, step) }; });
     if (best.length >= 2) return best.slice(0, 40);
-    for (let i = TICK_STEPS.indexOf(step) - 1; i >= 0; i--) {
-      const s = TICK_STEPS[i];
+    for (let i = STEPS.indexOf(step) - 1; i >= 0; i--) {
+      const s = STEPS[i];
       const pxPerStep = (s / span) * width;
       const k = Math.max(1, Math.ceil(TICK_GAP / pxPerStep));
       if (k > 48) break;
@@ -3856,6 +5596,24 @@
       S.offlineDismissed = true;
       show($('offline-banner'), false);
       $('main').focus({ preventScroll: true });
+    });
+
+    // simulation: the reset confirmation (Cancel sends nothing; Reset simulation sends one POST)
+    const resetDlg = $('sim-reset-dialog');
+    $('sim-reset-cancel').addEventListener('click', closeResetDialog);
+    $('sim-reset-confirm').addEventListener('click', function () {
+      if ($('sim-reset-confirm').getAttribute('aria-disabled') === 'true') return;
+      confirmReset();
+    });
+    resetDlg.addEventListener('cancel', function (ev) {
+      ev.preventDefault();
+      if (!SIM.resetBusy) closeResetDialog();
+    });
+    let resetDown = false;
+    resetDlg.addEventListener('pointerdown', function (ev) { resetDown = ev.target === resetDlg; });
+    resetDlg.addEventListener('click', function (ev) {
+      if (ev.target === resetDlg && resetDown && !SIM.resetBusy) closeResetDialog();
+      resetDown = false;
     });
 
     // drawer: close button, Esc, backdrop

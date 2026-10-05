@@ -1,0 +1,343 @@
+{
+ "_fixture": {
+  "built_by": "package A (tests/test_fairvalue.py), by hand. ILLUSTRATIVE values, real field names and shapes.",
+  "matching_rule": "D57: path + query multiset ignoring 'limit' and parameter order (tickers / market_tickers lists compared as sets in the test transport)",
+  "what": "Outside price history for the optional import (spec \u00a74.11, D26): Polymarket CLOB /prices-history at fidelity=5 for the NH Senate D and R YES tokens (one hour, 12 five-minute points; 't' is the bucket start, so a point is known at t + 300 s), and the Kalshi batch /markets/candlesticks (response {markets: [{market_ticker, candlesticks}]}, kalshi_python_sync 3.2.0 BatchGetMarketCandlesticksResponse) for SENATENH-26-D/R with three hourly bars plus one bar ending after end_ts (a partial bar: the import must drop it).",
+  "unsure_fields": [
+   "prices-history 'p' semantics (mid vs last): treated as indicative",
+   "the *_dollars fields of candlesticks after the cents removal are assumed"
+  ]
+ },
+ "responses": [
+  {
+   "request": "GET https://clob.polymarket.com/prices-history?market=82410058691149830741200014405570918770267839390767234397030380747995715352939&startTs=1791126000&endTs=1791129600&fidelity=5",
+   "status": 200,
+   "body": {
+    "history": [
+     {
+      "t": 1791126000,
+      "p": 0.85
+     },
+     {
+      "t": 1791126300,
+      "p": 0.85
+     },
+     {
+      "t": 1791126600,
+      "p": 0.855
+     },
+     {
+      "t": 1791126900,
+      "p": 0.855
+     },
+     {
+      "t": 1791127200,
+      "p": 0.86
+     },
+     {
+      "t": 1791127500,
+      "p": 0.86
+     },
+     {
+      "t": 1791127800,
+      "p": 0.855
+     },
+     {
+      "t": 1791128100,
+      "p": 0.85
+     },
+     {
+      "t": 1791128400,
+      "p": 0.85
+     },
+     {
+      "t": 1791128700,
+      "p": 0.845
+     },
+     {
+      "t": 1791129000,
+      "p": 0.85
+     },
+     {
+      "t": 1791129300,
+      "p": 0.855
+     }
+    ]
+   }
+  },
+  {
+   "request": "GET https://clob.polymarket.com/prices-history?market=62227089537100115269143206481757249285124282589590263790284791475153705872216&startTs=1791126000&endTs=1791129600&fidelity=5",
+   "status": 200,
+   "body": {
+    "history": [
+     {
+      "t": 1791126000,
+      "p": 0.14
+     },
+     {
+      "t": 1791126300,
+      "p": 0.14
+     },
+     {
+      "t": 1791126600,
+      "p": 0.135
+     },
+     {
+      "t": 1791126900,
+      "p": 0.135
+     },
+     {
+      "t": 1791127200,
+      "p": 0.13
+     },
+     {
+      "t": 1791127500,
+      "p": 0.13
+     },
+     {
+      "t": 1791127800,
+      "p": 0.135
+     },
+     {
+      "t": 1791128100,
+      "p": 0.14
+     },
+     {
+      "t": 1791128400,
+      "p": 0.14
+     },
+     {
+      "t": 1791128700,
+      "p": 0.145
+     },
+     {
+      "t": 1791129000,
+      "p": 0.14
+     },
+     {
+      "t": 1791129300,
+      "p": 0.135
+     }
+    ]
+   }
+  },
+  {
+   "request": "GET https://api.elections.kalshi.com/trade-api/v2/markets/candlesticks?market_tickers=SENATENH-26-D,SENATENH-26-R&start_ts=1791122400&end_ts=1791133200&period_interval=60",
+   "status": 200,
+   "body": {
+    "markets": [
+     {
+      "market_ticker": "SENATENH-26-D",
+      "candlesticks": [
+       {
+        "end_period_ts": 1791126000,
+        "yes_bid": {
+         "open_dollars": "0.8500",
+         "low_dollars": "0.8450",
+         "high_dollars": "0.8550",
+         "close_dollars": "0.8500"
+        },
+        "yes_ask": {
+         "open_dollars": "0.8600",
+         "low_dollars": "0.8550",
+         "high_dollars": "0.8650",
+         "close_dollars": "0.8600"
+        },
+        "price": {
+         "open_dollars": "0.8550",
+         "low_dollars": "0.8550",
+         "high_dollars": "0.8550",
+         "close_dollars": "0.8550",
+         "mean_dollars": "0.8550",
+         "previous_dollars": "0.8550"
+        },
+        "volume_fp": "1500.00",
+        "open_interest_fp": "217000.00"
+       },
+       {
+        "end_period_ts": 1791129600,
+        "yes_bid": {
+         "open_dollars": "0.8550",
+         "low_dollars": "0.8500",
+         "high_dollars": "0.8600",
+         "close_dollars": "0.8550"
+        },
+        "yes_ask": {
+         "open_dollars": "0.8650",
+         "low_dollars": "0.8600",
+         "high_dollars": "0.8700",
+         "close_dollars": "0.8650"
+        },
+        "price": {
+         "open_dollars": "0.8600",
+         "low_dollars": "0.8600",
+         "high_dollars": "0.8600",
+         "close_dollars": "0.8600",
+         "mean_dollars": "0.8600",
+         "previous_dollars": "0.8600"
+        },
+        "volume_fp": "1500.00",
+        "open_interest_fp": "217000.00"
+       },
+       {
+        "end_period_ts": 1791133200,
+        "yes_bid": {
+         "open_dollars": "0.8500",
+         "low_dollars": "0.8450",
+         "high_dollars": "0.8550",
+         "close_dollars": "0.8500"
+        },
+        "yes_ask": {
+         "open_dollars": "0.8600",
+         "low_dollars": "0.8550",
+         "high_dollars": "0.8650",
+         "close_dollars": "0.8600"
+        },
+        "price": {
+         "open_dollars": "0.8550",
+         "low_dollars": "0.8550",
+         "high_dollars": "0.8550",
+         "close_dollars": "0.8550",
+         "mean_dollars": "0.8550",
+         "previous_dollars": "0.8550"
+        },
+        "volume_fp": "1500.00",
+        "open_interest_fp": "217000.00"
+       },
+       {
+        "end_period_ts": 1791136800,
+        "yes_bid": {
+         "open_dollars": "0.8000",
+         "low_dollars": "0.7950",
+         "high_dollars": "0.8050",
+         "close_dollars": "0.8000"
+        },
+        "yes_ask": {
+         "open_dollars": "0.8100",
+         "low_dollars": "0.8050",
+         "high_dollars": "0.8150",
+         "close_dollars": "0.8100"
+        },
+        "price": {
+         "open_dollars": "0.8000",
+         "low_dollars": "0.8000",
+         "high_dollars": "0.8000",
+         "close_dollars": "0.8000",
+         "mean_dollars": "0.8000",
+         "previous_dollars": "0.8000"
+        },
+        "volume_fp": "1500.00",
+        "open_interest_fp": "217000.00"
+       }
+      ]
+     },
+     {
+      "market_ticker": "SENATENH-26-R",
+      "candlesticks": [
+       {
+        "end_period_ts": 1791126000,
+        "yes_bid": {
+         "open_dollars": "0.1400",
+         "low_dollars": "0.1350",
+         "high_dollars": "0.1450",
+         "close_dollars": "0.1400"
+        },
+        "yes_ask": {
+         "open_dollars": "0.1500",
+         "low_dollars": "0.1450",
+         "high_dollars": "0.1550",
+         "close_dollars": "0.1500"
+        },
+        "price": {
+         "open_dollars": "0.1450",
+         "low_dollars": "0.1450",
+         "high_dollars": "0.1450",
+         "close_dollars": "0.1450",
+         "mean_dollars": "0.1450",
+         "previous_dollars": "0.1450"
+        },
+        "volume_fp": "1500.00",
+        "open_interest_fp": "217000.00"
+       },
+       {
+        "end_period_ts": 1791129600,
+        "yes_bid": {
+         "open_dollars": "0.1350",
+         "low_dollars": "0.1300",
+         "high_dollars": "0.1400",
+         "close_dollars": "0.1350"
+        },
+        "yes_ask": {
+         "open_dollars": "0.1450",
+         "low_dollars": "0.1400",
+         "high_dollars": "0.1500",
+         "close_dollars": "0.1450"
+        },
+        "price": {
+         "open_dollars": "0.1400",
+         "low_dollars": "0.1400",
+         "high_dollars": "0.1400",
+         "close_dollars": "0.1400",
+         "mean_dollars": "0.1400",
+         "previous_dollars": "0.1400"
+        },
+        "volume_fp": "1500.00",
+        "open_interest_fp": "217000.00"
+       },
+       {
+        "end_period_ts": 1791133200,
+        "yes_bid": {
+         "open_dollars": "0.1400",
+         "low_dollars": "0.1350",
+         "high_dollars": "0.1450",
+         "close_dollars": "0.1400"
+        },
+        "yes_ask": {
+         "open_dollars": "0.1500",
+         "low_dollars": "0.1450",
+         "high_dollars": "0.1550",
+         "close_dollars": "0.1500"
+        },
+        "price": {
+         "open_dollars": "0.1450",
+         "low_dollars": "0.1450",
+         "high_dollars": "0.1450",
+         "close_dollars": "0.1450",
+         "mean_dollars": "0.1450",
+         "previous_dollars": "0.1450"
+        },
+        "volume_fp": "1500.00",
+        "open_interest_fp": "217000.00"
+       },
+       {
+        "end_period_ts": 1791136800,
+        "yes_bid": {
+         "open_dollars": "0.1900",
+         "low_dollars": "0.1850",
+         "high_dollars": "0.1950",
+         "close_dollars": "0.1900"
+        },
+        "yes_ask": {
+         "open_dollars": "0.2000",
+         "low_dollars": "0.1950",
+         "high_dollars": "0.2050",
+         "close_dollars": "0.2000"
+        },
+        "price": {
+         "open_dollars": "0.1900",
+         "low_dollars": "0.1900",
+         "high_dollars": "0.1900",
+         "close_dollars": "0.1900",
+         "mean_dollars": "0.1900",
+         "previous_dollars": "0.1900"
+        },
+        "volume_fp": "1500.00",
+        "open_interest_fp": "217000.00"
+       }
+      ]
+     }
+    ]
+   }
+  }
+ ]
+}

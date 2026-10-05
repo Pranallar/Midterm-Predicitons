@@ -34,6 +34,14 @@ same as selling YES at `1 - q`; for YES best bid `b` and best ask `a`, the NO as
 | `tracker.py` | `Tracker`: background loop + workers, live view | client, bot, store, analytics, attribution, strategy |
 | `demo.py` | simulated Super Market API (`httpx.MockTransport`) + `DemoNewsProvider` | models, news |
 | `web.py` + `web/` | HTTP server + single-page UI | tracker, store, strategy |
+| `fairvalue.py`, `fv_pins.py` | outside fair values (Polymarket, Kalshi, your file), race matching | models, readonly |
+| `sizing.py`, `depth.py` | sizing policies (conservative, chaser), order-book walks | models |
+| `paper.py`, `study.py`, `backtest.py` | paper trader, signal-level event study, replay backtest | models, sizing, strategy, depth |
+| `pipeline.py` | strategy inputs and paper observations from the tracker's view (no reads); headless driver | models, store |
+| `readonly.py` | runtime GET-only guards for every client the simulator builds | – |
+
+The paper trader, outside fair values, sizing policies and backtest are specified in
+[`docs/PAPER_TRADING.md`](PAPER_TRADING.md) (see "Paper trading and outside fair values" below).
 
 ## Rate budget (per account: 100 reads + 30 writes per minute, shared by all keys)
 
@@ -47,12 +55,39 @@ tracker splits that budget:
 * **Analysis** (its own limiter, default 20 reads/min): per surge, one trade-tape read (up to
   200 trades since `start_ts - 1h`) and one exchange orderbook read (`depth=20`).
 * **Context** (every 300 s): `GET /relationships/constraints?violationsOnly=true`,
-  `GET /tournaments/{slug}` (my balance), the leaderboard top 3, and up to 10
-  multi-outcome `GET /markets/{id}/orderbook` reads for overround and arbitrage flags.
+  `GET /tournaments/{slug}` (my balance), the leaderboard (100 rows, one read, for the top-3
+  bar), and up to 10 multi-outcome `GET /markets/{id}/orderbook` reads for overround and
+  arbitrage flags, plus up to 12 idea books.
+* **Settlements** (every 600 s, and early when outcomes go missing from the bulk prices):
+  `GET /tournaments/{slug}/markets?status=settled` (usually one page).
+* **Paper trader** (its own limiter): at most 8 books and 2 tape pages per step, 20 reads/min,
+  6/min while the backfill queue is not empty.
+* **Read reserve** (D44): every background read (context, backfill, analysis, paper) waits or
+  is skipped while fewer than 12 of the client's 90 slots are free; the snapshot loop's own
+  reads are never gated, so a busy start-up or a burst of retries delays optional work, never
+  the snapshots.
+
+| consumer | per minute (237 outcomes, 30-s interval) |
+| --- | --- |
+| bulk prices | 6.0 |
+| market list | 0.6 (up to 6 near a settlement) |
+| context | <= 3.2 |
+| settlements | 0.1-0.3 |
+| backfill | 30 in the first ~16 min, then 0 |
+| analysis | ~2 (bursts <= 20) |
+| dashboard drawers | 4 per open drawer |
+| paper | <= 20 (6 during the backfill) |
+| **total** | **~36-40 steady, ~80 at start-up (plus retries)** |
+
+`status()["read_budget"]` reports the projection from the live outcome count
+(`projected_per_min`, a warning above 75), the paper budget and the reserve. One process per
+account: a store lease makes a second tracker on the same database refuse to start.
 
 News providers are separate hosts with their own politeness limits: GDELT at most 1
 request per 5 s; Google News at most 1 request per 2 s. Results are cached in the store
-for 20 minutes per query.
+for 20 minutes per query. Polymarket and Kalshi (outside fair values) are read anonymously
+with GET only, each with its own 30/min limiter and a 30-s deadline per refresh (about 5 and 3
+reads a minute).
 
 ## Analytics (pure, `analytics.py`)
 
@@ -294,8 +329,8 @@ context_refresh=300, clock=time.time)`.
 ## Demo (`demo.py`)
 
 `DemoMarket(seed=7, now=None, clock=time.time)` simulates one tournament
-("Predictions Cup — Midterm Elections (demo)", 100,000 SUSQies) with about 14 markets and 22
-outcomes.
+("Predictions Cup — Midterm Elections (demo)", 100,000 SUSQies) with 26 markets and 34
+outcomes (33 open; markets 316-326 were added for the paper trader, see below).
 
 * Election-style titles, e.g. "Will Republicans win the Pennsylvania Senate race?", and one
   multi-outcome "Who will win the Arizona Governor race?" with three candidates.
@@ -311,6 +346,14 @@ outcomes.
   * (e) one ALL constraint violation.
   * (f) a **live surge** about 90 s after start (participant-style), so the dashboard shows
     detection happening.
+  * (g)-(l) for the paper trader (docs/PAPER_TRADING.md §7.6), titled in the real Cup grammar:
+    a Nevada Governor NO basket (YES bids sum to 1.05 over `t0+4m..30m`), a Texas Senate value
+    winner (outside 0.58, the Cup converges), an Iowa Senate value loser (the outside price was
+    wrong), a three-leg Nebraska Senate NO basket (`t0+60m..80m`), a Wyoming Governor liquidity
+    hole (`t0+20m`) and a Maine debate market that settles YES at `t0+40m`. `DemoFairValueProvider`
+    serves the scripted outside prices; for four liquid Senate markets its price leads the Cup by
+    15 minutes. Three far-ahead leaders put the top-3 bar at 221,500.
+  * `SimClock` + `no_wait`: fast, deterministic runs (`paper --demo --fast`, `backtest --demo`).
 * `transport()` returns an `httpx.MockTransport` serving the endpoints the bot uses, with
   realistic shapes from the OpenAPI spec:
   * `/account`, `/tournaments`, `/tournaments/{slug}`, `/tournaments/{slug}/markets`,
@@ -352,3 +395,31 @@ outcomes.
     trades, news.
 * Light and dark mode. Charts follow the dataviz skill rules: one axis, thin marks,
   hover tooltips, recessive grid, legends, and text in text colours.
+
+## Paper trading and outside fair values
+
+The full, normative design is [`docs/PAPER_TRADING.md`](PAPER_TRADING.md) (revision 2). In
+short:
+
+* **Outside fair value** (`fairvalue.py`): Polymarket, Kalshi and a user file, matched to each
+  Cup outcome (pins validated live, a map file for overrides), blended into one value with a
+  stated uncertainty. The tracker refreshes it every 60 s in its own `tracker-fairvalue` worker
+  and records changes (plus one row per refresh) for replays.
+* **Ideas and sizing** (`strategy.py`, `sizing.py`): `value`, `basket` and `hole` ideas next to
+  fade, carry and arbitrage; a conservative and a goal-based `chaser` sizing policy.
+* **Paper trader** (`paper.py`, `study.py`): several simulated portfolios on the live signals,
+  filled only from books read after the decision plus each portfolio's latency (the headline,
+  `human:<sizing>`, waits 240 s), valued at liquidation value, judged by a cluster-robust verdict
+  that one day can lift at most to "promising, not proof", plus a signal-level event study.
+  `tracker-paper` steps it once per cycle through `TrackerMarketReader` (GET only, its own
+  budget); `PaperRunner` serialises steps and resets under one lock and publishes an immutable
+  summary that `/api/paper` and `status()` read without that lock. Lock order: runner ->
+  FairValueService -> tracker; the tracker never calls either while holding its own lock.
+* **Backtest** (`backtest.py`): the same engine over the stored history behind a look-ahead
+  guard, on a separate read-only connection (`TrackerStore.open_read_only`).
+* **Integration** (`tracker.py`, `pipeline.py`, `store.py` schema v2, `web.py`, `cli.py`,
+  `demo.py`): endpoints `/api/paper` (`?run=previous`), `POST /api/paper/reset`,
+  `/api/backtest`, `/api/fairvalue`; commands `paper`, `backtest`, `fairvalue`; demo scenarios
+  (g)-(l) (markets 316-326, exchanges 9024-9034) and a `SimClock` fast mode in which every
+  limiter runs on simulated time, so a 2-hour run takes seconds and is byte-for-byte
+  reproducible.
