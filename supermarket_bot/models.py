@@ -118,6 +118,9 @@ class TradeRecord(_Serializable):
     price: Optional[float]
     size: float
     side: Optional[str] = None  # "YES" | "NO" (the taker side as reported by the tape)
+    # When this print was fetched by us (store column trades.fetched_at, schema v2; None for older rows).
+    # Replays use a print at decision time t only if fetched_at <= t (§6.12.2).
+    fetched_at: Optional[float] = None
 
 
 @dataclass
@@ -263,6 +266,15 @@ class Opportunity(_Serializable):
     profit_per_capital_day: Optional[float] = None  # edge / (cost x days the capital stays tied up)
     sizing: Optional[Dict[str, Any]] = None  # SizeDecision.to_dict() under the report's sizing policy
     alt_sizing: Optional[Dict[str, Any]] = None  # SizeDecision.to_dict() under the other policy (chaser <-> conservative)
+    # ---- added in spec revision 2 (docs/PAPER_TRADING.md, "Design decisions") ----
+    bet_limit: Optional["BetShape"] = None  # the same bet priced at limit_price (the worst fill the order accepts)
+    # (CONTRACT price per unit, units) on offer up to limit_price in the decision-time book, best first;
+    # sets: (marginal set cost, sets) from depth.set_levels. Empty = depth unknown (sizing then assumes the touch).
+    levels: List[Tuple[float, float]] = field(default_factory=list)
+    fv_uncertainty: Optional[float] = None  # +/- uncertainty of the fair value behind the edge (FairValue.uncertainty or a kind default)
+    factor_delta: Optional[float] = None  # SUSQies gained per unit for a 1-point national swing toward Democrats (0: sets, no race)
+    called_prob: Optional[float] = None  # strategy.called_prob behind the regime EV (None: not used)
+    priced_from: str = "tick"  # "tick" | "candle": where the decision quote came from (candle only in replays)
 
 
 @dataclass
@@ -275,6 +287,10 @@ class BacktestResult(_Serializable):
     horizon_hours: float = 6.0
     by_window: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     notes: List[str] = field(default_factory=list)
+    # ---- added in spec revision 2 ----
+    net_of_spread: bool = True  # entry at the ask (or 1 - bid), exit at the horizon's bid
+    n_participant: int = 0  # surges whose attribution verdict was "participants"
+    participant_reversion_rate: Optional[float] = None  # net-of-spread reversion rate of those surges only (fade p)
 
 
 @dataclass
@@ -409,22 +425,47 @@ class FairValue(_Serializable):
     match_confidence: float = 0.0
     note: Optional[str] = None  # the manual entry's note
     manual_updated_at: Optional[float] = None
+    # ---- added in spec revision 2 ----
+    # +/- uncertainty of ``value`` as a probability: max(agreement, tightest venue half-spread, venue fee
+    # band) (fairvalue.uncertainty_of). Strategy needs gap >= min_value_edge + this.
+    uncertainty: Optional[float] = None
+    prev_value: Optional[float] = None  # the value at the previous refresh (jump check, §5.2)
+    prev_as_of: Optional[float] = None
+    suspect: bool = False  # |value - Cup mid| > SUSPECT_GAP and the match is not confirmed by the user
+    history: bool = False  # rebuilt from imported outside price history ("indicative"), replays only
 
 
 @dataclass
 class FairValueRecord(_Serializable):
-    """One stored fair-value observation (store table ``fair_values``) for replays."""
+    """One stored fair-value observation (store table ``fair_values``) for replays.
+
+    Written on a change of at least one tick (0.005) in value / bid / ask, a change of usable or
+    confidence, or a heartbeat every FV_RECORD_HEARTBEAT_S; confirmations in between are proven by
+    the ``fair_value_refreshes`` rows (FairValueRefresh)."""
 
     ts: float  # when it was recorded (our clock); a replay may use it at decision time t only if ts <= t - latency
     exchange_id: str
     value: Optional[float]
-    source: str
+    source: str  # FV_SOURCES member, or "history" for imported outside price history
     bid: Optional[float] = None
     ask: Optional[float] = None
     confidence: str = FV_CONF_LOW
     usable: bool = False
     agreement: Optional[float] = None
-    detail: Dict[str, Any] = field(default_factory=dict)  # FairValue.to_dict() minus the bulky "sources"
+    # compact: {"as_of", "venues", "match_kind", "match_confidence", "uncertainty", "prev_value", "suspect"}
+    # (no reason text, no "sources")
+    detail: Dict[str, Any] = field(default_factory=dict)
+    as_of: Optional[float] = None  # the live FairValue.as_of (oldest venue fetched_at) when recorded
+    venues: List[str] = field(default_factory=list)  # venues whose quotes were used ("polymarket", "kalshi", ...)
+
+
+@dataclass
+class FairValueRefresh(_Serializable):
+    """One fair-value refresh (store table ``fair_value_refreshes``): proves which venues answered when,
+    so a replay knows an unchanged value was re-confirmed between FairValueRecords."""
+
+    ts: float
+    venues: Dict[str, Dict[str, Any]] = field(default_factory=dict)  # venue -> {"status", "fetched_at"}
 
 
 # --------------------------------------------------------------------------- idea shapes
@@ -439,16 +480,21 @@ class BetShape(_Serializable):
       entry + expected edge, so that p - cost = EV per share).
     * ``bracket``: a target/stop trade, same fields (gain to target, loss to stop).
     * ``riskless``: a set paying at least ``floor`` per unit for ``cost``; ``gain`` = floor - cost.
+      Only when the regime is ``resolved_outcomes`` (every leg pays 1/0) and no refund signal exists.
+    * ``bounded``: a set that is riskless at settlement but not under the other regimes or a REFUND
+      on one leg (§5.3): pays ``gain`` (expected edge) with ``p = 1 - tail_prob`` and loses ``loss``
+      (the refund scenario: set cost - cheapest leg) with ``tail_prob``.
     * ``fixed``: small passive orders (holes): sized by ``cap_pct`` of equity, no Kelly.
     """
 
-    kind: str  # "binary" | "bracket" | "riskless" | "fixed"
+    kind: str  # "binary" | "bracket" | "riskless" | "bounded" | "fixed"
     p: float  # win probability (1.0 for riskless)
     gain: float  # per unit if it wins (> 0)
     loss: float  # per unit at risk if it loses (0 for riskless)
     cost: float  # cash per unit at the entry price (contract price, or set cost)
-    floor: Optional[float] = None  # riskless: guaranteed payoff per unit at settlement
+    floor: Optional[float] = None  # riskless / bounded: guaranteed payoff per unit at a 1/0 settlement
     cap_pct: Optional[float] = None  # fixed: stake cap as a share of equity
+    tail_prob: Optional[float] = None  # bounded: probability of the loss branch
 
 
 @dataclass
@@ -478,19 +524,29 @@ class StrategyParams(_Serializable):
     """Every tunable of the idea generators (backtest sweeps set these by name)."""
 
     # value (external fair value vs Super Market)
-    min_value_edge: float = 0.02  # per share, after spread, exit cost and the regime adjustment
+    min_value_edge: float = 0.02  # per share, after spread, exit cost and the regime adjustment, ON TOP of the fair value's uncertainty
     value_exit_buffer: float = 0.005  # exit when the contract bid >= fv - half spread - this
-    fv_max_age_s: float = 300.0  # external fair values older than this are not traded on
+    fv_max_age_s: float = 90.0  # external fair values older than this are not traded on (competitors react in seconds)
+    history_fv_max_age_s: float = 600.0  # imported outside price history (5-60 min bars): replays only
     manual_fv_max_age_s: float = 72 * 3600.0  # manual entries older than this are not traded on
     longshot_shrink: float = 0.10  # buying a contract whose fair value is < 0.15: use fv x (1 - this)
+    longshot_min_edge_mult: float = 2.0  # ... and require this x min_value_edge
+    near_extra_edge: float = 0.03  # NEAR matches the user enabled for trading need this much more edge
+    fv_jump_fraction: float = 0.5  # skip when the outside value moved by more than this x the gap between the last two refreshes
+    cup_move_fraction: float = 0.5  # skip when the Cup mid moved away from fair value by more than this x the gap since fv.as_of
     called_prob_fast: float = 0.85  # P(race called before the closeout window), fast-count states
     called_prob_slow: float = 0.40  # slow-count / ranked-choice states (strategy.SLOW_COUNT_STATES)
     called_prob_safe: float = 0.97  # favourite side >= 0.95 (safe seats are called at poll close)
-    unconverged_share: float = 0.30  # share of an uncalled race's gap a VWAP closeout still realises
+    # Uncalled branch under a VWAP closeout (§5.2): E[p | uncalled] = 0.5 + (q - 0.5) x uncalled_shrink,
+    # and the closeout VWAP still carries (1 - unconverged_share) of the Cup's mispricing.
+    uncalled_shrink: float = 0.30
+    unconverged_share: float = 0.30  # share of the Cup's mispricing (fair - Cup mid) a VWAP closeout of an uncalled race realises
     # basket (pair / set arbitrage)
     basket_min_edge: float = 0.01  # per set: sum(YES bids) - 1 (NO basket), 1 - sum(YES asks) (YES basket)
     basket_exit_fraction: float = 0.5  # exit when set profit now >= max(min profit, this x entry edge)
     basket_exit_min_profit: float = 0.005  # per set
+    basket_refund_prob: float = 0.01  # tail probability of a REFUND / ruling on one leg (bounded bet)
+    same_snapshot_s: float = 5.0  # every leg of a set idea needs a tick quote from the same bulk snapshot (|dts| <= this)
     # hole (deep resting orders on liquid favourites)
     hole_min_mid: float = 0.70  # favourite side's mid
     hole_min_touch_qty: float = 200.0  # shares at the favourite's best bid in a recent book
@@ -506,7 +562,11 @@ class StrategyParams(_Serializable):
     hole_fill_prob: float = 0.02  # prior, only for the score
     # fade / carry
     fade_horizon_h: float = 6.0
+    min_fade_gain: float = 0.02  # per share after both spreads, else no fade
     carry_max_entry: float = 0.995
+    # national factor (tilt, chaser slate): P(D) = Phi(margin / race_margin_sd_pts); a national swing moves every margin
+    race_margin_sd_pts: float = 7.0
+    national_swing_sd_pts: float = 3.0  # one standard deviation of a national polling miss, in points
     # common
     book_max_age_s: float = 900.0  # a stored book older than this does not cap max_units
     settle_margin_s: float = 3600.0  # "settles before the Cup end" needs settlement this much earlier
@@ -533,14 +593,17 @@ class LeaderboardSnapshot(_Serializable):
 class BarEstimate(_Serializable):
     """The estimated final top-3 balance (the bar a chaser must clear)."""
 
-    value: float  # the bar used for sizing
+    value: float  # the bar used for sizing = ``low`` (sized from the lower end of the range)
     third_value: Optional[float] = None  # 3rd place now (initial + pnl, mid-Cup marks)
     tenth_value: Optional[float] = None
     hundredth_value: Optional[float] = None
-    growth_per_day: Optional[float] = None  # of 3rd place, from leaderboard history (clipped)
-    projected: bool = False  # value includes growth to the Cup end
-    method: str = "floor"  # "third" | "projected" | "floor"
+    growth_per_day: Optional[float] = None  # LINEAR growth per day (share of today's value), median over ranks 3-10, clipped
+    projected: bool = False  # kept for compatibility: always False (value is never projected; see ``high``)
+    method: str = "floor"  # "third" | "floor"
     explanation: List[str] = field(default_factory=list)
+    low: Optional[float] = None  # max(third, floor): what sizing uses
+    high: Optional[float] = None  # third x (1 + growth x days_left), capped: shown, never sized from
+    history_days: Optional[float] = None  # span of leaderboard history behind growth_per_day (needs >= 3 days)
 
 
 @dataclass
@@ -550,8 +613,14 @@ class ExposureSummary(_Serializable):
     gross_cost: float = 0.0  # open positions at cost + cash reserved by pending entry orders
     by_race: Dict[str, float] = field(default_factory=dict)  # race_key (or "market:<id>") -> cost
     by_idea: Dict[str, float] = field(default_factory=dict)  # idea_id -> cost
-    national_tilt_d: float = 0.0  # signed cost toward Democrats (YES D / NO R positive, YES R / NO D negative)
+    # SUSQies gained by open positions + pending entries for a 1-point national swing toward Democrats:
+    # sum(qty x factor_delta) (delta-weighted, §5.6.1); set legs (basket / arbitrage) are left out.
+    national_tilt_d: float = 0.0
     open_positions: int = 0
+    # directional (binary / bracket) ideas held or pending: idea_id -> score at entry (chaser top_k slots)
+    directional: Dict[str, float] = field(default_factory=dict)
+    directional_sign: Dict[str, int] = field(default_factory=dict)  # idea_id -> sign of factor_delta (+1 D, -1 R, 0 none)
+    bold_idea: Optional[str] = None  # the chaser's one open bold-to-goal bet, if any
 
 
 @dataclass
@@ -572,6 +641,10 @@ class SizingContext(_Serializable):
     regime: str = REGIME_UNKNOWN
     all_collateral: bool = False  # riskless sets need only cost - floor in cash (ALL collateral)
     races: Dict[str, "RaceRef"] = field(default_factory=dict)  # exchange_id -> race (for race caps and tilt)
+    # ---- added in spec revision 2 ----
+    prev_mode: Optional[str] = None  # the chaser mode at the previous sizing (hysteresis, §5.6.4)
+    mode_since: Optional[float] = None  # when prev_mode began
+    params: Optional["StrategyParams"] = None  # national_swing_sd_pts etc. (None = StrategyParams())
 
 
 @dataclass
@@ -583,9 +656,17 @@ class SizeDecision(_Serializable):
     units: int  # 0 = do not trade
     stake: float  # cash committed (units x cash per unit)
     kelly_fraction: Optional[float] = None  # of equity at risk, before caps
-    capped_by: List[str] = field(default_factory=list)  # "kelly", "idea_cap", "race_cap", "total_cap", "tilt_cap", "cash", "depth", "top_k", "goal", "zero_edge"
+    # "kelly", "idea_cap", "race_cap", "total_cap", "tilt_cap", "swing_cap", "cash", "depth", "top_k",
+    # "goal", "zero_edge", "basket_cap", "factor", "certainty"
+    capped_by: List[str] = field(default_factory=list)
     mode: Optional[str] = None  # chaser mode: "near" | "chase" | "swing" | "out_of_reach" | "unknown_bar"
     lines: List[str] = field(default_factory=list)  # plain-English explanation, one sentence each
+    # ---- added in spec revision 2 ----
+    avg_cost: Optional[float] = None  # expected depth-walked average cost per unit at this size (None: touch assumed)
+    certainty: Optional[float] = None  # edge^2 / (edge^2 + uncertainty^2) applied to the Kelly multiplier
+    factor_scale: Optional[float] = None  # 1 / (1 + (n_same - 1) x FACTOR_RHO): correlated-slate scaling (chaser)
+    bold: bool = False  # the chaser's bold-to-goal bet
+    replaces: Optional[str] = None  # chaser top_k: sell this held idea first (the new one enters in a later step)
 
 
 class SizingPolicy(Protocol):
@@ -636,6 +717,11 @@ class StrategyInputs(_Serializable):
     bar: Optional[BarEstimate] = None
     settlement_regime: str = REGIME_UNKNOWN
     params: Optional[StrategyParams] = None  # None = StrategyParams()
+    # ---- added in spec revision 2 ----
+    # exchange_id -> [(ts, YES mid)] over the last ~5 minutes, oldest first (the fair-value staleness check, §5.2)
+    recent_mids: Dict[str, List[Tuple[float, float]]] = field(default_factory=dict)
+    # exchanges where a paper portfolio has a resting hole order: hole ideas there survive a missing book (§5.4)
+    resting_exchanges: Set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -693,20 +779,35 @@ class MarketObservation(_Serializable):
 # --------------------------------------------------------------------------- paper configuration
 
 
+HUMAN_LATENCY_S = 240.0  # "human speed": a person reads the dashboard and places the order by hand ~4 minutes later
+HUMAN_MAX_FILL_DELAY_S = 360.0
+
+
 @dataclass
 class PortfolioSpec(_Serializable):
-    portfolio_id: str  # "policy:conservative", "kind:value", ...
+    portfolio_id: str  # "policy:conservative", "human:conservative", "kind:value", ...
     label: str
     policy: str  # POLICIES member
     kinds: Optional[List[str]] = None  # None = every TRADE_KINDS member
     start_capital: Optional[float] = None  # None = the run's start capital
+    # ---- added in spec revision 2 ----
+    min_latency_s: Optional[float] = None  # None = PaperConfig.min_latency_s; "human:*" portfolios use HUMAN_LATENCY_S
+    max_fill_delay_s: Optional[float] = None  # None = PaperConfig.max_fill_delay_s
 
 
-def default_portfolios() -> List[PortfolioSpec]:
-    """Two sizing policies on every kind, plus one conservative portfolio per kind (equal capital)."""
+def default_portfolios(sizing: str = POLICY_CONSERVATIVE) -> List[PortfolioSpec]:
+    """The pre-registered headline first: the user's sizing policy at human speed (``human:<sizing>``), then
+    both policies at bot speed, then one conservative portfolio per kind (equal capital, exploratory)."""
+    if sizing not in POLICIES:
+        raise ValueError(f"unknown sizing policy {sizing!r}")
+    human_label = {
+        POLICY_CONSERVATIVE: "You, acting by hand ~4 min late: all ideas, conservative sizing",
+        POLICY_CHASER: "You, acting by hand ~4 min late: all ideas, chaser sizing",
+    }[sizing]
     return [
-        PortfolioSpec("policy:conservative", "All ideas, conservative sizing (quarter-Kelly, 8% cap)", POLICY_CONSERVATIVE),
-        PortfolioSpec("policy:chaser", "All ideas, chaser sizing (goal-based)", POLICY_CHASER),
+        PortfolioSpec(f"human:{sizing}", human_label, sizing, None, None, HUMAN_LATENCY_S, HUMAN_MAX_FILL_DELAY_S),
+        PortfolioSpec("policy:conservative", "Bot speed (30 s): all ideas, conservative sizing (quarter-Kelly, 8% cap)", POLICY_CONSERVATIVE),
+        PortfolioSpec("policy:chaser", "Bot speed (30 s): all ideas, chaser sizing (goal-based)", POLICY_CHASER),
         PortfolioSpec("kind:value", "Value vs outside fair value only", POLICY_CONSERVATIVE, [KIND_VALUE]),
         PortfolioSpec("kind:basket", "Pair and set baskets only", POLICY_CONSERVATIVE, [KIND_BASKET]),
         PortfolioSpec("kind:hole", "Liquidity-hole resting orders only", POLICY_CONSERVATIVE, [KIND_HOLE]),
@@ -719,27 +820,43 @@ def default_portfolios() -> List[PortfolioSpec]:
 @dataclass
 class PaperConfig(_Serializable):
     portfolios: List[PortfolioSpec] = field(default_factory=default_portfolios)
-    headline_portfolio: str = "policy:conservative"
+    # The ONE pre-registered portfolio whose verdict can reach every level; None = f"human:{sizing}"
+    # (paper.headline_id). Every other portfolio is exploratory (§6.9).
+    headline_portfolio: Optional[str] = None
+    sizing: str = POLICY_CONSERVATIVE  # the user's --sizing choice (picks the headline)
     target_hours: float = 24.0
     start_capital: Optional[float] = None  # None: account value at reset, else cash, else the initial balance, else 100,000
     regime: str = REGIME_UNKNOWN
     all_collateral: bool = False
     reads_per_min: int = 20  # the paper worker's own limiter (on top of the client's 90/min)
+    reads_per_min_during_backfill: int = 6  # while the tracker's backfill queue is not empty
     max_book_reads_per_step: int = 8
     max_trade_reads_per_step: int = 2
+    max_tape_pages: int = 3  # follow the tape cursor this many pages when a page comes back full (200)
     book_depth: int = 20
+    interval_s: float = 30.0  # the step interval (covered hours count gaps up to 3 x this, §6.11)
+    gap_cancel_s: float = 300.0  # after a gap longer than this, resting orders count as cancelled at the last step before it
     min_latency_s: float = 2.0  # a fill uses only observations at least this long after the decision
     max_fill_delay_s: float = 120.0  # a taker order with no usable observation by then expires unfilled
     stale_quote_s: float = 120.0  # no decisions, fills or exits on an outcome whose bulk quote is older
-    mark_book_max_age_s: float = 900.0  # liquidation marks walk a book at most this old, else the touch
-    consumed_memory_s: float = 900.0  # liquidity a portfolio took stays taken in later books this long
+    set_book_max_age_s: float = 60.0  # a set entry waits until every leg has a book at most this old
+    mark_book_max_age_s: float = 900.0  # liquidation marks walk a consistent book at most this old ("fresh")
+    mark_depth_max_age_s: float = 3600.0  # else the last real book this old, shifted to today's touch ("stale")
+    depth_unknown_full_shares: float = 100.0  # no real book within the hour: this many shares at the touch ...
+    depth_unknown_haircut: float = 0.5  # ... and the rest at touch x (1 - this) ("unknown")
+    queue_book_max_age_s: float = 120.0  # maker queue_ahead needs a book this fresh showing our price level, else None
+    consumed_memory_s: float = 1800.0  # liquidity a portfolio took stays taken this long (>= reentry_cooldown_s)
+    consumed_match_ticks: int = 1  # ... matched within this many ticks of the price we took
     queue_haircut: float = 0.5  # maker fills from prints AT the limit price, after the queue ahead
     trade_poll_s: float = 60.0  # tape read per exchange with resting orders at most this often
     mark_refresh_s: float = 300.0  # book re-read per open position at most this often
+    resting_book_refresh_s: float = 600.0  # book re-read for exchanges with resting orders (keeps hole ideas alive)
     reentry_cooldown_s: float = 1800.0  # an idea that closed may not re-enter for this long
     maker_cancel_after_missing_steps: int = 2  # cancel a resting order once its idea is absent this many steps
     max_open_positions: int = 40  # per portfolio
     max_new_orders_per_step: int = 10  # per portfolio
+    equity_min_spacing_s: float = 60.0  # at most one stored equity point per minute per portfolio
+    unfilled_tracked: int = 200  # per portfolio: unfilled entry orders kept to show what they would have made
     params: StrategyParams = field(default_factory=StrategyParams)
     demo: bool = False
 
@@ -781,6 +898,12 @@ class PaperOrder(_Serializable):
     cancel_at: Optional[float] = None  # maker: when the engine decided to cancel (or expires_at); prints up to it still count
     title: str = ""
     option: Optional[str] = None
+    # ---- added in spec revision 2 ----
+    decision_touch: Optional[float] = None  # contract touch at the decision (ask for buys, bid for sells): slippage reference
+    latency_s: Optional[float] = None  # this order's portfolio latency (fills need an observation >= created_at + this)
+    planned_price: Optional[float] = None  # exits: the price the exit rule planned (target_bid etc.), for exit slippage
+    synthetic: bool = False  # filled (partly) from candles or a synthetic book (replays): left out of verdict statistics
+    tape_gap: bool = False  # maker: a tape read was truncated past our cursor (prints may have been missed)
 
 
 @dataclass
@@ -807,6 +930,9 @@ class PaperFill(_Serializable):
     group_id: Optional[str] = None
     title: str = ""
     option: Optional[str] = None
+    # ---- added in spec revision 2 ----
+    slippage: Optional[float] = None  # buys: price - decision_touch; sells: decision_touch - price (positive = worse)
+    synthetic: bool = False  # from candles or a synthetic book (replays only)
 
 
 @dataclass
@@ -829,15 +955,24 @@ class PaperPosition(_Serializable):
     realized_pnl: float = 0.0  # from partial exits so far
     collateral_advance: float = 0.0  # all_collateral: cash advanced against the set's floor (repaid on close)
     status: str = "open"  # "open" | "frozen" | "closed"
-    flags: List[str] = field(default_factory=list)  # "depth_unknown", "closed_no_ruling", "stale_quote", "post_cup"
+    # "depth_stale", "depth_unknown", "closed_no_ruling", "stale_quote", "post_cup", "synthetic"
+    flags: List[str] = field(default_factory=list)
     first_fill_at: Optional[float] = None
     updated_at: Optional[float] = None
-    liq_value: Optional[float] = None  # selling qty into the bids now (depth-aware)
+    liq_value: Optional[float] = None  # selling qty into the bids now (depth-aware; frozen positions: their last value, "unvalued")
     mark_value: Optional[float] = None  # qty x contract mid mark (reference only)
-    fv_value: Optional[float] = None  # qty x contract fair value (model, reference only)
+    fv_value: Optional[float] = None  # qty x contract fair value (the model's own opinion, reference only)
     last_marked_at: Optional[float] = None
     title: str = ""
     option: Optional[str] = None
+    # ---- added in spec revision 2 ----
+    depth_state: str = "unknown"  # liquidation mark: "fresh" | "stale" | "unknown" (§6.7)
+    factor_delta: Optional[float] = None  # per share (Opportunity.factor_delta); set legs 0
+    score: Optional[float] = None  # the idea's score at entry (chaser top_k ranking)
+    bold: bool = False  # the chaser's bold-to-goal bet
+    floor_per_unit: Optional[float] = None  # set legs: the set's floor / n legs (floor value shown next to liquidation)
+    synthetic: bool = False  # opened by a candle / synthetic-book fill (replays only)
+    entered_at: Optional[float] = None  # decision time of the entry order (time-block clusters, §6.9)
 
 
 @dataclass
@@ -855,13 +990,22 @@ class PaperTrade(_Serializable):
     cost: float
     proceeds: float  # sales + settlement payouts (+ refunds)
     pnl: float  # proceeds - cost
-    exit_reason: str  # "target" | "stop" | "time" | "settled" | "refund" | "converged" | "fair_value" | "regime" | "legging" | "reset"
+    # "target" | "stop" | "time" | "settled" | "refund" | "converged" | "fair_value" | "regime" | "legging"
+    # | "replaced" | "reset" | "settings changed"
+    exit_reason: str
     race_key: Optional[str] = None
     title: str = ""
     legs: List[Dict[str, Any]] = field(default_factory=list)  # [{"exchange_id", "side", "qty", "avg_cost", "avg_exit"}]
     return_pct: Optional[float] = None  # pnl / cost
     hold_hours: Optional[float] = None
     profit_per_capital_day: Optional[float] = None  # pnl / (cost x max(hold days, 1/24))
+    # ---- added in spec revision 2 ----
+    synthetic: bool = False  # any fill was synthetic (replays): left out of verdict statistics
+    entered_at: Optional[float] = None  # decision time of the entry (time-block clusters)
+    direction: str = "N"  # "D" | "R" | "N": sign of the position's national-swing exposure at entry (clusters)
+
+
+VERDICT_LEVELS = ("insufficient", "inconclusive", "promising", "positive", "negative")
 
 
 @dataclass
@@ -878,28 +1022,52 @@ class EquityPoint(_Serializable):
 
 @dataclass
 class Verdict(_Serializable):
-    """An honest statement of what a run shows (docs/PAPER_TRADING.md §6.9)."""
+    """An honest statement of what a run shows (docs/PAPER_TRADING.md §6.9, revision 2).
+
+    The statistic is over every idea ENTERED (closed ones at realised P&L, open ones at liquidation
+    P&L; frozen and synthetic ones left out), with a two-way cluster-robust t-interval (clusters:
+    races, and 2-hour blocks x party direction; G = the smaller count; G - 1 degrees of freedom)."""
 
     portfolio_id: str
-    level: str  # "insufficient" | "inconclusive" | "positive" | "negative"
+    level: str  # VERDICT_LEVELS: "insufficient" | "inconclusive" | "promising" | "positive" | "negative"
     sentence: str
-    hours_run: float
+    hours_run: float  # COVERED hours (sum of step gaps, each capped at 3 x interval), not wall-clock time
     closed_trades: int
-    clusters: int  # distinct races (or markets) among closed trades
-    pnl_liq: float  # realised + unrealised at liquidation value
-    pnl_ex_best: float  # pnl_liq without the single best closed trade
-    best_trade_pnl: Optional[float] = None
-    mean_trade_pnl: Optional[float] = None
-    ci_low: Optional[float] = None  # cluster-bootstrap CI of the mean closed-trade P&L
+    clusters: int  # G = min(race clusters, time-block clusters) among the ideas counted
+    pnl_liq: float  # realised + unrealised at liquidation value, frozen ("unvalued") positions at 0
+    pnl_ex_best: float  # pnl_liq without the single best idea, open or closed
+    best_trade_pnl: Optional[float] = None  # the best idea's P&L (open or closed)
+    mean_trade_pnl: Optional[float] = None  # mean P&L per idea entered (SUSQies)
+    ci_low: Optional[float] = None  # two-way cluster-robust t-interval of mean_trade_pnl
     ci_high: Optional[float] = None
-    ci_level: float = 0.90
-    win_rate: Optional[float] = None
+    ci_level: float = 0.90  # 0.90 for the headline; 1 - 0.10 / n_portfolios for exploratory portfolios
+    win_rate: Optional[float] = None  # CLOSED trades only (biased toward quick winners: label it so)
     win_rate_low: Optional[float] = None  # Wilson interval
     win_rate_high: Optional[float] = None
     max_drawdown: Optional[float] = None  # fraction of peak liquidation equity
-    thresholds: Dict[str, float] = field(default_factory=dict)  # {"min_hours", "min_trades", "min_clusters"}
-    reasons: List[str] = field(default_factory=list)  # why this level
+    thresholds: Dict[str, float] = field(default_factory=dict)  # {"min_hours", "min_ideas", "min_clusters", "positive_hours", "positive_days"}
+    reasons: List[str] = field(default_factory=list)  # why this level (one sentence each)
     caveats: List[str] = field(default_factory=list)
+    # ---- added in spec revision 2 ----
+    exploratory: bool = False  # not the pre-registered headline: adjusted level, capped at "promising"
+    n_ideas: int = 0  # ideas counted (closed + open, non-synthetic, non-frozen)
+    open_ideas: int = 0
+    closed_pnl: float = 0.0  # realised P&L of the closed ideas counted
+    open_pnl_liq: float = 0.0  # unrealised P&L at liquidation of the open ideas counted
+    clusters_race: int = 0
+    clusters_time: int = 0
+    df: Optional[int] = None  # G - 1
+    return_mean: Optional[float] = None  # mean P&L / cost per idea
+    return_ci_low: Optional[float] = None
+    return_ci_high: Optional[float] = None
+    days_covered: int = 0  # UTC days with >= 6 covered hours
+    wall_hours: Optional[float] = None
+    unvalued_positions: int = 0  # frozen (market closed without a ruling): left out, named in the sentence
+    unvalued_value: float = 0.0  # their last liquidation value
+    depth_unknown_share: Optional[float] = None  # share of equity marked without a real book in the last hour
+    swing_share: Optional[float] = None  # |national tilt| x national_swing_sd_pts / equity: one-swing exposure
+    top_race_share: Optional[float] = None  # largest single race's share of |pnl_liq|
+    synthetic_excluded: int = 0  # replays: ideas with candle / synthetic fills left out
 
 
 @dataclass
@@ -937,6 +1105,17 @@ class PortfolioSummary(_Serializable):
     sizing: Optional[Dict[str, Any]] = None  # SizingPolicy.explain()
     verdict: Optional[Verdict] = None
     last_step_at: Optional[float] = None
+    # ---- added in spec revision 2 ----
+    headline: bool = False  # the one pre-registered portfolio
+    exploratory: bool = True
+    latency_s: Optional[float] = None  # this portfolio's fill latency (human speed: 240 s)
+    unvalued: float = 0.0  # last liquidation value of frozen positions (left out of equity_liq / pnl_liq)
+    depth_unknown_share: Optional[float] = None  # share of equity_liq marked "unknown" (no real book within 1 h)
+    depth_stale_share: Optional[float] = None  # share marked from a real book 15-60 min old
+    swing_risk: Optional[float] = None  # SUSQies lost by a one-sd (3-point) national swing against the portfolio
+    # kind -> {"entries", "filled", "fill_rate", "avg_slippage", "unfilled", "unfilled_pnl_now", "exits", "avg_exit_slippage"}
+    execution: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    no_trade_reason: Optional[str] = None  # plain sentence when the portfolio has no fills (why: no data vs no edge)
 
 
 @dataclass
@@ -954,7 +1133,35 @@ class StepReport(_Serializable):
     trade_reads: int = 0
     reads_skipped: int = 0  # wanted but not read (budget)
     errors: List[str] = field(default_factory=list)
-    duration_s: Optional[float] = None
+    duration_s: Optional[float] = None  # measured with the injected clock (0.0 on a SimClock)
+    # ---- added in spec revision 2 ----
+    sets_deferred: int = 0  # set entries waiting for fresh books of every leg
+    tape_gaps: int = 0  # tape reads that came back full and could not be paged within budget
+    gap_s: Optional[float] = None  # time since the previous step when it exceeded 3 x interval
+
+
+@dataclass
+class SignalEvent(_Serializable):
+    """One signal in the event study (study.py, §6.14): what trading it at the decision touch would
+    show at fixed horizons, net of the spread, whether or not any portfolio traded it."""
+
+    event_id: str  # "<idea_id>@<int(t0)>"
+    idea_id: str
+    kind: str  # "value" | "basket"
+    t0: float  # decision time of the first appearance in this episode
+    exchange_ids: List[str] = field(default_factory=list)
+    sides: List[str] = field(default_factory=list)
+    race_key: Optional[str] = None
+    direction: str = "N"  # "D" | "R" | "N" (clusters)
+    entry: float = 0.0  # cost per unit at the decision touch (contract ask; set: sum of leg asks)
+    fair_value: Optional[float] = None  # value: the contract's fair value at t0
+    gap: Optional[float] = None  # value: fair value - entry; basket: set edge at t0
+    traded: bool = False  # some portfolio placed an order for it
+    # horizon label ("5m", "30m", "2h", "6h") -> exit value at the touch minus entry, per unit (None: no quote)
+    outcomes: Dict[str, Optional[float]] = field(default_factory=dict)
+    converged: Dict[str, Optional[bool]] = field(default_factory=dict)  # half the gap closed by the CUP moving
+    reversed: Dict[str, Optional[bool]] = field(default_factory=dict)  # the gap closed because the OUTSIDE value moved toward the Cup
+    done: bool = False  # every horizon observed (or past by more than 2 x interval)
 
 
 # --------------------------------------------------------------------------- backtest
@@ -976,6 +1183,11 @@ class BacktestConfig(_Serializable):
     paper: PaperConfig = field(default_factory=PaperConfig)
     params_overrides: Dict[str, Any] = field(default_factory=dict)  # StrategyParams field -> value
     label: str = ""
+    # ---- added in spec revision 2 ----
+    candle_fill_cap: float = 50.0  # shares per candle trade-through fill (5m candles only), at most
+    use_history_fair_values: bool = True  # also replay imported outside history (source "history", indicative)
+    time_budget_s: Optional[float] = None  # stop early (report says so) after this much wall time; the dashboard passes 120
+    live_run_started_at: Optional[float] = None  # the live paper run's start, for the overlap warning
 
 
 @dataclass
@@ -993,3 +1205,9 @@ class BacktestReport(_Serializable):
     verdicts: Dict[str, Verdict] = field(default_factory=dict)
     sweep: Optional[List[Dict[str, Any]]] = None  # [{"params", "label", "pnl_liq", "trades_closed", "verdict_level", "max_drawdown"}]
     warnings: List[str] = field(default_factory=list)
+    # ---- added in spec revision 2 ----
+    # kind -> {"status": "testable" | "partial" | "not_testable" | "not_replayable", "hours": float, "sentence": str}
+    testability: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    study: Optional[Dict[str, Any]] = None  # SignalStudy.summary() over the replay (§6.14)
+    overlap_hours: Optional[float] = None  # hours of the window that the live paper run also saw
+    stopped_early: bool = False  # hit time_budget_s

@@ -1414,6 +1414,7 @@ import re  # noqa: E402
 from dataclasses import dataclass as _dataclass, field as _field  # noqa: E402
 
 from .models import (  # noqa: E402
+    BetShape,
     FairValue,
     RaceRef,
     StrategyInputs,
@@ -1460,23 +1461,59 @@ def called_prob(race: Optional[RaceRef], favourite_price: Optional[float], param
     raise NotImplementedError
 
 
-def regime_ev(resolution_gap: float, convergence_gain: float, regime: str, called: float,
-              params: StrategyParams, *, settles_before_end: Optional[bool] = None) -> Tuple[float, str]:
-    """Expected value per share of holding a contract, under the settlement regime (§5.2):
+def regime_ev(q: float, entry: float, cup_mid: float, regime: str, called: float, params: StrategyParams, *,
+              settles_before_end: Optional[bool] = None) -> Tuple[float, str, Dict[str, float]]:
+    """Expected value per share of holding a contract bought at ``entry`` whose fair value is ``q``, under
+    the settlement regime (§5.2, revision 2). ``cup_mid`` is the contract's Cup mid at the decision.
 
-    * resolved_outcomes, or the market settles before the Cup end: ``resolution_gap`` (fair - entry);
-    * vwap_closeout: ``called * resolution_gap + (1 - called) * unconverged_share * convergence_gain``;
+    * resolved_outcomes, or the market settles before the Cup end: ``ev = q - entry``;
+    * vwap_closeout: the race is called before the closeout with probability ``called`` (payoff 1/0,
+      expected ``q_called``) or is still uncalled (the closeout VWAP is ``q_uncalled - (1 - unconverged_share)
+      x g`` with ``g = q - cup_mid``, the Cup mispricing that persists). With ``q_uncalled = 0.5 + (q - 0.5)
+      x uncalled_shrink`` and ``q_called = clip((q - (1 - called) x q_uncalled) / called, 0, 1)`` (so the two
+      branches average to q), ``ev = called x (q_called - entry) + (1 - called) x (q_uncalled - (1 -
+      unconverged_share) x g - entry)``, which simplifies to ``q - entry - (1 - called) x (1 -
+      unconverged_share) x g`` when q_called is not clipped. A favourite still uncalled closes near 0.5-0.6,
+      so its uncalled branch is a LOSS; this is a documented heuristic, and the rationale says so;
     * unknown: the smaller of the two.
 
-    Returns (ev, one sentence saying which rule applied)."""
+    Returns (ev, one sentence saying which rule applied, detail ``{"q_called", "q_uncalled", "called_payoff",
+    "uncalled_payoff"}``; empty detail for the resolved rule)."""
+    raise NotImplementedError
+
+
+def factor_delta(race: Optional[RaceRef], side: str, p_yes: Optional[float], params: StrategyParams) -> float:
+    """SUSQies gained per share for a 1-point national swing toward Democrats (§5.6.1): with ``s =
+    params.race_margin_sd_pts``, a YES share of the D leg gains ``phi(Phi^-1(p)) / s`` (``p`` = the leg's YES
+    probability: usable fair value, else the Cup mid, clipped to [0.01, 0.99]); YES-R the negative of its own
+    value; NO flips the sign. Parties other than D/R, no race, or ``p_yes`` None: 0.0. Chamber-control legs
+    use the same formula (a heuristic)."""
+    raise NotImplementedError
+
+
+def growth_score(bet: Optional[BetShape], edge: Optional[float], confidence: float, entry: Optional[float]) -> float:
+    """The ranking score of every trade idea (§5.1, revision 2): expected profit in percent of equity at the
+    conservative capped size, times confidence: ``100 x confidence x edge x u`` with ``u`` = units per unit of
+    equity = ``min(0.25 x (p / loss - (1 - p) / gain), 0.08 / cost)`` for binary / bracket / bounded bets,
+    ``0.08 / cost`` for riskless sets and ``cap_pct / cost`` for fixed (hole) bets; 0 when anything is
+    missing or non-positive. Ranks a 0.50 toss-up with a 5-cent edge above a 0.10 longshot with a 2-cent edge."""
+    raise NotImplementedError
+
+
+def value_limit(q: float, entry: float, cup_mid: float, target_exit: float, regime: str, called: float,
+                required: float, params: StrategyParams, *, settles_before_end: Optional[bool] = None) -> Optional[float]:
+    """The worst contract price a value order accepts (§5.1): the highest tick ``L`` in
+    ``[entry, floor_tick(entry + 0.5 x ev(entry))]`` whose MARGINAL ev (regime_ev at L) and convergence gain
+    (``target_exit - L``) are both ``>= required``; None when even ``L = entry`` fails."""
     raise NotImplementedError
 
 
 def value_opportunity(exchange_id: str, fv: FairValue, point: Optional[PricePoint], info: Optional[ExchangeInfo],
                       race: Optional[RaceRef], inputs: StrategyInputs, params: StrategyParams) -> Optional[Opportunity]:
     """Buy the side the outside fair value says is cheap, net of the spread and the exit cost, with a
-    regime-aware edge (§5.2). None when no side clears ``min_value_edge``, the fair value is not
-    usable / too old, or the quote is one-sided."""
+    regime-aware edge that must clear ``min_value_edge`` PLUS the fair value's own uncertainty (§5.2). None
+    when no side clears it, the fair value is not usable / too old / suspect / jumping, the Cup moved away
+    from it since it was fetched, or the quote is one-sided."""
     raise NotImplementedError
 
 
@@ -1488,12 +1525,16 @@ def group_races(infos: Mapping[str, ExchangeInfo], races: Mapping[str, RaceRef],
 
 def basket_opportunities(inputs: StrategyInputs, params: StrategyParams) -> List[Opportunity]:
     """NO baskets (YES bids sum > 1 + basket_min_edge) on every group, YES baskets (YES asks sum <
-    1 - basket_min_edge) only on exhaustive groups; depth-limited, with an early-exit plan (§5.3)."""
+    1 - basket_min_edge) only on exhaustive groups; every leg needs a TICK quote from the same bulk snapshot
+    (|dts| <= same_snapshot_s, never candles); bet "riskless" only under resolved_outcomes or when every
+    leg's race is a fast count, else "bounded"; depth-limited, with an early-exit plan (§5.3)."""
     raise NotImplementedError
 
 
 def hole_opportunities(inputs: StrategyInputs, params: StrategyParams) -> List[Opportunity]:
-    """Resting maker bids far below liquid favourites to catch liquidity holes (§5.4)."""
+    """Resting maker bids far below liquid favourites to catch liquidity holes (§5.4). An outcome in
+    ``inputs.resting_exchanges`` keeps its idea without a fresh book while its last stored book is at most
+    2 x book_max_age_s old and the bulk quote still meets the spread and mid rules."""
     raise NotImplementedError
 
 

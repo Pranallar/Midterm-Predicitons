@@ -14,6 +14,9 @@ it against live data before use (active, not closed, a 2026 event, the party tag
 that fails validation is dropped, never guessed. Rows are keyed by ``(race_key, party)``; the
 Super Market ids are only a cross-check (match by parsed title, never by id).
 
+Revision 2: the Kentucky Senate rows were pinned to ``SENATELA-26-D/R`` (the Louisiana race) in the
+source file; those two Kalshi pins are blanked (provably wrong, not guessed), leaving 220 Kalshi pins.
+
 Columns: race_key, party, polymarket_market_id ("" = none), polymarket_label, kalshi_ticker
 ("" = none), match_kind ("EXACT" | "NEAR": chamber control and Independent legs settle on
 different wording), sig_market_id, sig_exchange_id, sig_title.
@@ -216,8 +219,8 @@ PINS: Tuple[Tuple[str, str, str, str, str, str, str, str, str], ...] = (
     ('2026:SENATE:IL', 'R', '630721', 'Don Tracy (R) - Illinois Senate Election Winner', 'SENATEIL-26-R', 'EXACT', '265', '954', 'Will the Republican Party win the Illinois Senate?'),
     ('2026:SENATE:KS', 'D', '630746', 'Adam Hamilton (D) - Kansas Senate Election Winner', 'SENATEKS-26-D', 'EXACT', '356', '1045', 'Will the Democratic Party win the Kansas Senate?'),
     ('2026:SENATE:KS', 'R', '630747', 'Roger Marshall (R) - Kansas Senate Election Winner', 'SENATEKS-26-R', 'EXACT', '357', '1046', 'Will the Republican Party win the Kansas Senate?'),
-    ('2026:SENATE:KY', 'D', '630759', 'Charles Booker (D) - Kentucky Senate Election Winner', 'SENATELA-26-D', 'EXACT', '266', '955', 'Will the Democratic Party win the Kentucky Senate?'),
-    ('2026:SENATE:KY', 'R', '630760', 'Andy Barr (R) - Kentucky Senate Election Winner', 'SENATELA-26-R', 'EXACT', '267', '956', 'Will the Republican Party win the Kentucky Senate?'),
+    ('2026:SENATE:KY', 'D', '630759', 'Charles Booker (D) - Kentucky Senate Election Winner', '', 'EXACT', '266', '955', 'Will the Democratic Party win the Kentucky Senate?'),
+    ('2026:SENATE:KY', 'R', '630760', 'Andy Barr (R) - Kentucky Senate Election Winner', '', 'EXACT', '267', '956', 'Will the Republican Party win the Kentucky Senate?'),
     ('2026:SENATE:LA', 'D', '634878', 'Jamie Davis (D) - Louisiana Senate Election Winner', 'KXSENATELA-26NOV-D', 'EXACT', '268', '957', 'Will the Democratic Party win the Louisiana Senate?'),
     ('2026:SENATE:LA', 'R', '634879', 'Julia Letlow (R) - Louisiana Senate Election Winner', 'KXSENATELA-26NOV-R', 'EXACT', '269', '958', 'Will the Republican Party win the Louisiana Senate?'),
     ('2026:SENATE:MA', 'D', '630790', 'Ed Markey (D) - Massachusetts Senate Election Winner', 'SENATEMA-26-D', 'EXACT', '379', '1068', 'Will the Democratic Party win the Massachusetts Senate?'),
