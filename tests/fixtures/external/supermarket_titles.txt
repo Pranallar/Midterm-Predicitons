@@ -1,0 +1,273 @@
+# Super Market (sig.thesuper.market) Susquehanna Predictions Cup, tournament slug "midterm-elections"
+# (id bda92870-621e-47b0-bc3c-3602c5c26f55, startDate 2026-10-01T16:00:00Z, endDate 2026-11-04T17:00:00Z, initialBalance 100000,
+#  marketCount 237, memberCount 3255 at capture ~2026-10-01: raw_captured/sig-tournament.json from github.com/nullif1ed/sigprediction).
+#
+# ALL 237 MARKETS. Titles + SIG market/exchange ids from github.com/DanielCWeng/predictions-cup data/mappings/sig_polymarket_2026.csv
+# (commit fb4f6c6, 2026-10-04; that participant marks every row VERIFIED). Cross-check: the 13 markets in raw_captured/sig-markets.json
+# (sigprediction capture, 2026-10-01) match these ids, exchange ids and titles exactly. VERIFY against your own GET /markets before relying on any id.
+#
+# TITLE GRAMMAR (all 237 match):  ^Will the (Democratic|Republican|Independent) Party win the (.+)\?$
+#   race part:  "U.S. House" | "U.S. Senate"                          -> chamber control
+#               "<State full name> Senate" | "<State full name> Governor"
+#               "<ST>-<NN> House race"   (two-digit district, e.g. "ME-02 House race", "AZ-01 House race")
+# Counts: 92 House-race markets, 71 Governor, 70 Senate, 4 chamber-control; parties D=117 R=117 I=3.
+# PAIRING: 117 races = 114 two-market races (D+R) + 3 three-market races (D+R+I: Rhode Island Governor, Montana Senate, Nebraska Senate).
+#   Every market is a separate BINARY market with exactly ONE exchange, option "YES", initialPrice 0.5, isMultiOutcome false, isComposite false.
+#   Pair by the parsed race key, NEVER by adjacent ids (FL-09: D = 211, R = 322; VA-01: R = 249, D = 342).
+#   exchange id = market id + 689 for all 237 rows (asserted by _build_titles.py) but read exchanges[0].id rather than relying on it.
+#   Legs of a race are mutually exclusive but not guaranteed exhaustive (a winner from an unlisted party makes every listed leg NO):
+#   a YES basket (sum of YES asks < 1) is NOT riskless; a NO basket (sum of YES bids > 1, buy NO on every leg) is.
+# CATEGORIES: "Election Outcome" (state races) and "Freeform" (U.S. House control) seen in the 13 captured markets; "?" = not captured.
+# settlementDate "2026-11-04T17:00:00.000Z" (= Cup end) on every captured market; settledWith/settledOn null.
+# NOT IN THE CUP: Ohio (Senate special and Governor), and e.g. Pennsylvania/Wisconsin/Arizona/Nevada Senate (not up in 2026), NC Governor.
+#
+# EXTERNAL MAPPINGS (other participants' work, unverified by us):
+#   pm_winner_id / pm_label: market in Polymarket's "<Race> Election Winner" event + its groupItemTitle, from github.com/grissou/prediction-market-maker
+#     ref_map.json (commit a49587c, 2026-10-01; name matching + hand review). For NH/ME/GA/NE/LA Senate, AZ-01, ME-02 and chamber control these ids
+#     AGREE with Daniel's independent mapping. Empty = no party-level winner market found (AK Senate/Governor, CA Governor, CA-22; CA-22 has Daniel EXACT ids).
+#   daniel_class / daniel_pm: DanielCWeng's class. EXACT/NEAR = one Polymarket market (id shown); DERIVED = sum of that party's margin-of-victory
+#     buckets in one negRisk event (bucket count shown); NO_TRADE = only candidate-specific external markets, fail closed.
+#   kalshi_ticker: from github.com/christiano7777777/sig-arb-bot kalshi_map.json (commit a209d57, 2026-10-05). "*" = chamber tickers taken from
+#     sigprediction lib/core/races.ts and sig-arb-bot config.py (CONTROLS-2026-D/R, CONTROLH-2026-D/R). Empty = not mapped (independent legs,
+#     MT/NE Senate, RI/KS/NH/AK Governor). Kalshi naming: SENATE<ST>-26, SENATEFLS-26 (FL special), KXSENATELA-26NOV (LA), GOVPARTY<ST>-26,
+#     HOUSE<ST><N>-26 (legacy) or KXHOUSERACE-<ST><NN>-26 (newer); market ticker = event ticker + "-D" / "-R".
+#
+# Columns are TAB-separated.
+sig_market_id	sig_exchange_id	race_key	party	category	title	pm_winner_id	pm_label	daniel_class	daniel_pm	kalshi_ticker
+368	1057	2026:GOVERNOR:AK	D	?	Will the Democratic Party win the Alaska Governor?			NO_TRADE	-	
+369	1058	2026:GOVERNOR:AK	R	?	Will the Republican Party win the Alaska Governor?			NO_TRADE	-	
+155	844	2026:GOVERNOR:AL	D	?	Will the Democratic Party win the Alabama Governor?	629270	Doug Jones (D) - Alabama Governor Election Winner	EXACT	3364285	GOVPARTYAL-26-D
+156	845	2026:GOVERNOR:AL	R	?	Will the Republican Party win the Alabama Governor?	629271	Tommy Tuberville (R) - Alabama Governor Election Winner	DERIVED	sum_of_7_margin_buckets	GOVPARTYAL-26-R
+157	846	2026:GOVERNOR:AR	D	?	Will the Democratic Party win the Arkansas Governor?	629283	Fredrick Love (D) - Arkansas Governor Election Winner	EXACT	3365538	GOVPARTYAR-26-D
+158	847	2026:GOVERNOR:AR	R	?	Will the Republican Party win the Arkansas Governor?	629284	Sarah Huckabee Sanders (R) - Arkansas Governor Election Winner	DERIVED	sum_of_8_margin_buckets	GOVPARTYAR-26-R
+159	848	2026:GOVERNOR:AZ	D	?	Will the Democratic Party win the Arizona Governor?	629183	Katie Hobbs (D) - Arizona Governor Election Winner	DERIVED	sum_of_7_margin_buckets	GOVPARTYAZ-26-D
+160	849	2026:GOVERNOR:AZ	R	?	Will the Republican Party win the Arizona Governor?	629184	Andy Biggs (R) - Arizona Governor Election Winner	DERIVED	sum_of_3_margin_buckets	GOVPARTYAZ-26-R
+161	850	2026:GOVERNOR:CA	D	?	Will the Democratic Party win the California Governor?			NO_TRADE	-	GOVPARTYCA-26-D
+162	851	2026:GOVERNOR:CA	R	?	Will the Republican Party win the California Governor?			NO_TRADE	-	GOVPARTYCA-26-R
+163	852	2026:GOVERNOR:CO	D	?	Will the Democratic Party win the Colorado Governor?	629296	Phil Weiser (D) - Colorado Governor Election Winner	DERIVED	sum_of_9_margin_buckets	GOVPARTYCO-26-D
+164	853	2026:GOVERNOR:CO	R	?	Will the Republican Party win the Colorado Governor?	629297	Victor Marx (R) - Colorado Governor Election Winner	EXACT	3365543	GOVPARTYCO-26-R
+298	987	2026:GOVERNOR:CT	D	?	Will the Democratic Party win the Connecticut Governor?	629311	Ned Lamont (D) - Connecticut Governor Election Winner	DERIVED	sum_of_7_margin_buckets	GOVPARTYCT-26-D
+165	854	2026:GOVERNOR:CT	R	?	Will the Republican Party win the Connecticut Governor?	629312	Ryan Fazio (R) - Connecticut Governor Election Winner	EXACT	3365563	GOVPARTYCT-26-R
+299	988	2026:GOVERNOR:FL	D	?	Will the Democratic Party win the Florida Governor?	629324	David Jolly (D) - Florida Governor Election Winner	DERIVED	sum_of_3_margin_buckets	GOVPARTYFL-26-D
+300	989	2026:GOVERNOR:FL	R	?	Will the Republican Party win the Florida Governor?	629325	Byron Donalds (R)  - Florida Governor Election Winner	DERIVED	sum_of_7_margin_buckets	GOVPARTYFL-26-R
+166	855	2026:GOVERNOR:GA	D	?	Will the Democratic Party win the Georgia Governor?	629337	Keisha Lance Bottoms (D) - Georgia Governor Election Winner	DERIVED	sum_of_5_margin_buckets	GOVPARTYGA-26-D
+167	856	2026:GOVERNOR:GA	R	?	Will the Republican Party win the Georgia Governor?	629338	Rick Jackson (R) - Georgia Governor Election Winner	DERIVED	sum_of_5_margin_buckets	GOVPARTYGA-26-R
+301	990	2026:GOVERNOR:HI	D	?	Will the Democratic Party win the Hawaii Governor?	629350	Josh Green (D) - Hawaii Governor Election Winner	DERIVED	sum_of_9_margin_buckets	GOVPARTYHI-26-D
+302	991	2026:GOVERNOR:HI	R	?	Will the Republican Party win the Hawaii Governor?	629351	Gary Cordery (R) - Hawaii Governor Election Winner	EXACT	3365597	GOVPARTYHI-26-R
+168	857	2026:GOVERNOR:IA	D	?	Will the Democratic Party win the Iowa Governor?	629397	Rob Sand (D) - Iowa Governor Election Winner	DERIVED	sum_of_5_margin_buckets	GOVPARTYIA-26-D
+169	858	2026:GOVERNOR:IA	R	?	Will the Republican Party win the Iowa Governor?	629398	Zach Lahn (R) - Iowa Governor Election Winner	DERIVED	sum_of_5_margin_buckets	GOVPARTYIA-26-R
+170	859	2026:GOVERNOR:ID	D	?	Will the Democratic Party win the Idaho Governor?	629363	Terri Pickens (D) - Idaho Governor Election Winner	EXACT	3365657	GOVPARTYID-26-D
+171	860	2026:GOVERNOR:ID	R	?	Will the Republican Party win the Idaho Governor?	629364	Brad Little (R) - Idaho Governor Election Winner	DERIVED	sum_of_10_margin_buckets	GOVPARTYID-26-R
+172	861	2026:GOVERNOR:IL	D	?	Will the Democratic Party win the Illinois Governor?	629376	JB Pritzker (D) - Illinois Governor Election Winner	DERIVED	sum_of_7_margin_buckets	GOVPARTYIL-26-D
+173	862	2026:GOVERNOR:IL	R	?	Will the Republican Party win the Illinois Governor?	629377	Darren Bailey (R) - Illinois Governor Election Winner	EXACT	3365667	GOVPARTYIL-26-R
+303	992	2026:GOVERNOR:KS	D	?	Will the Democratic Party win the Kansas Governor?	629412	Cindy Holscher (D) - Kansas Governor Election Winner	DERIVED	sum_of_3_margin_buckets	
+304	993	2026:GOVERNOR:KS	R	?	Will the Republican Party win the Kansas Governor?	629413	Ty Masterson (R) - Kansas Governor Election Winner	DERIVED	sum_of_7_margin_buckets	
+370	1059	2026:GOVERNOR:MA	D	?	Will the Democratic Party win the Massachusetts Governor?	629451	Maura Healey (D) - Massachusetts Governor Election Winner	DERIVED	sum_of_9_margin_buckets	GOVPARTYMA-26-D
+371	1060	2026:GOVERNOR:MA	R	?	Will the Republican Party win the Massachusetts Governor?	629452	Michael Minogue (R) - Massachusetts Governor Election Winner	EXACT	3367206	GOVPARTYMA-26-R
+174	863	2026:GOVERNOR:MD	D	?	Will the Democratic Party win the Maryland Governor?	629438	Wes Moore (D) - Maryland Governor Election Winner	DERIVED	sum_of_9_margin_buckets	GOVPARTYMD-26-D
+175	864	2026:GOVERNOR:MD	R	?	Will the Republican Party win the Maryland Governor?	629439	Dan Cox (R) - Maryland Governor Election Winner	EXACT	3365743	GOVPARTYMD-26-R
+176	865	2026:GOVERNOR:ME	D	?	Will the Democratic Party win the Maine Governor?	629425	Hannah Pingree (D) - Maine Governor Election Winner	DERIVED	sum_of_6_margin_buckets	GOVPARTYME-26-D
+177	866	2026:GOVERNOR:ME	R	?	Will the Republican Party win the Maine Governor?	629426	Robert Charles (R) - Maine Governor Election Winner	DERIVED	sum_of_2_margin_buckets	GOVPARTYME-26-R
+305	994	2026:GOVERNOR:MI	D	?	Will the Democratic Party win the Michigan Governor?	629464	Jocelyn Benson (D) - Michigan Governor Election Winner	DERIVED	sum_of_7_margin_buckets	GOVPARTYMI-26-D
+306	995	2026:GOVERNOR:MI	R	?	Will the Republican Party win the Michigan Governor?	629465	John James (R) - Michigan Governor Election Winner	DERIVED	sum_of_3_margin_buckets	GOVPARTYMI-26-R
+307	996	2026:GOVERNOR:MN	D	?	Will the Democratic Party win the Minnesota Governor?	629477	Amy Klobuchar (D) - Minnesota Governor Election Winner	DERIVED	sum_of_7_margin_buckets	GOVPARTYMN-26-D
+308	997	2026:GOVERNOR:MN	R	?	Will the Republican Party win the Minnesota Governor?	629478	Lisa Demuth (R) - Minnesota Governor Election Winner	EXACT	3369107	GOVPARTYMN-26-R
+178	867	2026:GOVERNOR:NE	D	Election Outcome	Will the Democratic Party win the Nebraska Governor?	629490	Lynne Walz (D) - Nebraska Governor Election Winner	EXACT	3369148	GOVPARTYNE-26-D
+179	868	2026:GOVERNOR:NE	R	Election Outcome	Will the Republican Party win the Nebraska Governor?	629491	Jim Pillen (R) - Nebraska Governor Election Winner	DERIVED	sum_of_8_margin_buckets	GOVPARTYNE-26-R
+372	1061	2026:GOVERNOR:NH	D	?	Will the Democratic Party win the New Hampshire Governor?	629518	Cinde Warmington (D) - New Hampshire Governor Election Winner	DERIVED	sum_of_3_margin_buckets	
+373	1062	2026:GOVERNOR:NH	R	?	Will the Republican Party win the New Hampshire Governor?	629519	Kelly Ayotte (R) - New Hampshire Governor Election Winner	DERIVED	sum_of_7_margin_buckets	
+180	869	2026:GOVERNOR:NM	D	?	Will the Democratic Party win the New Mexico Governor?	629531	Deb Haaland (D) - New Mexico Governor Election Winner	DERIVED	sum_of_6_margin_buckets	GOVPARTYNM-26-D
+181	870	2026:GOVERNOR:NM	R	?	Will the Republican Party win the New Mexico Governor?	629532	Gregg Hull (R) - New Mexico Governor Election Winner	DERIVED	sum_of_2_margin_buckets	GOVPARTYNM-26-R
+182	871	2026:GOVERNOR:NV	D	?	Will the Democratic Party win the Nevada Governor?	629505	Aaron Ford (D) - Nevada Governor Election Winner	DERIVED	sum_of_5_margin_buckets	GOVPARTYNV-26-D
+183	872	2026:GOVERNOR:NV	R	?	Will the Republican Party win the Nevada Governor?	629506	Joe Lombardo (R) - Nevada Governor Election Winner	DERIVED	sum_of_5_margin_buckets	GOVPARTYNV-26-R
+184	873	2026:GOVERNOR:NY	D	?	Will the Democratic Party win the New York Governor?	629544	Kathy Hochul (D) - New York Governor Election Winner	DERIVED	sum_of_8_margin_buckets	GOVPARTYNY-26-D
+185	874	2026:GOVERNOR:NY	R	?	Will the Republican Party win the New York Governor?	629545	Bruce Blakeman (R) - New York Governor Election Winner	EXACT	3369185	GOVPARTYNY-26-R
+186	875	2026:GOVERNOR:OK	D	?	Will the Democratic Party win the Oklahoma Governor?	629570	Cyndi Munson (D) - Oklahoma Governor Election Winner	EXACT	3369227	GOVPARTYOK-26-D
+374	1063	2026:GOVERNOR:OK	R	?	Will the Republican Party win the Oklahoma Governor?	629571	Mike Mazzei (R) - Oklahoma Governor Election Winner	DERIVED	sum_of_8_margin_buckets	GOVPARTYOK-26-R
+187	876	2026:GOVERNOR:OR	D	?	Will the Democratic Party win the Oregon Governor?	629583	Tina Kotek (D) - Oregon Governor Election Winner	DERIVED	sum_of_7_margin_buckets	GOVPARTYOR-26-D
+188	877	2026:GOVERNOR:OR	R	?	Will the Republican Party win the Oregon Governor?	629584	Christine Drazan (R) - Oregon Governor Election Winner	DERIVED	sum_of_3_margin_buckets	GOVPARTYOR-26-R
+189	878	2026:GOVERNOR:PA	D	?	Will the Democratic Party win the Pennsylvania Governor?	629614	Josh Shapiro (D) - Pennsylvania Governor Election Winner	DERIVED	sum_of_7_margin_buckets	GOVPARTYPA-26-D
+190	879	2026:GOVERNOR:PA	R	?	Will the Republican Party win the Pennsylvania Governor?	629615	Stacy Garrity (R) - Pennsylvania Governor Election Winner	EXACT	3369445	GOVPARTYPA-26-R
+384	1073	2026:GOVERNOR:RI	D	?	Will the Democratic Party win the Rhode Island Governor?	629627	Helena Foulkes (D) - Rhode Island Governor Election Winner	DERIVED	sum_of_8_margin_buckets	
+191	880	2026:GOVERNOR:RI	I	?	Will the Independent Party win the Rhode Island Governor?	629629	Independent - Rhode Island Governor Election Winner	EXACT	629629	
+385	1074	2026:GOVERNOR:RI	R	?	Will the Republican Party win the Rhode Island Governor?	629628	Republican - Rhode Island Governor Election Winner	EXACT	3369455	
+192	881	2026:GOVERNOR:SC	D	?	Will the Democratic Party win the South Carolina Governor?	629640	Jermaine Johnson (D) - South Carolina Governor Election Winner	DERIVED	sum_of_2_margin_buckets	GOVPARTYSC-26-D
+193	882	2026:GOVERNOR:SC	R	?	Will the Republican Party win the South Carolina Governor?	629641	Alan Wilson (R) - South Carolina Governor Election Winner	DERIVED	sum_of_6_margin_buckets	GOVPARTYSC-26-R
+194	883	2026:GOVERNOR:SD	D	?	Will the Democratic Party win the South Dakota Governor?	629653	Dan Ahlers (D) - South Dakota Governor Election Winner	EXACT	3369485	GOVPARTYSD-26-D
+309	998	2026:GOVERNOR:SD	R	?	Will the Republican Party win the South Dakota Governor?	629654	Larry Rhoden (R) - South Dakota Governor Election Winner	DERIVED	sum_of_9_margin_buckets	GOVPARTYSD-26-R
+310	999	2026:GOVERNOR:TN	D	?	Will the Democratic Party win the Tennessee Governor?	629666	Jerri Green (D) - Tennessee Governor Election Winner	EXACT	3369512	GOVPARTYTN-26-D
+311	1000	2026:GOVERNOR:TN	R	?	Will the Republican Party win the Tennessee Governor?	629667	Marsha Blackburn (R) - Tennessee Governor Election Winner	DERIVED	sum_of_9_margin_buckets	GOVPARTYTN-26-R
+195	884	2026:GOVERNOR:TX	D	?	Will the Democratic Party win the Texas Governor?	629690	Gina Hinojosa (D)  - Texas Governor Election Winner	DERIVED	sum_of_3_margin_buckets	GOVPARTYTX-26-D
+196	885	2026:GOVERNOR:TX	R	?	Will the Republican Party win the Texas Governor?	629691	Greg Abbott (R) - Texas Governor Election Winner	DERIVED	sum_of_7_margin_buckets	GOVPARTYTX-26-R
+312	1001	2026:GOVERNOR:VT	D	?	Will the Democratic Party win the Vermont Governor?	629707	Amanda Janoo (D) - Vermont Governor Election Winner	EXACT	3369552	GOVPARTYVT-26-D
+313	1002	2026:GOVERNOR:VT	R	?	Will the Republican Party win the Vermont Governor?	629708	Phil Scott (R) - Vermont Governor Election Winner	DERIVED	sum_of_7_margin_buckets	GOVPARTYVT-26-R
+314	1003	2026:GOVERNOR:WI	D	?	Will the Democratic Party win the Wisconsin Governor?	629720	David Crowley (D) - Wisconsin Governor Election Winner	DERIVED	sum_of_5_margin_buckets	GOVPARTYWI-26-D
+315	1004	2026:GOVERNOR:WI	R	?	Will the Republican Party win the Wisconsin Governor?	629721	Tom Tiffany (R) - Wisconsin Governor Election Winner	DERIVED	sum_of_5_margin_buckets	GOVPARTYWI-26-R
+316	1005	2026:GOVERNOR:WY	D	?	Will the Democratic Party win the Wyoming Governor?	629733	Kenneth Casner (D) - Wyoming Governor Election Winner	EXACT	3369565	GOVPARTYWY-26-D
+317	1006	2026:GOVERNOR:WY	R	?	Will the Republican Party win the Wyoming Governor?	629734	Eric Barlow (R) - Wyoming Governor Election Winner	DERIVED	sum_of_10_margin_buckets	GOVPARTYWY-26-R
+318	1007	2026:HOUSE:AL-02	D	?	Will the Democratic Party win the AL-02 House race?	1280801	Shomari Figures (D) - AL-02 House Election Winner	EXACT	1280801	KXHOUSERACE-AL02-26-D
+319	1008	2026:HOUSE:AL-02	R	?	Will the Republican Party win the AL-02 House race?	1280800	Rhett Marques (R) - AL-02 House Election Winner	EXACT	1280800	KXHOUSERACE-AL02-26-R
+197	886	2026:HOUSE:AZ-01	D	?	Will the Democratic Party win the AZ-01 House race?	942084	Amish Shah (D) - AZ-01 House Election Winner	EXACT	942084	HOUSEAZ1-26-D
+198	887	2026:HOUSE:AZ-01	R	?	Will the Republican Party win the AZ-01 House race?	942082	Jay Feely (R) - AZ-01 House Election Winner	EXACT	942082	HOUSEAZ1-26-R
+199	888	2026:HOUSE:AZ-06	D	?	Will the Democratic Party win the AZ-06 House race?	942162	JoAnna Mendoza (D) - AZ-06 House Election Winner	EXACT	942162	HOUSEAZ6-26-D
+200	889	2026:HOUSE:AZ-06	R	?	Will the Republican Party win the AZ-06 House race?	942159	Juan Ciscomani (R) - AZ-06 House Election Winner	EXACT	942159	HOUSEAZ6-26-R
+201	890	2026:HOUSE:CA-22	D	?	Will the Democratic Party win the CA-22 House race?			EXACT	703686	HOUSECA22-26-D
+202	891	2026:HOUSE:CA-22	R	?	Will the Republican Party win the CA-22 House race?			EXACT	703685	HOUSECA22-26-R
+203	892	2026:HOUSE:CA-48	D	?	Will the Democratic Party win the CA-48 House race?	1282825	Marni von Wilpert (D) - CA-48 House Election Winner	EXACT	1282825	KXHOUSERACE-CA48-26-D
+204	893	2026:HOUSE:CA-48	R	?	Will the Republican Party win the CA-48 House race?	1282824	Jim Desmond (R) - CA-48 House Election Winner	EXACT	1282824	KXHOUSERACE-CA48-26-R
+205	894	2026:HOUSE:CO-03	D	?	Will the Democratic Party win the CO-03 House race?	942304	Dwayne Romero (D) - CO-03 House Election Winner	EXACT	942304	HOUSECO3-26-D
+206	895	2026:HOUSE:CO-03	R	?	Will the Republican Party win the CO-03 House race?	942301	Jeff Hurd (R) - CO-03 House Election Winner	EXACT	942301	HOUSECO3-26-R
+207	896	2026:HOUSE:CO-04	D	?	Will the Democratic Party win the CO-04 House race?	1282881	Eileen Laubacher (D) - CO-04 House Election Winner	EXACT	1282881	KXHOUSERACE-CO04-26-D
+208	897	2026:HOUSE:CO-04	R	?	Will the Republican Party win the CO-04 House race?	1282880	Lauren Boebert (R) - CO-04 House Election Winner	EXACT	1282880	KXHOUSERACE-CO04-26-R
+209	898	2026:HOUSE:CO-08	D	?	Will the Democratic Party win the CO-08 House race?	942325	Manny Rutinel (D) - CO-08 House Election Winner	EXACT	942325	HOUSECO8-26-D
+210	899	2026:HOUSE:CO-08	R	?	Will the Republican Party win the CO-08 House race?	942324	Gabe Evans (R) - CO-08 House Election Winner	EXACT	942324	HOUSECO8-26-R
+320	1009	2026:HOUSE:FL-07	D	?	Will the Democratic Party win the FL-07 House race?	1283001	Bale Dalton (D) - FL-07 House Election Winner	EXACT	1283001	KXHOUSERACE-FL07-26-D
+321	1010	2026:HOUSE:FL-07	R	?	Will the Republican Party win the FL-07 House race?	1283000	Ryan Elijah (R) - FL-07 House Election Winner	EXACT	1283000	KXHOUSERACE-FL07-26-R
+211	900	2026:HOUSE:FL-09	D	?	Will the Democratic Party win the FL-09 House race?	1283017	Darren Soto (D) - FL-09 House Election Winner	EXACT	1283017	KXHOUSERACE-FL09-26-D
+322	1011	2026:HOUSE:FL-09	R	?	Will the Republican Party win the FL-09 House race?	1283016	Dan Green (R) - FL-09 House Election Winner	EXACT	1283016	KXHOUSERACE-FL09-26-R
+323	1012	2026:HOUSE:FL-13	D	?	Will the Democratic Party win the FL-13 House race?	942401	Leela Gray (D) - FL-13 House Election Winner	EXACT	942401	HOUSEFL13-26-D
+212	901	2026:HOUSE:FL-13	R	?	Will the Republican Party win the FL-13 House race?	942400	Anna Paulina Luna (R) - FL-13 House Election Winner	EXACT	942400	HOUSEFL13-26-R
+324	1013	2026:HOUSE:FL-16	D	?	Will the Democratic Party win the FL-16 House race?	1283065	Kelly Kirschner (D) - FL-16 House Election Winner	EXACT	1283065	KXHOUSERACE-FL16-26-D
+325	1014	2026:HOUSE:FL-16	R	?	Will the Republican Party win the FL-16 House race?	1283064	Sydney Gruters (R) - FL-16 House Election Winner	EXACT	1283064	KXHOUSERACE-FL16-26-R
+326	1015	2026:HOUSE:FL-20	D	?	Will the Democratic Party win the FL-20 House race?	1283097	Debbie Wasserman Schultz (D) - FL-20 House Election Winner	EXACT	1283097	KXHOUSERACE-FL20-26-D
+327	1016	2026:HOUSE:FL-20	R	?	Will the Republican Party win the FL-20 House race?	1283096	Brent Andersen (R) - FL-20 House Election Winner	EXACT	1283096	KXHOUSERACE-FL20-26-R
+328	1017	2026:HOUSE:FL-22	D	?	Will the Democratic Party win the FL-22 House race?	1283113	Pia Dandiya (D) - FL-22 House Election Winner	EXACT	1283113	KXHOUSERACE-FL22-26-D
+329	1018	2026:HOUSE:FL-22	R	?	Will the Republican Party win the FL-22 House race?	1283112	Casey Askar (R) - FL-22 House Election Winner	EXACT	1283112	KXHOUSERACE-FL22-26-R
+213	902	2026:HOUSE:IA-01	D	?	Will the Democratic Party win the IA-01 House race?	942433	Christina Bohannan (D) - IA-01 House Election Winner	EXACT	942433	HOUSEIA1-26-D
+214	903	2026:HOUSE:IA-01	R	?	Will the Republican Party win the IA-01 House race?	942432	Mariannette Miller-Meeks (R) - IA-01 House Election Winner	EXACT	942432	HOUSEIA1-26-R
+215	904	2026:HOUSE:IA-02	D	?	Will the Democratic Party win the IA-02 House race?	1283289	Lindsay James (D) - IA-02 House Election Winner	EXACT	1283289	KXHOUSERACE-IA02-26-D
+216	905	2026:HOUSE:IA-02	R	?	Will the Republican Party win the IA-02 House race?	1283288	Joe Mitchell (R) - IA-02 House Election Winner	EXACT	1283288	KXHOUSERACE-IA02-26-R
+217	906	2026:HOUSE:IA-03	D	?	Will the Democratic Party win the IA-03 House race?	942445	Sarah Trone Garriott (D) - IA-03 House Election Winner	EXACT	942445	HOUSEIA3-26-D
+218	907	2026:HOUSE:IA-03	R	?	Will the Republican Party win the IA-03 House race?	942444	Zach Nunn (R) - IA-03 House Election Winner	EXACT	942444	HOUSEIA3-26-R
+219	908	2026:HOUSE:KY-04	D	?	Will the Democratic Party win the KY-04 House race?	1283569	Melissa Strange (D) - KY-04 House Election Winner	EXACT	1283569	KXHOUSERACE-KY04-26-D
+220	909	2026:HOUSE:KY-04	R	?	Will the Republican Party win the KY-04 House race?	1283568	Ed Gallrein (R) - KY-04 House Election Winner	EXACT	1283568	KXHOUSERACE-KY04-26-R
+221	910	2026:HOUSE:ME-02	D	?	Will the Democratic Party win the ME-02 House race?	3006483	Matthew Dunlap (D) - ME-02 House Election Winner	EXACT	3006483	HOUSEME2-26-D
+222	911	2026:HOUSE:ME-02	R	?	Will the Republican Party win the ME-02 House race?	3006482	Paul LePage (R) - ME-02 House Election Winner	EXACT	3006482	HOUSEME2-26-R
+330	1019	2026:HOUSE:MI-07	D	?	Will the Democratic Party win the MI-07 House race?	942722	William Lawrence (D) - MI-07 House Election Winner	EXACT	942722	HOUSEMI7-26-D
+331	1020	2026:HOUSE:MI-07	R	?	Will the Republican Party win the MI-07 House race?	942721	Tom Barrett (R) - MI-07 House Election Winner	EXACT	942721	HOUSEMI7-26-R
+332	1021	2026:HOUSE:MI-10	D	?	Will the Democratic Party win the MI-10 House race?	942776	Christina Hines (D) - MI-10 House Election Winner	EXACT	942776	HOUSEMI10-26-D
+333	1022	2026:HOUSE:MI-10	R	?	Will the Republican Party win the MI-10 House race?	942774	Mike Bouchard (R) - MI-10 House Election Winner	EXACT	942774	HOUSEMI10-26-R
+334	1023	2026:HOUSE:MN-01	D	?	Will the Democratic Party win the MN-01 House race?	1283849	Jake Johnson (D) - MN-01 House Election Winner	EXACT	1283849	KXHOUSERACE-MN01-26-D
+335	1024	2026:HOUSE:MN-01	R	?	Will the Republican Party win the MN-01 House race?	1283848	Brad Finstad (R) - MN-01 House Election Winner	EXACT	1283848	KXHOUSERACE-MN01-26-R
+336	1025	2026:HOUSE:MN-02	D	?	Will the Democratic Party win the MN-02 House race?	942820	Matt Little (D) - MN-02 House Election Winner	EXACT	942820	HOUSEMN2-26-D
+337	1026	2026:HOUSE:MN-02	R	?	Will the Republican Party win the MN-02 House race?	942819	Eric Pratt (R) - MN-02 House Election Winner	EXACT	942819	HOUSEMN2-26-R
+338	1027	2026:HOUSE:MN-05	D	?	Will the Democratic Party win the MN-05 House race?	1283873	Ilhan Omar (D) - MN-05 House Election Winner	EXACT	1283873	KXHOUSERACE-MN05-26-D
+339	1028	2026:HOUSE:MN-05	R	?	Will the Republican Party win the MN-05 House race?	1283872	John Nagel (R) - MN-05 House Election Winner	EXACT	1283872	KXHOUSERACE-MN05-26-R
+223	912	2026:HOUSE:MT-01	D	?	Will the Democratic Party win the MT-01 House race?	942843	Sam Forstag (D) - MT-01 House Election Winner	EXACT	942843	HOUSEMT1-26-D
+224	913	2026:HOUSE:MT-01	R	?	Will the Republican Party win the MT-01 House race?	942841	Aaron Flint (R) - MT-01 House Election Winner	EXACT	942841	HOUSEMT1-26-R
+225	914	2026:HOUSE:NE-02	D	?	Will the Democratic Party win the NE-02 House race?	942878	Denise Powell (D) - NE-02 House Election Winner	EXACT	942878	HOUSENE2-26-D
+226	915	2026:HOUSE:NE-02	R	?	Will the Republican Party win the NE-02 House race?	942877	Brinker Harding (R) - NE-02 House Election Winner	EXACT	942877	HOUSENE2-26-R
+375	1064	2026:HOUSE:NH-01	D	?	Will the Democratic Party win the NH-01 House race?	942910	Stefany Shaheen (D) - NH-01 House Election Winner	EXACT	942910	HOUSENH1-26-D
+376	1065	2026:HOUSE:NH-01	R	?	Will the Republican Party win the NH-01 House race?	942909	Anthony DiLorenzo (R) - NH-01 House Election Winner	EXACT	942909	HOUSENH1-26-R
+227	916	2026:HOUSE:NJ-07	D	?	Will the Democratic Party win the NJ-07 House race?	942979	Rebecca Bennett (D) - NJ-07 House Election Winner	EXACT	942979	HOUSENJ7-26-D
+228	917	2026:HOUSE:NJ-07	R	?	Will the Republican Party win the NJ-07 House race?	942978	Thomas Kean Jr. (R) - NJ-07 House Election Winner	EXACT	942978	HOUSENJ7-26-R
+229	918	2026:HOUSE:NY-13	D	?	Will the Democratic Party win the NY-13 House race?	1284299	Darializa Avila Chevalier (D) - NY-13 House Election Winner	EXACT	1284299	KXHOUSERACE-NY13-26-D
+230	919	2026:HOUSE:NY-13	R	?	Will the Republican Party win the NY-13 House race?	1284298	Jomo Williams (R) - NY-13 House Election Winner	EXACT	1284298	KXHOUSERACE-NY13-26-R
+231	920	2026:HOUSE:NY-17	D	?	Will the Democratic Party win the NY-17 House race?	943441	Cait Conley (D) - NY-17 House Election Winner	EXACT	943441	HOUSENY17-26-D
+232	921	2026:HOUSE:NY-17	R	?	Will the Republican Party win the NY-17 House race?	943440	Mike Lawler (R) - NY-17 House Election Winner	EXACT	943440	HOUSENY17-26-R
+233	922	2026:HOUSE:PA-01	D	?	Will the Democratic Party win the PA-01 House race?	943749	Bob Harvie (D) - PA-01 House Election Winner	EXACT	943749	HOUSEPA1-26-D
+234	923	2026:HOUSE:PA-01	R	?	Will the Republican Party win the PA-01 House race?	943748	Brian Fitzpatrick (R) - PA-01 House Election Winner	EXACT	943748	HOUSEPA1-26-R
+235	924	2026:HOUSE:PA-07	D	?	Will the Democratic Party win the PA-07 House race?	943797	Bob Brooks (D) - PA-07 House Election Winner	EXACT	943797	HOUSEPA7-26-D
+236	925	2026:HOUSE:PA-07	R	?	Will the Republican Party win the PA-07 House race?	943796	Ryan Mackenzie (R) - PA-07 House Election Winner	EXACT	943796	HOUSEPA7-26-R
+237	926	2026:HOUSE:PA-08	D	?	Will the Democratic Party win the PA-08 House race?	943943	Paige Cognetti (D) - PA-08 House Election Winner	EXACT	943943	HOUSEPA8-26-D
+238	927	2026:HOUSE:PA-08	R	?	Will the Republican Party win the PA-08 House race?	943942	Rob Bresnahan (R) - PA-08 House Election Winner	EXACT	943942	HOUSEPA8-26-R
+239	928	2026:HOUSE:PA-10	D	?	Will the Democratic Party win the PA-10 House race?	943955	Janelle Stelson (D) - PA-10 House Election Winner	EXACT	943955	HOUSEPA10-26-D
+240	929	2026:HOUSE:PA-10	R	?	Will the Republican Party win the PA-10 House race?	943954	Scott Perry (R) - PA-10 House Election Winner	EXACT	943954	HOUSEPA10-26-R
+241	930	2026:HOUSE:SC-01	D	?	Will the Democratic Party win the SC-01 House race?	1284672	Nancy Lacore (D) - SC-01 House Election Winner	EXACT	1284672	KXHOUSERACE-SC01-26-D
+242	931	2026:HOUSE:SC-01	R	?	Will the Republican Party win the SC-01 House race?	1284671	Jenny Costa Honeycutt (R) - SC-01 House Election Winner	EXACT	1284671	KXHOUSERACE-SC01-26-R
+340	1029	2026:HOUSE:TN-05	D	?	Will the Democratic Party win the TN-05 House race?	1284768	Chaz Molder (D) - TN-05 House Election Winner	EXACT	1284768	KXHOUSERACE-TN05-26-D
+341	1030	2026:HOUSE:TN-05	R	?	Will the Republican Party win the TN-05 House race?	1284767	Charlie Hatcher (R) - TN-05 House Election Winner	EXACT	1284767	KXHOUSERACE-TN05-26-R
+243	932	2026:HOUSE:TX-15	D	?	Will the Democratic Party win the TX-15 House race?	944201	Bobby Pulido (D) - TX-15 House Election Winner	EXACT	944201	HOUSETX15-26-D
+244	933	2026:HOUSE:TX-15	R	?	Will the Republican Party win the TX-15 House race?	944199	Monica De La Cruz (R) - TX-15 House Election Winner	EXACT	944199	HOUSETX15-26-R
+245	934	2026:HOUSE:TX-23	D	?	Will the Democratic Party win the TX-23 House race?	1284960	Katy Padilla Stout (D) - TX-23 House Election Winner	EXACT	1284960	KXHOUSERACE-TX23-26-D
+246	935	2026:HOUSE:TX-23	R	?	Will the Republican Party win the TX-23 House race?	1284959	Brandon Herrera (R) - TX-23 House Election Winner	EXACT	1284959	KXHOUSERACE-TX23-26-R
+247	936	2026:HOUSE:TX-28	D	?	Will the Democratic Party win the TX-28 House race?	944222	Henry Cuellar (D) - TX-28 House Election Winner	EXACT	944222	HOUSETX28-26-D
+248	937	2026:HOUSE:TX-28	R	?	Will the Republican Party win the TX-28 House race?	944221	Tano Tijerina (R) - TX-28 House Election Winner	EXACT	944221	HOUSETX28-26-R
+342	1031	2026:HOUSE:VA-01	D	?	Will the Democratic Party win the VA-01 House race?	944282	Shannon Taylor (D) - VA-01 House Election Winner	EXACT	944282	HOUSEVA1-26-D
+249	938	2026:HOUSE:VA-01	R	?	Will the Republican Party win the VA-01 House race?	944281	Rob Wittman (R) - VA-01 House Election Winner	EXACT	944281	HOUSEVA1-26-R
+343	1032	2026:HOUSE:VA-02	D	?	Will the Democratic Party win the VA-02 House race?	944290	Elaine Luria (D) - VA-02 House Election Winner	EXACT	944290	HOUSEVA2-26-D
+250	939	2026:HOUSE:VA-02	R	?	Will the Republican Party win the VA-02 House race?	944289	Jen Kiggans (R) - VA-02 House Election Winner	EXACT	944289	HOUSEVA2-26-R
+344	1033	2026:HOUSE:VA-05	D	?	Will the Democratic Party win the VA-05 House race?	1285080	Tom Perriello (D) - VA-05 House Election Winner	EXACT	1285080	KXHOUSERACE-VA05-26-D
+345	1034	2026:HOUSE:VA-05	R	?	Will the Republican Party win the VA-05 House race?	1285079	John McGuire (R) - VA-05 House Election Winner	EXACT	1285079	KXHOUSERACE-VA05-26-R
+251	940	2026:HOUSE:VA-07	D	?	Will the Democratic Party win the VA-07 House race?	944298	Eugene Vindman (D) - VA-07 House Election Winner	EXACT	944298	HOUSEVA7-26-D
+346	1035	2026:HOUSE:VA-07	R	?	Will the Republican Party win the VA-07 House race?	944297	Doug Ollivant (R) - VA-07 House Election Winner	EXACT	944297	HOUSEVA7-26-R
+347	1036	2026:HOUSE:WA-03	D	?	Will the Democratic Party win the WA-03 House race?	944314	Marie Gluesenkamp Perez (D) - WA-03 House Election Winner	EXACT	944314	HOUSEWA3-26-D
+348	1037	2026:HOUSE:WA-03	R	?	Will the Republican Party win the WA-03 House race?	944313	John Braun (R) - WA-03 House Election Winner	EXACT	944313	HOUSEWA3-26-R
+349	1038	2026:HOUSE:WI-01	D	?	Will the Democratic Party win the WI-01 House race?	944334	Mitchell Berman (D) - WI-01 House Election Winner	EXACT	944334	HOUSEWI1-26-D
+350	1039	2026:HOUSE:WI-01	R	?	Will the Republican Party win the WI-01 House race?	944333	Bryan Steil (R) - WI-01 House Election Winner	EXACT	944333	HOUSEWI1-26-R
+351	1040	2026:HOUSE:WI-03	D	?	Will the Democratic Party win the WI-03 House race?	944342	Rebecca Cooke (D) - WI-03 House Election Winner	EXACT	944342	HOUSEWI3-26-D
+352	1041	2026:HOUSE:WI-03	R	?	Will the Republican Party win the WI-03 House race?	944341	Derrick Van Orden (R) - WI-03 House Election Winner	EXACT	944341	HOUSEWI3-26-R
+151	840	2026:HOUSE_CONTROL:US	D	Freeform	Will the Democratic Party win the U.S. House?	562802	Democratic Party - Which party will win the House in 2026? (added by hand)	NEAR	562802	CONTROLH-2026-D*
+152	841	2026:HOUSE_CONTROL:US	R	Freeform	Will the Republican Party win the U.S. House?	562803	Republican Party - Which party will win the House in 2026? (added by hand)	NEAR	562803	CONTROLH-2026-R*
+377	1066	2026:SENATE:AK	D	?	Will the Democratic Party win the Alaska Senate?			NO_TRADE	-	SENATEAK-26-D
+378	1067	2026:SENATE:AK	R	?	Will the Republican Party win the Alaska Senate?			NO_TRADE	-	SENATEAK-26-R
+252	941	2026:SENATE:AL	D	?	Will the Democratic Party win the Alabama Senate?	630627	Everett Wess (D) - Alabama Senate Election Winner	EXACT	3343108	SENATEAL-26-D
+253	942	2026:SENATE:AL	R	?	Will the Republican Party win the Alabama Senate?	630628	Barry Moore (R) - Alabama Senate Election Winner	DERIVED	sum_of_8_margin_buckets	SENATEAL-26-R
+254	943	2026:SENATE:AR	D	?	Will the Democratic Party win the Arkansas Senate?	630653	Hallie Shoffner (D) - Arkansas Senate Election Winner	EXACT	3343127	SENATEAR-26-D
+255	944	2026:SENATE:AR	R	?	Will the Republican Party win the Arkansas Senate?	630654	Tom Cotton (R)  - Arkansas Senate Election Winner	DERIVED	sum_of_9_margin_buckets	SENATEAR-26-R
+256	945	2026:SENATE:CO	D	?	Will the Democratic Party win the Colorado Senate?	630666	John Hickenlooper (D) - Colorado Senate Election Winner	DERIVED	sum_of_7_margin_buckets	SENATECO-26-D
+257	946	2026:SENATE:CO	R	?	Will the Republican Party win the Colorado Senate?	630667	Mark Baisley (R) - Colorado Senate Election Winner	EXACT	3343130	SENATECO-26-R
+353	1042	2026:SENATE:DE	D	Election Outcome	Will the Democratic Party win the Delaware Senate?	630679	Democrat - Delaware Senate Election Winner	DERIVED	sum_of_9_margin_buckets	SENATEDE-26-D
+386	1075	2026:SENATE:DE	R	Election Outcome	Will the Republican Party win the Delaware Senate?	630680	Republican - Delaware Senate Election Winner	EXACT	3343158	SENATEDE-26-R
+354	1043	2026:SENATE:FL	D	?	Will the Democratic Party win the Florida Senate?	631044	Angie Nixon (D) - Florida Senate Election Winner	DERIVED	sum_of_2_margin_buckets	SENATEFLS-26-D
+355	1044	2026:SENATE:FL	R	?	Will the Republican Party win the Florida Senate?	631045	Ashley Moody (R) - Florida Senate Election Winner	DERIVED	sum_of_8_margin_buckets	SENATEFLS-26-R
+258	947	2026:SENATE:GA	D	?	Will the Democratic Party win the Georgia Senate?	630692	Jon Ossoff (D)  - Georgia Senate Election Winner	EXACT	630692	SENATEGA-26-D
+259	948	2026:SENATE:GA	R	?	Will the Republican Party win the Georgia Senate?	630693	Mike Collins (R) - Georgia Senate Election Winner	EXACT	630693	SENATEGA-26-R
+260	949	2026:SENATE:IA	D	?	Will the Democratic Party win the Iowa Senate?	630733	Josh Turek (D) - Iowa Senate Election Winner	DERIVED	sum_of_5_margin_buckets	SENATEIA-26-D
+261	950	2026:SENATE:IA	R	?	Will the Republican Party win the Iowa Senate?	630734	Ashley Hinson (R) - Iowa Senate Election Winner	DERIVED	sum_of_5_margin_buckets	SENATEIA-26-R
+262	951	2026:SENATE:ID	D	?	Will the Democratic Party win the Idaho Senate?	630705	Democrat - Idaho Senate Election Winner	EXACT	3343316	SENATEID-26-D
+263	952	2026:SENATE:ID	R	?	Will the Republican Party win the Idaho Senate?	630706	Jim Risch (R) - Idaho Senate Election Winner	DERIVED	sum_of_9_margin_buckets	SENATEID-26-R
+264	953	2026:SENATE:IL	D	?	Will the Democratic Party win the Illinois Senate?	630720	Juliana Stratton (D) - Illinois Senate Election Winner	DERIVED	sum_of_8_margin_buckets	SENATEIL-26-D
+265	954	2026:SENATE:IL	R	?	Will the Republican Party win the Illinois Senate?	630721	Don Tracy (R) - Illinois Senate Election Winner	EXACT	3343321	SENATEIL-26-R
+356	1045	2026:SENATE:KS	D	?	Will the Democratic Party win the Kansas Senate?	630746	Adam Hamilton (D) - Kansas Senate Election Winner	EXACT	3343547	SENATEKS-26-D
+357	1046	2026:SENATE:KS	R	?	Will the Republican Party win the Kansas Senate?	630747	Roger Marshall (R) - Kansas Senate Election Winner	DERIVED	sum_of_7_margin_buckets	SENATEKS-26-R
+266	955	2026:SENATE:KY	D	?	Will the Democratic Party win the Kentucky Senate?	630759	Charles Booker (D) - Kentucky Senate Election Winner	EXACT	3343566	SENATELA-26-D
+267	956	2026:SENATE:KY	R	?	Will the Republican Party win the Kentucky Senate?	630760	Andy Barr (R) - Kentucky Senate Election Winner	DERIVED	sum_of_9_margin_buckets	SENATELA-26-R
+268	957	2026:SENATE:LA	D	?	Will the Democratic Party win the Louisiana Senate?	634878	Jamie Davis (D) - Louisiana Senate Election Winner	EXACT	634878	KXSENATELA-26NOV-D
+269	958	2026:SENATE:LA	R	?	Will the Republican Party win the Louisiana Senate?	634879	Julia Letlow (R) - Louisiana Senate Election Winner	EXACT	634879	KXSENATELA-26NOV-R
+379	1068	2026:SENATE:MA	D	?	Will the Democratic Party win the Massachusetts Senate?	630790	Ed Markey (D) - Massachusetts Senate Election Winner	DERIVED	sum_of_9_margin_buckets	SENATEMA-26-D
+380	1069	2026:SENATE:MA	R	?	Will the Republican Party win the Massachusetts Senate?	630791	John Deaton (R) - Massachusetts Senate Election Winner	EXACT	3343808	SENATEMA-26-R
+270	959	2026:SENATE:ME	D	?	Will the Democratic Party win the Maine Senate?	630772	Troy Jackson (D) - Maine Senate Election Winner	EXACT	630772	SENATEME-26-D
+271	960	2026:SENATE:ME	R	?	Will the Republican Party win the Maine Senate?	630773	Susan Collins (R) - Maine Senate Election Winner	EXACT	630773	SENATEME-26-R
+358	1047	2026:SENATE:MI	D	?	Will the Democratic Party win the Michigan Senate?	630805	Abdul El-Sayed (D) - Michigan Senate Election Winner	DERIVED	sum_of_5_margin_buckets	SENATEMI-26-D
+359	1048	2026:SENATE:MI	R	?	Will the Republican Party win the Michigan Senate?	630806	Mike Rogers (R) - Michigan Senate Election Winner	DERIVED	sum_of_5_margin_buckets	SENATEMI-26-R
+360	1049	2026:SENATE:MN	D	?	Will the Democratic Party win the Minnesota Senate?	630818	Peggy Flanagan (D) - Minnesota Senate Election Winner	DERIVED	sum_of_6_margin_buckets	SENATEMN-26-D
+361	1050	2026:SENATE:MN	R	?	Will the Republican Party win the Minnesota Senate?	630819	Michele Tafoya (R) - Minnesota Senate Election Winner	DERIVED	sum_of_2_margin_buckets	SENATEMN-26-R
+272	961	2026:SENATE:MS	D	?	Will the Democratic Party win the Mississippi Senate?	631017	Scott Colom (D) - Mississippi Senate Election Winner	EXACT	3343915	SENATEMS-26-D
+273	962	2026:SENATE:MS	R	?	Will the Republican Party win the Mississippi Senate?	631018	Cindy Hyde-Smith (R) - Mississippi Senate Election Winner	DERIVED	sum_of_7_margin_buckets	SENATEMS-26-R
+274	963	2026:SENATE:MT	D	?	Will the Democratic Party win the Montana Senate?	630831	Alani Bankhead (D) - Montana Senate Election Winner	EXACT	3364160	
+276	965	2026:SENATE:MT	I	?	Will the Independent Party win the Montana Senate?	630833	Independent - Montana Senate Election Winner	DERIVED	sum_of_2_margin_buckets	
+275	964	2026:SENATE:MT	R	?	Will the Republican Party win the Montana Senate?	630832	Kurt Alme (R)  - Montana Senate Election Winner	DERIVED	sum_of_8_margin_buckets	
+277	966	2026:SENATE:NC	D	?	Will the Democratic Party win the North Carolina Senate?	630883	Roy Cooper (D) - North Carolina Senate Election Winner	DERIVED	sum_of_7_margin_buckets	SENATENC-26-D
+278	967	2026:SENATE:NC	R	?	Will the Republican Party win the North Carolina Senate?	630884	Michael Whatley (R) - North Carolina Senate Election Winner	DERIVED	sum_of_3_margin_buckets	SENATENC-26-R
+279	968	2026:SENATE:NE	D	Election Outcome	Will the Democratic Party win the Nebraska Senate?	634891	Democrat - Nebraska Senate Election Winner	EXACT	634891	
+280	969	2026:SENATE:NE	I	Election Outcome	Will the Independent Party win the Nebraska Senate?	634893	Independent - Nebraska Senate Election Winner	EXACT	634893	
+281	970	2026:SENATE:NE	R	Election Outcome	Will the Republican Party win the Nebraska Senate?	634892	Pete Ricketts (R) - Nebraska Senate Election Winner	EXACT	634892	
+381	1070	2026:SENATE:NH	D	Election Outcome	Will the Democratic Party win the New Hampshire Senate?	630844	Chris Pappas (D) - New Hampshire Senate Election Winner	DERIVED	sum_of_7_margin_buckets	SENATENH-26-D
+382	1071	2026:SENATE:NH	R	Election Outcome	Will the Republican Party win the New Hampshire Senate?	630845	John E. Sununu (R) - New Hampshire Senate Election Winner	DERIVED	sum_of_3_margin_buckets	SENATENH-26-R
+282	971	2026:SENATE:NJ	D	?	Will the Democratic Party win the New Jersey Senate?	630857	Cory Booker (D) - New Jersey Senate Election Winner	DERIVED	sum_of_8_margin_buckets	SENATENJ-26-D
+283	972	2026:SENATE:NJ	R	?	Will the Republican Party win the New Jersey Senate?	630858	Justin Murphy (R) - New Jersey Senate Election Winner	DERIVED	sum_of_2_margin_buckets	SENATENJ-26-R
+284	973	2026:SENATE:NM	D	?	Will the Democratic Party win the New Mexico Senate?	630870	Ben Ray Luján (D) - New Mexico Senate Election Winner	DERIVED	sum_of_8_margin_buckets	SENATENM-26-D
+285	974	2026:SENATE:NM	R	?	Will the Republican Party win the New Mexico Senate?	630871	Larry Marker (R) - New Mexico Senate Election Winner	DERIVED	sum_of_2_margin_buckets	SENATENM-26-R
+383	1072	2026:SENATE:OK	D	?	Will the Democratic Party win the Oklahoma Senate?	631030	N’Kiyla “Jasmine” Thomas (D) - Oklahoma Senate Election Winner	EXACT	3344073	SENATEOK-26-D
+286	975	2026:SENATE:OK	R	?	Will the Republican Party win the Oklahoma Senate?	631031	Kevin Hern (R) - Oklahoma Senate Election Winner	DERIVED	sum_of_9_margin_buckets	SENATEOK-26-R
+287	976	2026:SENATE:OR	D	?	Will the Democratic Party win the Oregon Senate?	630898	Jeff Merkley (D) - Oregon Senate Election Winner	DERIVED	sum_of_8_margin_buckets	SENATEOR-26-D
+288	977	2026:SENATE:OR	R	?	Will the Republican Party win the Oregon Senate?	630899	David Brock Smith (R) - Oregon Senate Election Winner	EXACT	3344085	SENATEOR-26-R
+387	1076	2026:SENATE:RI	D	Election Outcome	Will the Democratic Party win the Rhode Island Senate?	630911	Jack Reed (D) - Rhode Island Senate Election Winner	DERIVED	sum_of_7_margin_buckets	SENATERI-26-D
+388	1077	2026:SENATE:RI	R	Election Outcome	Will the Republican Party win the Rhode Island Senate?	630912	Raymond McKay (R) - Rhode Island Senate Election Winner	EXACT	3344096	SENATERI-26-R
+289	978	2026:SENATE:SC	D	?	Will the Democratic Party win the South Carolina Senate?	630924	Annie Andrews (D) - South Carolina Senate Election Winner	EXACT	3344127	SENATESC-26-D
+290	979	2026:SENATE:SC	R	?	Will the Republican Party win the South Carolina Senate?	630925	Darline Graham Nordone (R) - South Carolina Senate Election Winner	DERIVED	sum_of_7_margin_buckets	SENATESC-26-R
+291	980	2026:SENATE:SD	D	?	Will the Democratic Party win the South Dakota Senate?	630937	Democrat - South Dakota Senate Election Winner	EXACT	630937	SENATESD-26-D
+292	981	2026:SENATE:SD	R	?	Will the Republican Party win the South Dakota Senate?	630938	Mike Rounds (R) - South Dakota Senate Election Winner	DERIVED	sum_of_9_margin_buckets	SENATESD-26-R
+362	1051	2026:SENATE:TN	D	?	Will the Democratic Party win the Tennessee Senate?	630950	Marquita Bradshaw (D) - Tennessee Senate Election Winner	EXACT	3344157	SENATETN-26-D
+363	1052	2026:SENATE:TN	R	?	Will the Republican Party win the Tennessee Senate?	630951	Bill Hagerty (R) - Tennessee Senate Election Winner	DERIVED	sum_of_9_margin_buckets	SENATETN-26-R
+293	982	2026:SENATE:TX	D	?	Will the Democratic Party win the Texas Senate?	630963	James Talarico (D) - Texas Senate Election Winner	DERIVED	sum_of_5_margin_buckets	SENATETX-26-D
+294	983	2026:SENATE:TX	R	?	Will the Republican Party win the Texas Senate?	630964	Ken Paxton (R) - Texas Senate Election Winner	DERIVED	sum_of_5_margin_buckets	SENATETX-26-R
+295	984	2026:SENATE:VA	D	?	Will the Democratic Party win the Virginia Senate?	630976	Mark Warner (D) - Virginia Senate Election Winner	DERIVED	sum_of_8_margin_buckets	SENATEVA-26-D
+364	1053	2026:SENATE:VA	R	?	Will the Republican Party win the Virginia Senate?	630977	Bert Mizusawa (R) - Virginia Senate Election Winner	DERIVED	sum_of_2_margin_buckets	SENATEVA-26-R
+296	985	2026:SENATE:WV	D	?	Will the Democratic Party win the West Virginia Senate?	630989	Rachel Fetty Anderson (D) - West Virginia Senate Election Winner	EXACT	3344182	SENATEWV-26-D
+297	986	2026:SENATE:WV	R	?	Will the Republican Party win the West Virginia Senate?	630990	Shelley Moore Capito (R) - West Virginia Senate Election Winner	DERIVED	sum_of_10_margin_buckets	SENATEWV-26-R
+365	1054	2026:SENATE:WY	D	?	Will the Democratic Party win the Wyoming Senate?	631002	James W. Byrd (D) - Wyoming Senate Election Winner	EXACT	3344233	SENATEWY-26-D
+366	1055	2026:SENATE:WY	R	?	Will the Republican Party win the Wyoming Senate?	631003	Harriet Hageman (R)  - Wyoming Senate Election Winner	DERIVED	sum_of_10_margin_buckets	SENATEWY-26-R
+153	842	2026:SENATE_CONTROL:US	D	?	Will the Democratic Party win the U.S. Senate?	562793	Democratic Party - Which party will win the Senate in 2026? (added by hand)	NEAR	562793	CONTROLS-2026-D*
+154	843	2026:SENATE_CONTROL:US	R	?	Will the Republican Party win the U.S. Senate?	562794	Republican Party - Which party will win the Senate in 2026? (added by hand)	NEAR	562794	CONTROLS-2026-R*

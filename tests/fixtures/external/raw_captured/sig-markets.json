@@ -1,0 +1,595 @@
+{
+ "data": [
+  {
+   "id": "388",
+   "title": "Will the Republican Party win the Rhode Island Senate?",
+   "thumbnailUrl": "https://pub-795415aed96647a28f0883c8946d59fc.r2.dev/market-thumbnails/2af90abd-bac7-4289-ad62-60ee4d672464/f71f1c3f-35b0-4ee7-b0b8-cdc1fea064bb.webp",
+   "status": "open",
+   "createdAt": "2026-09-18T22:32:17.996Z",
+   "settlementDate": "2026-11-04T17:00:00.000Z",
+   "settledWith": null,
+   "settledOn": null,
+   "categories": [
+    "Election Outcome"
+   ],
+   "isComposite": false,
+   "isMultiOutcome": false,
+   "exchanges": [
+    {
+     "id": "1077",
+     "option": "YES",
+     "latestPrice": null,
+     "initialPrice": 0.5
+    }
+   ],
+   "creator": {
+    "id": "00000000-0000-0000-0000-000000000001",
+    "username": "kind-heron-1039"
+   },
+   "contexts": [
+    {
+     "type": "tournament",
+     "tournament": {
+      "id": "bda92870-621e-47b0-bc3c-3602c5c26f55",
+      "slug": "midterm-elections",
+      "name": "Midterm Elections",
+      "currencyName": "SUSQies",
+      "isOngoingPlay": false
+     },
+     "exchanges": [
+      {
+       "id": "1077",
+       "latestPrice": null
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "id": "387",
+   "title": "Will the Democratic Party win the Rhode Island Senate?",
+   "thumbnailUrl": "https://pub-795415aed96647a28f0883c8946d59fc.r2.dev/market-thumbnails/2af90abd-bac7-4289-ad62-60ee4d672464/c9ffafbd-d52d-4b16-a134-ab30f0aa0c1e.webp",
+   "status": "open",
+   "createdAt": "2026-09-18T22:32:17.108Z",
+   "settlementDate": "2026-11-04T17:00:00.000Z",
+   "settledWith": null,
+   "settledOn": null,
+   "categories": [
+    "Election Outcome"
+   ],
+   "isComposite": false,
+   "isMultiOutcome": false,
+   "exchanges": [
+    {
+     "id": "1076",
+     "option": "YES",
+     "latestPrice": null,
+     "initialPrice": 0.5
+    }
+   ],
+   "creator": {
+    "id": "00000000-0000-0000-0000-000000000001",
+    "username": "kind-heron-1039"
+   },
+   "contexts": [
+    {
+     "type": "tournament",
+     "tournament": {
+      "id": "bda92870-621e-47b0-bc3c-3602c5c26f55",
+      "slug": "midterm-elections",
+      "name": "Midterm Elections",
+      "currencyName": "SUSQies",
+      "isOngoingPlay": false
+     },
+     "exchanges": [
+      {
+       "id": "1076",
+       "latestPrice": null
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "id": "386",
+   "title": "Will the Republican Party win the Delaware Senate?",
+   "thumbnailUrl": "https://pub-795415aed96647a28f0883c8946d59fc.r2.dev/market-thumbnails/2af90abd-bac7-4289-ad62-60ee4d672464/c6c150b6-5cfe-435a-8608-293f49ec3c14.webp",
+   "status": "open",
+   "createdAt": "2026-09-18T22:32:16.184Z",
+   "settlementDate": "2026-11-04T17:00:00.000Z",
+   "settledWith": null,
+   "settledOn": null,
+   "categories": [
+    "Election Outcome"
+   ],
+   "isComposite": false,
+   "isMultiOutcome": false,
+   "exchanges": [
+    {
+     "id": "1075",
+     "option": "YES",
+     "latestPrice": null,
+     "initialPrice": 0.5
+    }
+   ],
+   "creator": {
+    "id": "00000000-0000-0000-0000-000000000001",
+    "username": "kind-heron-1039"
+   },
+   "contexts": [
+    {
+     "type": "tournament",
+     "tournament": {
+      "id": "bda92870-621e-47b0-bc3c-3602c5c26f55",
+      "slug": "midterm-elections",
+      "name": "Midterm Elections",
+      "currencyName": "SUSQies",
+      "isOngoingPlay": false
+     },
+     "exchanges": [
+      {
+       "id": "1075",
+       "latestPrice": null
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "id": "382",
+   "title": "Will the Republican Party win the New Hampshire Senate?",
+   "thumbnailUrl": "https://pub-795415aed96647a28f0883c8946d59fc.r2.dev/market-thumbnails/2af90abd-bac7-4289-ad62-60ee4d672464/c7b1e77f-4487-4c68-bb20-b3597a37cb5e.webp",
+   "status": "open",
+   "createdAt": "2026-09-10T02:58:02.589Z",
+   "settlementDate": "2026-11-04T17:00:00.000Z",
+   "settledWith": null,
+   "settledOn": null,
+   "categories": [
+    "Election Outcome"
+   ],
+   "isComposite": false,
+   "isMultiOutcome": false,
+   "exchanges": [
+    {
+     "id": "1071",
+     "option": "YES",
+     "latestPrice": null,
+     "initialPrice": 0.5
+    }
+   ],
+   "creator": {
+    "id": "00000000-0000-0000-0000-000000000001",
+    "username": "kind-heron-1039"
+   },
+   "contexts": [
+    {
+     "type": "tournament",
+     "tournament": {
+      "id": "bda92870-621e-47b0-bc3c-3602c5c26f55",
+      "slug": "midterm-elections",
+      "name": "Midterm Elections",
+      "currencyName": "SUSQies",
+      "isOngoingPlay": false
+     },
+     "exchanges": [
+      {
+       "id": "1071",
+       "latestPrice": null
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "id": "381",
+   "title": "Will the Democratic Party win the New Hampshire Senate?",
+   "thumbnailUrl": "https://pub-795415aed96647a28f0883c8946d59fc.r2.dev/market-thumbnails/2af90abd-bac7-4289-ad62-60ee4d672464/43c45424-a6b7-4893-a5f0-c5e7ac1e271e.webp",
+   "status": "open",
+   "createdAt": "2026-09-10T02:58:01.605Z",
+   "settlementDate": "2026-11-04T17:00:00.000Z",
+   "settledWith": null,
+   "settledOn": null,
+   "categories": [
+    "Election Outcome"
+   ],
+   "isComposite": false,
+   "isMultiOutcome": false,
+   "exchanges": [
+    {
+     "id": "1070",
+     "option": "YES",
+     "latestPrice": null,
+     "initialPrice": 0.5
+    }
+   ],
+   "creator": {
+    "id": "00000000-0000-0000-0000-000000000001",
+    "username": "kind-heron-1039"
+   },
+   "contexts": [
+    {
+     "type": "tournament",
+     "tournament": {
+      "id": "bda92870-621e-47b0-bc3c-3602c5c26f55",
+      "slug": "midterm-elections",
+      "name": "Midterm Elections",
+      "currencyName": "SUSQies",
+      "isOngoingPlay": false
+     },
+     "exchanges": [
+      {
+       "id": "1070",
+       "latestPrice": null
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "id": "353",
+   "title": "Will the Democratic Party win the Delaware Senate?",
+   "thumbnailUrl": "https://pub-795415aed96647a28f0883c8946d59fc.r2.dev/market-thumbnails/2af90abd-bac7-4289-ad62-60ee4d672464/30a69b54-a872-4312-bc70-96acbd215507.webp",
+   "status": "open",
+   "createdAt": "2026-08-24T20:57:40.479Z",
+   "settlementDate": "2026-11-04T17:00:00.000Z",
+   "settledWith": null,
+   "settledOn": null,
+   "categories": [
+    "Election Outcome"
+   ],
+   "isComposite": false,
+   "isMultiOutcome": false,
+   "exchanges": [
+    {
+     "id": "1042",
+     "option": "YES",
+     "latestPrice": null,
+     "initialPrice": 0.5
+    }
+   ],
+   "creator": {
+    "id": "00000000-0000-0000-0000-000000000001",
+    "username": "kind-heron-1039"
+   },
+   "contexts": [
+    {
+     "type": "tournament",
+     "tournament": {
+      "id": "bda92870-621e-47b0-bc3c-3602c5c26f55",
+      "slug": "midterm-elections",
+      "name": "Midterm Elections",
+      "currencyName": "SUSQies",
+      "isOngoingPlay": false
+     },
+     "exchanges": [
+      {
+       "id": "1042",
+       "latestPrice": null
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "id": "281",
+   "title": "Will the Republican Party win the Nebraska Senate?",
+   "thumbnailUrl": "https://pub-795415aed96647a28f0883c8946d59fc.r2.dev/market-thumbnails/2af90abd-bac7-4289-ad62-60ee4d672464/36cc1a24-1a3a-4dc2-8637-103d3f437df5.webp",
+   "status": "open",
+   "createdAt": "2026-08-24T20:42:01.645Z",
+   "settlementDate": "2026-11-04T17:00:00.000Z",
+   "settledWith": null,
+   "settledOn": null,
+   "categories": [
+    "Election Outcome"
+   ],
+   "isComposite": false,
+   "isMultiOutcome": false,
+   "exchanges": [
+    {
+     "id": "970",
+     "option": "YES",
+     "latestPrice": null,
+     "initialPrice": 0.5
+    }
+   ],
+   "creator": {
+    "id": "00000000-0000-0000-0000-000000000001",
+    "username": "kind-heron-1039"
+   },
+   "contexts": [
+    {
+     "type": "tournament",
+     "tournament": {
+      "id": "bda92870-621e-47b0-bc3c-3602c5c26f55",
+      "slug": "midterm-elections",
+      "name": "Midterm Elections",
+      "currencyName": "SUSQies",
+      "isOngoingPlay": false
+     },
+     "exchanges": [
+      {
+       "id": "970",
+       "latestPrice": null
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "id": "280",
+   "title": "Will the Independent Party win the Nebraska Senate?",
+   "thumbnailUrl": "https://pub-795415aed96647a28f0883c8946d59fc.r2.dev/market-thumbnails/2af90abd-bac7-4289-ad62-60ee4d672464/48bef842-3e8f-4c22-ad6e-d7fd7948e243.webp",
+   "status": "open",
+   "createdAt": "2026-08-24T20:42:00.621Z",
+   "settlementDate": "2026-11-04T17:00:00.000Z",
+   "settledWith": null,
+   "settledOn": null,
+   "categories": [
+    "Election Outcome"
+   ],
+   "isComposite": false,
+   "isMultiOutcome": false,
+   "exchanges": [
+    {
+     "id": "969",
+     "option": "YES",
+     "latestPrice": null,
+     "initialPrice": 0.5
+    }
+   ],
+   "creator": {
+    "id": "00000000-0000-0000-0000-000000000001",
+    "username": "kind-heron-1039"
+   },
+   "contexts": [
+    {
+     "type": "tournament",
+     "tournament": {
+      "id": "bda92870-621e-47b0-bc3c-3602c5c26f55",
+      "slug": "midterm-elections",
+      "name": "Midterm Elections",
+      "currencyName": "SUSQies",
+      "isOngoingPlay": false
+     },
+     "exchanges": [
+      {
+       "id": "969",
+       "latestPrice": null
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "id": "279",
+   "title": "Will the Democratic Party win the Nebraska Senate?",
+   "thumbnailUrl": "https://pub-795415aed96647a28f0883c8946d59fc.r2.dev/market-thumbnails/2af90abd-bac7-4289-ad62-60ee4d672464/3bad40bb-69c4-431e-83b4-7a9f3593060e.webp",
+   "status": "open",
+   "createdAt": "2026-08-24T20:41:59.570Z",
+   "settlementDate": "2026-11-04T17:00:00.000Z",
+   "settledWith": null,
+   "settledOn": null,
+   "categories": [
+    "Election Outcome"
+   ],
+   "isComposite": false,
+   "isMultiOutcome": false,
+   "exchanges": [
+    {
+     "id": "968",
+     "option": "YES",
+     "latestPrice": null,
+     "initialPrice": 0.5
+    }
+   ],
+   "creator": {
+    "id": "00000000-0000-0000-0000-000000000001",
+    "username": "kind-heron-1039"
+   },
+   "contexts": [
+    {
+     "type": "tournament",
+     "tournament": {
+      "id": "bda92870-621e-47b0-bc3c-3602c5c26f55",
+      "slug": "midterm-elections",
+      "name": "Midterm Elections",
+      "currencyName": "SUSQies",
+      "isOngoingPlay": false
+     },
+     "exchanges": [
+      {
+       "id": "968",
+       "latestPrice": null
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "id": "179",
+   "title": "Will the Republican Party win the Nebraska Governor?",
+   "thumbnailUrl": "https://pub-795415aed96647a28f0883c8946d59fc.r2.dev/market-thumbnails/2af90abd-bac7-4289-ad62-60ee4d672464/e06953af-7369-49ed-a497-1698f13aff3e.webp",
+   "status": "open",
+   "createdAt": "2026-08-24T20:39:58.514Z",
+   "settlementDate": "2026-11-04T17:00:00.000Z",
+   "settledWith": null,
+   "settledOn": null,
+   "categories": [
+    "Election Outcome"
+   ],
+   "isComposite": false,
+   "isMultiOutcome": false,
+   "exchanges": [
+    {
+     "id": "868",
+     "option": "YES",
+     "latestPrice": null,
+     "initialPrice": 0.5
+    }
+   ],
+   "creator": {
+    "id": "00000000-0000-0000-0000-000000000001",
+    "username": "kind-heron-1039"
+   },
+   "contexts": [
+    {
+     "type": "tournament",
+     "tournament": {
+      "id": "bda92870-621e-47b0-bc3c-3602c5c26f55",
+      "slug": "midterm-elections",
+      "name": "Midterm Elections",
+      "currencyName": "SUSQies",
+      "isOngoingPlay": false
+     },
+     "exchanges": [
+      {
+       "id": "868",
+       "latestPrice": null
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "id": "178",
+   "title": "Will the Democratic Party win the Nebraska Governor?",
+   "thumbnailUrl": "https://pub-795415aed96647a28f0883c8946d59fc.r2.dev/market-thumbnails/2af90abd-bac7-4289-ad62-60ee4d672464/95393d59-2fe9-4fa6-8c36-1a203bf4c375.webp",
+   "status": "open",
+   "createdAt": "2026-08-24T20:39:57.602Z",
+   "settlementDate": "2026-11-04T17:00:00.000Z",
+   "settledWith": null,
+   "settledOn": null,
+   "categories": [
+    "Election Outcome"
+   ],
+   "isComposite": false,
+   "isMultiOutcome": false,
+   "exchanges": [
+    {
+     "id": "867",
+     "option": "YES",
+     "latestPrice": null,
+     "initialPrice": 0.5
+    }
+   ],
+   "creator": {
+    "id": "00000000-0000-0000-0000-000000000001",
+    "username": "kind-heron-1039"
+   },
+   "contexts": [
+    {
+     "type": "tournament",
+     "tournament": {
+      "id": "bda92870-621e-47b0-bc3c-3602c5c26f55",
+      "slug": "midterm-elections",
+      "name": "Midterm Elections",
+      "currencyName": "SUSQies",
+      "isOngoingPlay": false
+     },
+     "exchanges": [
+      {
+       "id": "867",
+       "latestPrice": null
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "id": "152",
+   "title": "Will the Republican Party win the U.S. House?",
+   "thumbnailUrl": "https://pub-795415aed96647a28f0883c8946d59fc.r2.dev/market-thumbnails/2af90abd-bac7-4289-ad62-60ee4d672464/187aa997-8478-4ac4-9f1f-1465bae346a9.webp",
+   "status": "open",
+   "createdAt": "2026-08-24T20:39:29.187Z",
+   "settlementDate": "2026-11-04T17:00:00.000Z",
+   "settledWith": null,
+   "settledOn": null,
+   "categories": [
+    "Freeform"
+   ],
+   "isComposite": false,
+   "isMultiOutcome": false,
+   "exchanges": [
+    {
+     "id": "841",
+     "option": "YES",
+     "latestPrice": null,
+     "initialPrice": 0.5
+    }
+   ],
+   "creator": {
+    "id": "00000000-0000-0000-0000-000000000001",
+    "username": "kind-heron-1039"
+   },
+   "contexts": [
+    {
+     "type": "tournament",
+     "tournament": {
+      "id": "bda92870-621e-47b0-bc3c-3602c5c26f55",
+      "slug": "midterm-elections",
+      "name": "Midterm Elections",
+      "currencyName": "SUSQies",
+      "isOngoingPlay": false
+     },
+     "exchanges": [
+      {
+       "id": "841",
+       "latestPrice": null
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "id": "151",
+   "title": "Will the Democratic Party win the U.S. House?",
+   "thumbnailUrl": "https://pub-795415aed96647a28f0883c8946d59fc.r2.dev/market-thumbnails/2af90abd-bac7-4289-ad62-60ee4d672464/f0b9d0de-a84f-40a1-9060-f88bb35298e2.webp",
+   "status": "open",
+   "createdAt": "2026-08-24T20:39:28.210Z",
+   "settlementDate": "2026-11-04T17:00:00.000Z",
+   "settledWith": null,
+   "settledOn": null,
+   "categories": [
+    "Freeform"
+   ],
+   "isComposite": false,
+   "isMultiOutcome": false,
+   "exchanges": [
+    {
+     "id": "840",
+     "option": "YES",
+     "latestPrice": null,
+     "initialPrice": 0.5
+    }
+   ],
+   "creator": {
+    "id": "00000000-0000-0000-0000-000000000001",
+    "username": "kind-heron-1039"
+   },
+   "contexts": [
+    {
+     "type": "tournament",
+     "tournament": {
+      "id": "bda92870-621e-47b0-bc3c-3602c5c26f55",
+      "slug": "midterm-elections",
+      "name": "Midterm Elections",
+      "currencyName": "SUSQies",
+      "isOngoingPlay": false
+     },
+     "exchanges": [
+      {
+       "id": "840",
+       "latestPrice": null
+      }
+     ]
+    }
+   ]
+  }
+ ],
+ "pagination": {
+  "total": 13,
+  "limit": 100,
+  "hasMore": false,
+  "nextCursor": null
+ }
+}

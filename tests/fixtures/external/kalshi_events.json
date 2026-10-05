@@ -1,0 +1,1655 @@
+{
+ "_fixture": {
+  "built_by": "_build_fixtures.py (offline). Re-run to regenerate.",
+  "snapshot_time_for_illustrative_prices": "2026-10-04T20:00:00Z",
+  "templates_real_capture": [
+   "https://github.com/nullif1ed/sigprediction/blob/main/fixtures/polymarket-nh-senate.json (real GET /events?slug=new-hampshire-senate-election-winner element, updatedAt 2026-10-01)",
+   "https://github.com/nullif1ed/sigprediction/blob/main/fixtures/kalshi-senatenh-26.json (real GET /events/SENATENH-26?with_nested_markets=true, updated_time 2026-09-15)"
+  ],
+  "id_sources": [
+   "https://github.com/DanielCWeng/predictions-cup/blob/main/data/mappings/sig_polymarket_2026.csv (237 SIG markets -> Polymarket market/condition/token ids, 'VERIFIED' by that participant, 2026-10-04)",
+   "https://github.com/grissou/prediction-market-maker/blob/main/ref_map.json (229 'race|party' -> Polymarket winner-market ids + groupItemTitle notes, 2026-10-01)",
+   "https://github.com/christiano7777777/sig-arb-bot/blob/main/kalshi_map.json (109 races -> Kalshi event/market tickers, 2026-10-05)"
+  ],
+  "shape_sources": [
+   "https://github.com/Polymarket/py-sdk (src/polymarket/_internal/actions/gamma.py, models/gamma/*.py; commit b543c9d 2026-10-01)",
+   "https://github.com/Polymarket/agent-skills/blob/main/market-data.md",
+   "https://docs.polymarket.com/developers/gamma-markets-api/overview (search snippet only; site blocked)",
+   "https://pypi.org/project/kalshi_python_sync/ 3.2.0 (generated from Kalshi OpenAPI; models/market.py etc.)",
+   "https://docs.kalshi.com/getting_started/fixed_point_migration (search snippet only; site blocked)"
+  ],
+  "prices": "Only the NH Senate objects carry real captured prices. All other prices are ILLUSTRATIVE (WebSearch snippets of Kalshi/Polymarket news, late Sep-early Oct 2026). Never treat them as live.",
+  "what": "Kalshi Trade API v2 event reads. With with_nested_markets=true the markets sit in event.markets and the top-level 'markets' is [] (REAL, see SENATENH-26). /events list -> {events:[...], cursor} (cursor '' or absent = last page).",
+  "base_urls": [
+   "https://api.elections.kalshi.com/trade-api/v2 (used by every participant repo; listed as 'Production shared API server, also supported')",
+   "https://external-api.kalshi.com/trade-api/v2 (current docs' primary production host)"
+  ],
+  "unsure_fields": [
+   "Only SENATENH-26 is a real capture. CONTROLS-2026/CONTROLH-2026 event+market titles, rules text and close/expiration times are ILLUSTRATIVE (the rule 'President pro tempore party on Feb 1 2027' comes from a sportsline/oddsshopper search snippet quoting Kalshi rules)",
+   "Kalshi market titles keep the REAL typo pattern 'Will Democratics win ...' (seen in SENATENH-26-D) for state races; do not parse party from title",
+   "Independent market ticker 'SENATENE-26-I' and its subtitle are GUESSES (participants fetch the event and match yes_sub_title by candidate name)",
+   "House title pattern 'AZ-01 House winner?' and governor 'Georgia governor winner?' come from christiano7777777/sig-arb-bot tools/build_kalshi_map.py title rules",
+   "series_ticker for KXHOUSERACE-* events assumed 'KXHOUSERACE'",
+   "settled primary KXSENATETXR-26 is illustrative (shape for filtering); status value 'finalized' assumed from the newer Kalshi status set",
+   "collateral_return_type, price_ranges, custom_strike, early_close_condition copied from the real NH capture",
+   "integer-cent fields (yes_bid, yes_ask, last_price, volume, open_interest, liquidity...) are ABSENT in the real capture: removed 2026-03-12 per Kalshi fixed-point migration doc snippet; the pip SDK kalshi_python_sync 3.2.0 still declares them (stale)"
+  ]
+ },
+ "responses": [
+  {
+   "request": "GET https://api.elections.kalshi.com/trade-api/v2/events/SENATENH-26?with_nested_markets=true",
+   "status": 200,
+   "body": {
+    "event": {
+     "category": "Elections",
+     "collateral_return_type": "MECNET",
+     "event_ticker": "SENATENH-26",
+     "exchange_index": 0,
+     "last_updated_ts": "0001-01-01T00:00:00Z",
+     "markets": [
+      {
+       "can_close_early": true,
+       "close_time": "2027-11-03T15:00:00Z",
+       "created_time": "2024-12-03T05:20:37.159771Z",
+       "custom_strike": {
+        "political_party": "9244ed4c-9dfd-45cc-8211-996dc902f315",
+        "politician": "23a985a0-5afc-472b-b971-5f154e1c1b1b"
+       },
+       "early_close_condition": "This market will close early following the swearing in of the Senator for the seat in question.",
+       "event_ticker": "SENATENH-26",
+       "exchange_index": 0,
+       "expected_expiration_time": "2027-01-04T15:00:00Z",
+       "expiration_time": "2027-11-03T15:00:00Z",
+       "expiration_value": "",
+       "last_price_dollars": "0.1500",
+       "latest_expiration_time": "2027-11-03T15:00:00Z",
+       "liquidity_dollars": "0.0000",
+       "market_type": "binary",
+       "no_ask_dollars": "0.8600",
+       "no_bid_dollars": "0.8500",
+       "no_sub_title": "John E. Sununu",
+       "notional_value_dollars": "1.0000",
+       "occurrence_datetime": "2027-01-03T15:00:00Z",
+       "open_interest_fp": "738863.91",
+       "open_time": "2024-12-03T15:00:00Z",
+       "previous_price_dollars": "0.1400",
+       "previous_yes_ask_dollars": "0.1400",
+       "previous_yes_bid_dollars": "0.1300",
+       "price_level_structure": "tapered_deci_cent",
+       "price_ranges": [
+        {
+         "end": "0.1000",
+         "start": "0.0000",
+         "step": "0.0010"
+        },
+        {
+         "end": "0.9000",
+         "start": "0.1000",
+         "step": "0.0100"
+        },
+        {
+         "end": "1.0000",
+         "start": "0.9000",
+         "step": "0.0010"
+        }
+       ],
+       "result": "",
+       "rules_primary": "If a representative of the Republican party is sworn in as a Senator of New Hampshire for the term beginning in 2027, then the market resolves to Yes.",
+       "rules_secondary": "This market is eligible for accelerated determination after a consensus of media organizations project the winner. See full rules for details.",
+       "settlement_timer_seconds": 1800,
+       "status": "active",
+       "strike_type": "structured",
+       "subtitle": "Republican party:: Republican party",
+       "ticker": "SENATENH-26-R",
+       "title": "Will Republicans win the Senate race in New Hampshire?",
+       "updated_time": "2026-09-15T21:46:55.77266Z",
+       "volume_24h_fp": "30043.26",
+       "volume_fp": "1073943.74",
+       "yes_ask_dollars": "0.1500",
+       "yes_ask_size_fp": "23666.23",
+       "yes_bid_dollars": "0.1400",
+       "yes_bid_size_fp": "72854.19",
+       "yes_sub_title": "John E. Sununu"
+      },
+      {
+       "can_close_early": true,
+       "close_time": "2027-11-03T15:00:00Z",
+       "created_time": "2024-12-03T05:20:37.159771Z",
+       "custom_strike": {
+        "political_party": "57fa2293-3102-463b-9087-68cd9f6da0a6",
+        "politician": "79a41654-264c-4f8b-af6c-66d7e0b857c8"
+       },
+       "early_close_condition": "This market will close early following the swearing in of the Senator for the seat in question.",
+       "event_ticker": "SENATENH-26",
+       "exchange_index": 0,
+       "expected_expiration_time": "2027-01-04T15:00:00Z",
+       "expiration_time": "2027-11-03T15:00:00Z",
+       "expiration_value": "",
+       "last_price_dollars": "0.8600",
+       "latest_expiration_time": "2027-11-03T15:00:00Z",
+       "liquidity_dollars": "0.0000",
+       "market_type": "binary",
+       "no_ask_dollars": "0.1400",
+       "no_bid_dollars": "0.1300",
+       "no_sub_title": "Chris Pappas",
+       "notional_value_dollars": "1.0000",
+       "occurrence_datetime": "2027-01-03T15:00:00Z",
+       "open_interest_fp": "217039.07",
+       "open_time": "2024-12-03T15:00:00Z",
+       "previous_price_dollars": "0.8700",
+       "previous_yes_ask_dollars": "0.8700",
+       "previous_yes_bid_dollars": "0.8600",
+       "price_level_structure": "tapered_deci_cent",
+       "price_ranges": [
+        {
+         "end": "0.1000",
+         "start": "0.0000",
+         "step": "0.0010"
+        },
+        {
+         "end": "0.9000",
+         "start": "0.1000",
+         "step": "0.0100"
+        },
+        {
+         "end": "1.0000",
+         "start": "0.9000",
+         "step": "0.0010"
+        }
+       ],
+       "result": "",
+       "rules_primary": "If a representative of the Democratic party is sworn in as a Senator of New Hampshire for the term beginning in 2027, then the market resolves to Yes.",
+       "rules_secondary": "This market is eligible for accelerated determination after a consensus of media organizations project the winner. See full rules for details.",
+       "settlement_timer_seconds": 1800,
+       "status": "active",
+       "strike_type": "structured",
+       "subtitle": ":: Democratic party",
+       "ticker": "SENATENH-26-D",
+       "title": "Will Democratics win the Senate race in New Hampshire?",
+       "updated_time": "2026-09-15T21:46:54.814624Z",
+       "volume_24h_fp": "16611.75",
+       "volume_fp": "447627.47",
+       "yes_ask_dollars": "0.8700",
+       "yes_ask_size_fp": "27059.72",
+       "yes_bid_dollars": "0.8600",
+       "yes_bid_size_fp": "2524.15",
+       "yes_sub_title": "Chris Pappas"
+      }
+     ],
+     "mutually_exclusive": true,
+     "product_metadata": {
+      "competition": "Senate",
+      "competition_scope": "Election"
+     },
+     "series_ticker": "SENATENH",
+     "settlement_sources": [
+      {
+       "name": "United States Congress",
+       "url": "https://www.congress.gov/"
+      }
+     ],
+     "strike_period": "",
+     "sub_title": "In 2026",
+     "title": "New Hampshire Senate winner?"
+    },
+    "markets": []
+   }
+  },
+  {
+   "request": "GET https://api.elections.kalshi.com/trade-api/v2/events?series_ticker=CONTROLS&status=open&with_nested_markets=true&limit=200",
+   "status": 200,
+   "body": {
+    "events": [
+     {
+      "category": "Elections",
+      "collateral_return_type": "MECNET",
+      "event_ticker": "CONTROLS-2026",
+      "exchange_index": 0,
+      "last_updated_ts": "0001-01-01T00:00:00Z",
+      "markets": [
+       {
+        "can_close_early": true,
+        "close_time": "2027-02-01T15:00:00Z",
+        "created_time": "2024-12-03T05:20:37.159771Z",
+        "custom_strike": {
+         "political_party": "57fa2293-3102-463b-9087-68cd9f6da0a6",
+         "politician": "79a41654-264c-4f8b-af6c-66d7e0b857c8"
+        },
+        "early_close_condition": "This market will close early following the swearing in of the Senator for the seat in question.",
+        "event_ticker": "CONTROLS-2026",
+        "exchange_index": 0,
+        "expected_expiration_time": "2027-02-01T15:00:00Z",
+        "expiration_time": "2027-02-01T15:00:00Z",
+        "expiration_value": "",
+        "last_price_dollars": "0.6300",
+        "latest_expiration_time": "2027-02-01T15:00:00Z",
+        "liquidity_dollars": "0.0000",
+        "market_type": "binary",
+        "no_ask_dollars": "0.3800",
+        "no_bid_dollars": "0.3700",
+        "no_sub_title": "Democratic party",
+        "notional_value_dollars": "1.0000",
+        "occurrence_datetime": "2027-01-03T15:00:00Z",
+        "open_interest_fp": "12000000.00",
+        "open_time": "2024-12-03T15:00:00Z",
+        "previous_price_dollars": "0.6300",
+        "previous_yes_ask_dollars": "0.6350",
+        "previous_yes_bid_dollars": "0.6250",
+        "price_level_structure": "tapered_deci_cent",
+        "price_ranges": [
+         {
+          "end": "0.1000",
+          "start": "0.0000",
+          "step": "0.0010"
+         },
+         {
+          "end": "0.9000",
+          "start": "0.1000",
+          "step": "0.0100"
+         },
+         {
+          "end": "1.0000",
+          "start": "0.9000",
+          "step": "0.0010"
+         }
+        ],
+        "result": "",
+        "rules_primary": "If the Democratic party controls the Senate (President pro tempore's party on February 1, 2027), then the market resolves to Yes.",
+        "rules_secondary": "This market is eligible for accelerated determination after a consensus of media organizations project the winner. See full rules for details.",
+        "settlement_timer_seconds": 1800,
+        "status": "active",
+        "strike_type": "structured",
+        "subtitle": ":: Democratic party",
+        "ticker": "CONTROLS-2026-D",
+        "title": "Will Democrats win the Senate?",
+        "updated_time": "2026-10-04T20:00:00Z",
+        "volume_24h_fp": "1230000.00",
+        "volume_fp": "41000000.00",
+        "yes_ask_dollars": "0.6300",
+        "yes_ask_size_fp": "5000.00",
+        "yes_bid_dollars": "0.6200",
+        "yes_bid_size_fp": "5000.00",
+        "yes_sub_title": "Democratic party"
+       },
+       {
+        "can_close_early": true,
+        "close_time": "2027-02-01T15:00:00Z",
+        "created_time": "2024-12-03T05:20:37.159771Z",
+        "custom_strike": {
+         "political_party": "57fa2293-3102-463b-9087-68cd9f6da0a6",
+         "politician": "79a41654-264c-4f8b-af6c-66d7e0b857c8"
+        },
+        "early_close_condition": "This market will close early following the swearing in of the Senator for the seat in question.",
+        "event_ticker": "CONTROLS-2026",
+        "exchange_index": 0,
+        "expected_expiration_time": "2027-02-01T15:00:00Z",
+        "expiration_time": "2027-02-01T15:00:00Z",
+        "expiration_value": "",
+        "last_price_dollars": "0.3800",
+        "latest_expiration_time": "2027-02-01T15:00:00Z",
+        "liquidity_dollars": "0.0000",
+        "market_type": "binary",
+        "no_ask_dollars": "0.6200",
+        "no_bid_dollars": "0.6100",
+        "no_sub_title": "Republican party",
+        "notional_value_dollars": "1.0000",
+        "occurrence_datetime": "2027-01-03T15:00:00Z",
+        "open_interest_fp": "11000000.00",
+        "open_time": "2024-12-03T15:00:00Z",
+        "previous_price_dollars": "0.3800",
+        "previous_yes_ask_dollars": "0.3850",
+        "previous_yes_bid_dollars": "0.3750",
+        "price_level_structure": "tapered_deci_cent",
+        "price_ranges": [
+         {
+          "end": "0.1000",
+          "start": "0.0000",
+          "step": "0.0010"
+         },
+         {
+          "end": "0.9000",
+          "start": "0.1000",
+          "step": "0.0100"
+         },
+         {
+          "end": "1.0000",
+          "start": "0.9000",
+          "step": "0.0010"
+         }
+        ],
+        "result": "",
+        "rules_primary": "If the Republican party controls the Senate (President pro tempore's party on February 1, 2027), then the market resolves to Yes.",
+        "rules_secondary": "This market is eligible for accelerated determination after a consensus of media organizations project the winner. See full rules for details.",
+        "settlement_timer_seconds": 1800,
+        "status": "active",
+        "strike_type": "structured",
+        "subtitle": "Republican party:: Republican party",
+        "ticker": "CONTROLS-2026-R",
+        "title": "Will Republicans win the Senate?",
+        "updated_time": "2026-10-04T20:00:00Z",
+        "volume_24h_fp": "1140000.00",
+        "volume_fp": "38000000.00",
+        "yes_ask_dollars": "0.3900",
+        "yes_ask_size_fp": "5000.00",
+        "yes_bid_dollars": "0.3800",
+        "yes_bid_size_fp": "5000.00",
+        "yes_sub_title": "Republican party"
+       }
+      ],
+      "mutually_exclusive": true,
+      "product_metadata": {
+       "competition": "Senate control",
+       "competition_scope": "Election"
+      },
+      "series_ticker": "CONTROLS",
+      "settlement_sources": [
+       {
+        "name": "United States Congress",
+        "url": "https://www.congress.gov/"
+       }
+      ],
+      "strike_period": "",
+      "sub_title": "In 2026",
+      "title": "Which party will win the Senate?"
+     }
+    ],
+    "cursor": ""
+   }
+  },
+  {
+   "request": "GET https://api.elections.kalshi.com/trade-api/v2/events?series_ticker=CONTROLH&status=open&with_nested_markets=true&limit=200",
+   "status": 200,
+   "body": {
+    "events": [
+     {
+      "category": "Elections",
+      "collateral_return_type": "MECNET",
+      "event_ticker": "CONTROLH-2026",
+      "exchange_index": 0,
+      "last_updated_ts": "0001-01-01T00:00:00Z",
+      "markets": [
+       {
+        "can_close_early": true,
+        "close_time": "2027-02-01T15:00:00Z",
+        "created_time": "2024-12-03T05:20:37.159771Z",
+        "custom_strike": {
+         "political_party": "57fa2293-3102-463b-9087-68cd9f6da0a6",
+         "politician": "79a41654-264c-4f8b-af6c-66d7e0b857c8"
+        },
+        "early_close_condition": "This market will close early following the swearing in of the Senator for the seat in question.",
+        "event_ticker": "CONTROLH-2026",
+        "exchange_index": 0,
+        "expected_expiration_time": "2027-02-01T15:00:00Z",
+        "expiration_time": "2027-02-01T15:00:00Z",
+        "expiration_value": "",
+        "last_price_dollars": "0.9000",
+        "latest_expiration_time": "2027-02-01T15:00:00Z",
+        "liquidity_dollars": "0.0000",
+        "market_type": "binary",
+        "no_ask_dollars": "0.1000",
+        "no_bid_dollars": "0.0900",
+        "no_sub_title": "Democratic party",
+        "notional_value_dollars": "1.0000",
+        "occurrence_datetime": "2027-01-03T15:00:00Z",
+        "open_interest_fp": "9000000.00",
+        "open_time": "2024-12-03T15:00:00Z",
+        "previous_price_dollars": "0.9000",
+        "previous_yes_ask_dollars": "0.9050",
+        "previous_yes_bid_dollars": "0.8950",
+        "price_level_structure": "tapered_deci_cent",
+        "price_ranges": [
+         {
+          "end": "0.1000",
+          "start": "0.0000",
+          "step": "0.0010"
+         },
+         {
+          "end": "0.9000",
+          "start": "0.1000",
+          "step": "0.0100"
+         },
+         {
+          "end": "1.0000",
+          "start": "0.9000",
+          "step": "0.0010"
+         }
+        ],
+        "result": "",
+        "rules_primary": "If the Democratic party controls the House (Speaker's party on February 1, 2027), then the market resolves to Yes.",
+        "rules_secondary": "This market is eligible for accelerated determination after a consensus of media organizations project the winner. See full rules for details.",
+        "settlement_timer_seconds": 1800,
+        "status": "active",
+        "strike_type": "structured",
+        "subtitle": ":: Democratic party",
+        "ticker": "CONTROLH-2026-D",
+        "title": "Will Democrats win the House?",
+        "updated_time": "2026-10-04T20:00:00Z",
+        "volume_24h_fp": "990000.00",
+        "volume_fp": "33000000.00",
+        "yes_ask_dollars": "0.9100",
+        "yes_ask_size_fp": "5000.00",
+        "yes_bid_dollars": "0.9000",
+        "yes_bid_size_fp": "5000.00",
+        "yes_sub_title": "Democratic party"
+       },
+       {
+        "can_close_early": true,
+        "close_time": "2027-02-01T15:00:00Z",
+        "created_time": "2024-12-03T05:20:37.159771Z",
+        "custom_strike": {
+         "political_party": "57fa2293-3102-463b-9087-68cd9f6da0a6",
+         "politician": "79a41654-264c-4f8b-af6c-66d7e0b857c8"
+        },
+        "early_close_condition": "This market will close early following the swearing in of the Senator for the seat in question.",
+        "event_ticker": "CONTROLH-2026",
+        "exchange_index": 0,
+        "expected_expiration_time": "2027-02-01T15:00:00Z",
+        "expiration_time": "2027-02-01T15:00:00Z",
+        "expiration_value": "",
+        "last_price_dollars": "0.1000",
+        "latest_expiration_time": "2027-02-01T15:00:00Z",
+        "liquidity_dollars": "0.0000",
+        "market_type": "binary",
+        "no_ask_dollars": "0.9100",
+        "no_bid_dollars": "0.9000",
+        "no_sub_title": "Republican party",
+        "notional_value_dollars": "1.0000",
+        "occurrence_datetime": "2027-01-03T15:00:00Z",
+        "open_interest_fp": "8000000.00",
+        "open_time": "2024-12-03T15:00:00Z",
+        "previous_price_dollars": "0.1000",
+        "previous_yes_ask_dollars": "0.1050",
+        "previous_yes_bid_dollars": "0.0950",
+        "price_level_structure": "tapered_deci_cent",
+        "price_ranges": [
+         {
+          "end": "0.1000",
+          "start": "0.0000",
+          "step": "0.0010"
+         },
+         {
+          "end": "0.9000",
+          "start": "0.1000",
+          "step": "0.0100"
+         },
+         {
+          "end": "1.0000",
+          "start": "0.9000",
+          "step": "0.0010"
+         }
+        ],
+        "result": "",
+        "rules_primary": "If the Republican party controls the House (Speaker's party on February 1, 2027), then the market resolves to Yes.",
+        "rules_secondary": "This market is eligible for accelerated determination after a consensus of media organizations project the winner. See full rules for details.",
+        "settlement_timer_seconds": 1800,
+        "status": "active",
+        "strike_type": "structured",
+        "subtitle": "Republican party:: Republican party",
+        "ticker": "CONTROLH-2026-R",
+        "title": "Will Republicans win the House?",
+        "updated_time": "2026-10-04T20:00:00Z",
+        "volume_24h_fp": "870000.00",
+        "volume_fp": "29000000.00",
+        "yes_ask_dollars": "0.1000",
+        "yes_ask_size_fp": "5000.00",
+        "yes_bid_dollars": "0.0900",
+        "yes_bid_size_fp": "5000.00",
+        "yes_sub_title": "Republican party"
+       }
+      ],
+      "mutually_exclusive": true,
+      "product_metadata": {
+       "competition": "House control",
+       "competition_scope": "Election"
+      },
+      "series_ticker": "CONTROLH",
+      "settlement_sources": [
+       {
+        "name": "United States Congress",
+        "url": "https://www.congress.gov/"
+       }
+      ],
+      "strike_period": "",
+      "sub_title": "In 2026",
+      "title": "Which party will win the House?"
+     }
+    ],
+    "cursor": ""
+   }
+  },
+  {
+   "request": "GET https://api.elections.kalshi.com/trade-api/v2/events?status=open&with_nested_markets=true&limit=200",
+   "status": 200,
+   "body": {
+    "events": [
+     {
+      "category": "Elections",
+      "collateral_return_type": "MECNET",
+      "event_ticker": "SENATEME-26",
+      "exchange_index": 0,
+      "last_updated_ts": "0001-01-01T00:00:00Z",
+      "markets": [
+       {
+        "can_close_early": true,
+        "close_time": "2027-11-03T15:00:00Z",
+        "created_time": "2024-12-03T05:20:37.159771Z",
+        "custom_strike": {
+         "political_party": "57fa2293-3102-463b-9087-68cd9f6da0a6",
+         "politician": "79a41654-264c-4f8b-af6c-66d7e0b857c8"
+        },
+        "early_close_condition": "This market will close early following the swearing in of the Senator for the seat in question.",
+        "event_ticker": "SENATEME-26",
+        "exchange_index": 0,
+        "expected_expiration_time": "2027-01-04T15:00:00Z",
+        "expiration_time": "2027-11-03T15:00:00Z",
+        "expiration_value": "",
+        "last_price_dollars": "0.4200",
+        "latest_expiration_time": "2027-11-03T15:00:00Z",
+        "liquidity_dollars": "0.0000",
+        "market_type": "binary",
+        "no_ask_dollars": "0.5800",
+        "no_bid_dollars": "0.5700",
+        "no_sub_title": "Susan Collins",
+        "notional_value_dollars": "1.0000",
+        "occurrence_datetime": "2027-01-03T15:00:00Z",
+        "open_interest_fp": "120000.00",
+        "open_time": "2024-12-03T15:00:00Z",
+        "previous_price_dollars": "0.4200",
+        "previous_yes_ask_dollars": "0.4250",
+        "previous_yes_bid_dollars": "0.4150",
+        "price_level_structure": "tapered_deci_cent",
+        "price_ranges": [
+         {
+          "end": "0.1000",
+          "start": "0.0000",
+          "step": "0.0010"
+         },
+         {
+          "end": "0.9000",
+          "start": "0.1000",
+          "step": "0.0100"
+         },
+         {
+          "end": "1.0000",
+          "start": "0.9000",
+          "step": "0.0010"
+         }
+        ],
+        "result": "",
+        "rules_primary": "If a representative of the Republican party is sworn in as a Senator of Maine for the term beginning in 2027, then the market resolves to Yes.",
+        "rules_secondary": "This market is eligible for accelerated determination after a consensus of media organizations project the winner. See full rules for details.",
+        "settlement_timer_seconds": 1800,
+        "status": "active",
+        "strike_type": "structured",
+        "subtitle": "Republican party:: Republican party",
+        "ticker": "SENATEME-26-R",
+        "title": "Will Republicans win the Senate race in Maine?",
+        "updated_time": "2026-10-04T20:00:00Z",
+        "volume_24h_fp": "7500.00",
+        "volume_fp": "250000.00",
+        "yes_ask_dollars": "0.4300",
+        "yes_ask_size_fp": "5000.00",
+        "yes_bid_dollars": "0.4200",
+        "yes_bid_size_fp": "5000.00",
+        "yes_sub_title": "Susan Collins"
+       },
+       {
+        "can_close_early": true,
+        "close_time": "2027-11-03T15:00:00Z",
+        "created_time": "2024-12-03T05:20:37.159771Z",
+        "custom_strike": {
+         "political_party": "57fa2293-3102-463b-9087-68cd9f6da0a6",
+         "politician": "79a41654-264c-4f8b-af6c-66d7e0b857c8"
+        },
+        "early_close_condition": "This market will close early following the swearing in of the Senator for the seat in question.",
+        "event_ticker": "SENATEME-26",
+        "exchange_index": 0,
+        "expected_expiration_time": "2027-01-04T15:00:00Z",
+        "expiration_time": "2027-11-03T15:00:00Z",
+        "expiration_value": "",
+        "last_price_dollars": "0.5800",
+        "latest_expiration_time": "2027-11-03T15:00:00Z",
+        "liquidity_dollars": "0.0000",
+        "market_type": "binary",
+        "no_ask_dollars": "0.4300",
+        "no_bid_dollars": "0.4200",
+        "no_sub_title": "Troy Jackson",
+        "notional_value_dollars": "1.0000",
+        "occurrence_datetime": "2027-01-03T15:00:00Z",
+        "open_interest_fp": "120000.00",
+        "open_time": "2024-12-03T15:00:00Z",
+        "previous_price_dollars": "0.5800",
+        "previous_yes_ask_dollars": "0.5850",
+        "previous_yes_bid_dollars": "0.5750",
+        "price_level_structure": "tapered_deci_cent",
+        "price_ranges": [
+         {
+          "end": "0.1000",
+          "start": "0.0000",
+          "step": "0.0010"
+         },
+         {
+          "end": "0.9000",
+          "start": "0.1000",
+          "step": "0.0100"
+         },
+         {
+          "end": "1.0000",
+          "start": "0.9000",
+          "step": "0.0010"
+         }
+        ],
+        "result": "",
+        "rules_primary": "If a representative of the Democratic party is sworn in as a Senator of Maine for the term beginning in 2027, then the market resolves to Yes.",
+        "rules_secondary": "This market is eligible for accelerated determination after a consensus of media organizations project the winner. See full rules for details.",
+        "settlement_timer_seconds": 1800,
+        "status": "active",
+        "strike_type": "structured",
+        "subtitle": ":: Democratic party",
+        "ticker": "SENATEME-26-D",
+        "title": "Will Democratics win the Senate race in Maine?",
+        "updated_time": "2026-10-04T20:00:00Z",
+        "volume_24h_fp": "7500.00",
+        "volume_fp": "250000.00",
+        "yes_ask_dollars": "0.5800",
+        "yes_ask_size_fp": "5000.00",
+        "yes_bid_dollars": "0.5700",
+        "yes_bid_size_fp": "5000.00",
+        "yes_sub_title": "Troy Jackson"
+       }
+      ],
+      "mutually_exclusive": true,
+      "product_metadata": {
+       "competition": "Senate",
+       "competition_scope": "Election"
+      },
+      "series_ticker": "SENATEME",
+      "settlement_sources": [
+       {
+        "name": "United States Congress",
+        "url": "https://www.congress.gov/"
+       }
+      ],
+      "strike_period": "",
+      "sub_title": "In 2026",
+      "title": "Maine Senate winner?"
+     },
+     {
+      "category": "Elections",
+      "collateral_return_type": "MECNET",
+      "event_ticker": "SENATENE-26",
+      "exchange_index": 0,
+      "last_updated_ts": "0001-01-01T00:00:00Z",
+      "markets": [
+       {
+        "can_close_early": true,
+        "close_time": "2027-11-03T15:00:00Z",
+        "created_time": "2024-12-03T05:20:37.159771Z",
+        "custom_strike": {
+         "political_party": "57fa2293-3102-463b-9087-68cd9f6da0a6",
+         "politician": "79a41654-264c-4f8b-af6c-66d7e0b857c8"
+        },
+        "early_close_condition": "This market will close early following the swearing in of the Senator for the seat in question.",
+        "event_ticker": "SENATENE-26",
+        "exchange_index": 0,
+        "expected_expiration_time": "2027-01-04T15:00:00Z",
+        "expiration_time": "2027-11-03T15:00:00Z",
+        "expiration_value": "",
+        "last_price_dollars": "0.6800",
+        "latest_expiration_time": "2027-11-03T15:00:00Z",
+        "liquidity_dollars": "0.0000",
+        "market_type": "binary",
+        "no_ask_dollars": "0.3300",
+        "no_bid_dollars": "0.3200",
+        "no_sub_title": "Pete Ricketts",
+        "notional_value_dollars": "1.0000",
+        "occurrence_datetime": "2027-01-03T15:00:00Z",
+        "open_interest_fp": "120000.00",
+        "open_time": "2024-12-03T15:00:00Z",
+        "previous_price_dollars": "0.6800",
+        "previous_yes_ask_dollars": "0.6850",
+        "previous_yes_bid_dollars": "0.6750",
+        "price_level_structure": "tapered_deci_cent",
+        "price_ranges": [
+         {
+          "end": "0.1000",
+          "start": "0.0000",
+          "step": "0.0010"
+         },
+         {
+          "end": "0.9000",
+          "start": "0.1000",
+          "step": "0.0100"
+         },
+         {
+          "end": "1.0000",
+          "start": "0.9000",
+          "step": "0.0010"
+         }
+        ],
+        "result": "",
+        "rules_primary": "If a representative of the Republican party is sworn in as a Senator of Nebraska for the term beginning in 2027, then the market resolves to Yes.",
+        "rules_secondary": "This market is eligible for accelerated determination after a consensus of media organizations project the winner. See full rules for details.",
+        "settlement_timer_seconds": 1800,
+        "status": "active",
+        "strike_type": "structured",
+        "subtitle": "Republican party:: Republican party",
+        "ticker": "SENATENE-26-R",
+        "title": "Will Republicans win the Senate race in Nebraska?",
+        "updated_time": "2026-10-04T20:00:00Z",
+        "volume_24h_fp": "7500.00",
+        "volume_fp": "250000.00",
+        "yes_ask_dollars": "0.6800",
+        "yes_ask_size_fp": "5000.00",
+        "yes_bid_dollars": "0.6700",
+        "yes_bid_size_fp": "5000.00",
+        "yes_sub_title": "Pete Ricketts"
+       },
+       {
+        "can_close_early": true,
+        "close_time": "2027-11-03T15:00:00Z",
+        "created_time": "2024-12-03T05:20:37.159771Z",
+        "custom_strike": {
+         "political_party": "57fa2293-3102-463b-9087-68cd9f6da0a6",
+         "politician": "79a41654-264c-4f8b-af6c-66d7e0b857c8"
+        },
+        "early_close_condition": "This market will close early following the swearing in of the Senator for the seat in question.",
+        "event_ticker": "SENATENE-26",
+        "exchange_index": 0,
+        "expected_expiration_time": "2027-01-04T15:00:00Z",
+        "expiration_time": "2027-11-03T15:00:00Z",
+        "expiration_value": "",
+        "last_price_dollars": "0.3200",
+        "latest_expiration_time": "2027-11-03T15:00:00Z",
+        "liquidity_dollars": "0.0000",
+        "market_type": "binary",
+        "no_ask_dollars": "0.6900",
+        "no_bid_dollars": "0.6800",
+        "no_sub_title": "Dan Osborn",
+        "notional_value_dollars": "1.0000",
+        "occurrence_datetime": "2027-01-03T15:00:00Z",
+        "open_interest_fp": "120000.00",
+        "open_time": "2024-12-03T15:00:00Z",
+        "previous_price_dollars": "0.3200",
+        "previous_yes_ask_dollars": "0.3250",
+        "previous_yes_bid_dollars": "0.3150",
+        "price_level_structure": "tapered_deci_cent",
+        "price_ranges": [
+         {
+          "end": "0.1000",
+          "start": "0.0000",
+          "step": "0.0010"
+         },
+         {
+          "end": "0.9000",
+          "start": "0.1000",
+          "step": "0.0100"
+         },
+         {
+          "end": "1.0000",
+          "start": "0.9000",
+          "step": "0.0010"
+         }
+        ],
+        "result": "",
+        "rules_primary": "If Dan Osborn is sworn in as a Senator of Nebraska for the term beginning in 2027, then the market resolves to Yes.",
+        "rules_secondary": "This market is eligible for accelerated determination after a consensus of media organizations project the winner. See full rules for details.",
+        "settlement_timer_seconds": 1800,
+        "status": "active",
+        "strike_type": "structured",
+        "subtitle": "Dan Osborn:: Independent",
+        "ticker": "SENATENE-26-I",
+        "title": "Will Dan Osborn win the Senate race in Nebraska?",
+        "updated_time": "2026-10-04T20:00:00Z",
+        "volume_24h_fp": "7500.00",
+        "volume_fp": "250000.00",
+        "yes_ask_dollars": "0.3200",
+        "yes_ask_size_fp": "5000.00",
+        "yes_bid_dollars": "0.3100",
+        "yes_bid_size_fp": "5000.00",
+        "yes_sub_title": "Dan Osborn"
+       }
+      ],
+      "mutually_exclusive": true,
+      "product_metadata": {
+       "competition": "Senate",
+       "competition_scope": "Election"
+      },
+      "series_ticker": "SENATENE",
+      "settlement_sources": [
+       {
+        "name": "United States Congress",
+        "url": "https://www.congress.gov/"
+       }
+      ],
+      "strike_period": "",
+      "sub_title": "In 2026",
+      "title": "Nebraska Senate winner?"
+     },
+     {
+      "category": "Elections",
+      "collateral_return_type": "MECNET",
+      "event_ticker": "HOUSEAZ1-26",
+      "exchange_index": 0,
+      "last_updated_ts": "0001-01-01T00:00:00Z",
+      "markets": [
+       {
+        "can_close_early": true,
+        "close_time": "2027-11-03T15:00:00Z",
+        "created_time": "2024-12-03T05:20:37.159771Z",
+        "custom_strike": {
+         "political_party": "57fa2293-3102-463b-9087-68cd9f6da0a6",
+         "politician": "79a41654-264c-4f8b-af6c-66d7e0b857c8"
+        },
+        "early_close_condition": "This market will close early following the swearing in of the Senator for the seat in question.",
+        "event_ticker": "HOUSEAZ1-26",
+        "exchange_index": 0,
+        "expected_expiration_time": "2027-01-04T15:00:00Z",
+        "expiration_time": "2027-11-03T15:00:00Z",
+        "expiration_value": "",
+        "last_price_dollars": "0.6100",
+        "latest_expiration_time": "2027-11-03T15:00:00Z",
+        "liquidity_dollars": "0.0000",
+        "market_type": "binary",
+        "no_ask_dollars": "0.4000",
+        "no_bid_dollars": "0.3700",
+        "no_sub_title": "Amish Shah",
+        "notional_value_dollars": "1.0000",
+        "occurrence_datetime": "2027-01-03T15:00:00Z",
+        "open_interest_fp": "40000.00",
+        "open_time": "2024-12-03T15:00:00Z",
+        "previous_price_dollars": "0.6100",
+        "previous_yes_ask_dollars": "0.6150",
+        "previous_yes_bid_dollars": "0.6050",
+        "price_level_structure": "tapered_deci_cent",
+        "price_ranges": [
+         {
+          "end": "0.1000",
+          "start": "0.0000",
+          "step": "0.0010"
+         },
+         {
+          "end": "0.9000",
+          "start": "0.1000",
+          "step": "0.0100"
+         },
+         {
+          "end": "1.0000",
+          "start": "0.9000",
+          "step": "0.0010"
+         }
+        ],
+        "result": "",
+        "rules_primary": "If a representative of the Democratic party is sworn in as the Representative for Arizona's 1st congressional district for the term beginning in 2027, then the market resolves to Yes.",
+        "rules_secondary": "This market is eligible for accelerated determination after a consensus of media organizations project the winner. See full rules for details.",
+        "settlement_timer_seconds": 1800,
+        "status": "active",
+        "strike_type": "structured",
+        "subtitle": ":: Democratic party",
+        "ticker": "HOUSEAZ1-26-D",
+        "title": "Will Democrats win AZ-01?",
+        "updated_time": "2026-10-04T20:00:00Z",
+        "volume_24h_fp": "2730.00",
+        "volume_fp": "91000.00",
+        "yes_ask_dollars": "0.6300",
+        "yes_ask_size_fp": "5000.00",
+        "yes_bid_dollars": "0.6000",
+        "yes_bid_size_fp": "5000.00",
+        "yes_sub_title": "Amish Shah"
+       },
+       {
+        "can_close_early": true,
+        "close_time": "2027-11-03T15:00:00Z",
+        "created_time": "2024-12-03T05:20:37.159771Z",
+        "custom_strike": {
+         "political_party": "57fa2293-3102-463b-9087-68cd9f6da0a6",
+         "politician": "79a41654-264c-4f8b-af6c-66d7e0b857c8"
+        },
+        "early_close_condition": "This market will close early following the swearing in of the Senator for the seat in question.",
+        "event_ticker": "HOUSEAZ1-26",
+        "exchange_index": 0,
+        "expected_expiration_time": "2027-01-04T15:00:00Z",
+        "expiration_time": "2027-11-03T15:00:00Z",
+        "expiration_value": "",
+        "last_price_dollars": "0.3900",
+        "latest_expiration_time": "2027-11-03T15:00:00Z",
+        "liquidity_dollars": "0.0000",
+        "market_type": "binary",
+        "no_ask_dollars": "0.6300",
+        "no_bid_dollars": "0.6000",
+        "no_sub_title": "Jay Feely",
+        "notional_value_dollars": "1.0000",
+        "occurrence_datetime": "2027-01-03T15:00:00Z",
+        "open_interest_fp": "39000.00",
+        "open_time": "2024-12-03T15:00:00Z",
+        "previous_price_dollars": "0.3900",
+        "previous_yes_ask_dollars": "0.3950",
+        "previous_yes_bid_dollars": "0.3850",
+        "price_level_structure": "tapered_deci_cent",
+        "price_ranges": [
+         {
+          "end": "0.1000",
+          "start": "0.0000",
+          "step": "0.0010"
+         },
+         {
+          "end": "0.9000",
+          "start": "0.1000",
+          "step": "0.0100"
+         },
+         {
+          "end": "1.0000",
+          "start": "0.9000",
+          "step": "0.0010"
+         }
+        ],
+        "result": "",
+        "rules_primary": "If a representative of the Republican party is sworn in as the Representative for Arizona's 1st congressional district for the term beginning in 2027, then the market resolves to Yes.",
+        "rules_secondary": "This market is eligible for accelerated determination after a consensus of media organizations project the winner. See full rules for details.",
+        "settlement_timer_seconds": 1800,
+        "status": "active",
+        "strike_type": "structured",
+        "subtitle": "Republican party:: Republican party",
+        "ticker": "HOUSEAZ1-26-R",
+        "title": "Will Republicans win AZ-01?",
+        "updated_time": "2026-10-04T20:00:00Z",
+        "volume_24h_fp": "2640.00",
+        "volume_fp": "88000.00",
+        "yes_ask_dollars": "0.4000",
+        "yes_ask_size_fp": "5000.00",
+        "yes_bid_dollars": "0.3700",
+        "yes_bid_size_fp": "5000.00",
+        "yes_sub_title": "Jay Feely"
+       }
+      ],
+      "mutually_exclusive": true,
+      "product_metadata": {
+       "competition": "House",
+       "competition_scope": "Election"
+      },
+      "series_ticker": "HOUSEAZ1",
+      "settlement_sources": [
+       {
+        "name": "United States Congress",
+        "url": "https://www.congress.gov/"
+       }
+      ],
+      "strike_period": "",
+      "sub_title": "In 2026",
+      "title": "AZ-01 House winner?"
+     },
+     {
+      "category": "Elections",
+      "collateral_return_type": "MECNET",
+      "event_ticker": "KXHOUSERACE-AL02-26",
+      "exchange_index": 0,
+      "last_updated_ts": "0001-01-01T00:00:00Z",
+      "markets": [
+       {
+        "can_close_early": true,
+        "close_time": "2027-11-03T15:00:00Z",
+        "created_time": "2024-12-03T05:20:37.159771Z",
+        "custom_strike": {
+         "political_party": "57fa2293-3102-463b-9087-68cd9f6da0a6",
+         "politician": "79a41654-264c-4f8b-af6c-66d7e0b857c8"
+        },
+        "early_close_condition": "This market will close early following the swearing in of the Senator for the seat in question.",
+        "event_ticker": "KXHOUSERACE-AL02-26",
+        "exchange_index": 0,
+        "expected_expiration_time": "2027-01-04T15:00:00Z",
+        "expiration_time": "2027-11-03T15:00:00Z",
+        "expiration_value": "",
+        "last_price_dollars": "0.8200",
+        "latest_expiration_time": "2027-11-03T15:00:00Z",
+        "liquidity_dollars": "0.0000",
+        "market_type": "binary",
+        "no_ask_dollars": "0.2000",
+        "no_bid_dollars": "0.1700",
+        "no_sub_title": "Shomari Figures",
+        "notional_value_dollars": "1.0000",
+        "occurrence_datetime": "2027-01-03T15:00:00Z",
+        "open_interest_fp": "9000.00",
+        "open_time": "2024-12-03T15:00:00Z",
+        "previous_price_dollars": "0.8200",
+        "previous_yes_ask_dollars": "0.8250",
+        "previous_yes_bid_dollars": "0.8150",
+        "price_level_structure": "tapered_deci_cent",
+        "price_ranges": [
+         {
+          "end": "0.1000",
+          "start": "0.0000",
+          "step": "0.0010"
+         },
+         {
+          "end": "0.9000",
+          "start": "0.1000",
+          "step": "0.0100"
+         },
+         {
+          "end": "1.0000",
+          "start": "0.9000",
+          "step": "0.0010"
+         }
+        ],
+        "result": "",
+        "rules_primary": "If a representative of the Democratic party is sworn in as the Representative for Alabama's 2nd congressional district for the term beginning in 2027, then the market resolves to Yes.",
+        "rules_secondary": "This market is eligible for accelerated determination after a consensus of media organizations project the winner. See full rules for details.",
+        "settlement_timer_seconds": 1800,
+        "status": "active",
+        "strike_type": "structured",
+        "subtitle": ":: Democratic party",
+        "ticker": "KXHOUSERACE-AL02-26-D",
+        "title": "Will Democrats win AL-02?",
+        "updated_time": "2026-10-04T20:00:00Z",
+        "volume_24h_fp": "630.00",
+        "volume_fp": "21000.00",
+        "yes_ask_dollars": "0.8300",
+        "yes_ask_size_fp": "5000.00",
+        "yes_bid_dollars": "0.8000",
+        "yes_bid_size_fp": "5000.00",
+        "yes_sub_title": "Shomari Figures"
+       },
+       {
+        "can_close_early": true,
+        "close_time": "2027-11-03T15:00:00Z",
+        "created_time": "2024-12-03T05:20:37.159771Z",
+        "custom_strike": {
+         "political_party": "57fa2293-3102-463b-9087-68cd9f6da0a6",
+         "politician": "79a41654-264c-4f8b-af6c-66d7e0b857c8"
+        },
+        "early_close_condition": "This market will close early following the swearing in of the Senator for the seat in question.",
+        "event_ticker": "KXHOUSERACE-AL02-26",
+        "exchange_index": 0,
+        "expected_expiration_time": "2027-01-04T15:00:00Z",
+        "expiration_time": "2027-11-03T15:00:00Z",
+        "expiration_value": "",
+        "last_price_dollars": "0.1800",
+        "latest_expiration_time": "2027-11-03T15:00:00Z",
+        "liquidity_dollars": "0.0000",
+        "market_type": "binary",
+        "no_ask_dollars": "0.8300",
+        "no_bid_dollars": "0.8000",
+        "no_sub_title": "Rhett Marques",
+        "notional_value_dollars": "1.0000",
+        "occurrence_datetime": "2027-01-03T15:00:00Z",
+        "open_interest_fp": "8800.00",
+        "open_time": "2024-12-03T15:00:00Z",
+        "previous_price_dollars": "0.1800",
+        "previous_yes_ask_dollars": "0.1850",
+        "previous_yes_bid_dollars": "0.1750",
+        "price_level_structure": "tapered_deci_cent",
+        "price_ranges": [
+         {
+          "end": "0.1000",
+          "start": "0.0000",
+          "step": "0.0010"
+         },
+         {
+          "end": "0.9000",
+          "start": "0.1000",
+          "step": "0.0100"
+         },
+         {
+          "end": "1.0000",
+          "start": "0.9000",
+          "step": "0.0010"
+         }
+        ],
+        "result": "",
+        "rules_primary": "If a representative of the Republican party is sworn in as the Representative for Alabama's 2nd congressional district for the term beginning in 2027, then the market resolves to Yes.",
+        "rules_secondary": "This market is eligible for accelerated determination after a consensus of media organizations project the winner. See full rules for details.",
+        "settlement_timer_seconds": 1800,
+        "status": "active",
+        "strike_type": "structured",
+        "subtitle": "Republican party:: Republican party",
+        "ticker": "KXHOUSERACE-AL02-26-R",
+        "title": "Will Republicans win AL-02?",
+        "updated_time": "2026-10-04T20:00:00Z",
+        "volume_24h_fp": "615.00",
+        "volume_fp": "20500.00",
+        "yes_ask_dollars": "0.2000",
+        "yes_ask_size_fp": "5000.00",
+        "yes_bid_dollars": "0.1700",
+        "yes_bid_size_fp": "5000.00",
+        "yes_sub_title": "Rhett Marques"
+       }
+      ],
+      "mutually_exclusive": true,
+      "product_metadata": {
+       "competition": "House",
+       "competition_scope": "Election"
+      },
+      "series_ticker": "KXHOUSERACE",
+      "settlement_sources": [
+       {
+        "name": "United States Congress",
+        "url": "https://www.congress.gov/"
+       }
+      ],
+      "strike_period": "",
+      "sub_title": "In 2026",
+      "title": "AL-02 House winner?"
+     },
+     {
+      "category": "Elections",
+      "collateral_return_type": "MECNET",
+      "event_ticker": "GOVPARTYGA-26",
+      "exchange_index": 0,
+      "last_updated_ts": "0001-01-01T00:00:00Z",
+      "markets": [
+       {
+        "can_close_early": true,
+        "close_time": "2027-11-03T15:00:00Z",
+        "created_time": "2024-12-03T05:20:37.159771Z",
+        "custom_strike": {
+         "political_party": "57fa2293-3102-463b-9087-68cd9f6da0a6",
+         "politician": "79a41654-264c-4f8b-af6c-66d7e0b857c8"
+        },
+        "early_close_condition": "This market will close early following the swearing in of the Senator for the seat in question.",
+        "event_ticker": "GOVPARTYGA-26",
+        "exchange_index": 0,
+        "expected_expiration_time": "2027-01-04T15:00:00Z",
+        "expiration_time": "2027-11-03T15:00:00Z",
+        "expiration_value": "",
+        "last_price_dollars": "0.5700",
+        "latest_expiration_time": "2027-11-03T15:00:00Z",
+        "liquidity_dollars": "0.0000",
+        "market_type": "binary",
+        "no_ask_dollars": "0.4400",
+        "no_bid_dollars": "0.4300",
+        "no_sub_title": "Keisha Lance Bottoms",
+        "notional_value_dollars": "1.0000",
+        "occurrence_datetime": "2027-01-03T15:00:00Z",
+        "open_interest_fp": "120000.00",
+        "open_time": "2024-12-03T15:00:00Z",
+        "previous_price_dollars": "0.5700",
+        "previous_yes_ask_dollars": "0.5750",
+        "previous_yes_bid_dollars": "0.5650",
+        "price_level_structure": "tapered_deci_cent",
+        "price_ranges": [
+         {
+          "end": "0.1000",
+          "start": "0.0000",
+          "step": "0.0010"
+         },
+         {
+          "end": "0.9000",
+          "start": "0.1000",
+          "step": "0.0100"
+         },
+         {
+          "end": "1.0000",
+          "start": "0.9000",
+          "step": "0.0010"
+         }
+        ],
+        "result": "",
+        "rules_primary": "If a representative of the Democratic party is sworn in as Governor of Georgia for the term beginning in 2027, then the market resolves to Yes.",
+        "rules_secondary": "This market is eligible for accelerated determination after a consensus of media organizations project the winner. See full rules for details.",
+        "settlement_timer_seconds": 1800,
+        "status": "active",
+        "strike_type": "structured",
+        "subtitle": ":: Democratic party",
+        "ticker": "GOVPARTYGA-26-D",
+        "title": "Will Democrats win the Georgia governor race?",
+        "updated_time": "2026-10-04T20:00:00Z",
+        "volume_24h_fp": "7500.00",
+        "volume_fp": "250000.00",
+        "yes_ask_dollars": "0.5700",
+        "yes_ask_size_fp": "5000.00",
+        "yes_bid_dollars": "0.5600",
+        "yes_bid_size_fp": "5000.00",
+        "yes_sub_title": "Keisha Lance Bottoms"
+       },
+       {
+        "can_close_early": true,
+        "close_time": "2027-11-03T15:00:00Z",
+        "created_time": "2024-12-03T05:20:37.159771Z",
+        "custom_strike": {
+         "political_party": "57fa2293-3102-463b-9087-68cd9f6da0a6",
+         "politician": "79a41654-264c-4f8b-af6c-66d7e0b857c8"
+        },
+        "early_close_condition": "This market will close early following the swearing in of the Senator for the seat in question.",
+        "event_ticker": "GOVPARTYGA-26",
+        "exchange_index": 0,
+        "expected_expiration_time": "2027-01-04T15:00:00Z",
+        "expiration_time": "2027-11-03T15:00:00Z",
+        "expiration_value": "",
+        "last_price_dollars": "0.4300",
+        "latest_expiration_time": "2027-11-03T15:00:00Z",
+        "liquidity_dollars": "0.0000",
+        "market_type": "binary",
+        "no_ask_dollars": "0.5700",
+        "no_bid_dollars": "0.5600",
+        "no_sub_title": "Rick Jackson",
+        "notional_value_dollars": "1.0000",
+        "occurrence_datetime": "2027-01-03T15:00:00Z",
+        "open_interest_fp": "120000.00",
+        "open_time": "2024-12-03T15:00:00Z",
+        "previous_price_dollars": "0.4300",
+        "previous_yes_ask_dollars": "0.4350",
+        "previous_yes_bid_dollars": "0.4250",
+        "price_level_structure": "tapered_deci_cent",
+        "price_ranges": [
+         {
+          "end": "0.1000",
+          "start": "0.0000",
+          "step": "0.0010"
+         },
+         {
+          "end": "0.9000",
+          "start": "0.1000",
+          "step": "0.0100"
+         },
+         {
+          "end": "1.0000",
+          "start": "0.9000",
+          "step": "0.0010"
+         }
+        ],
+        "result": "",
+        "rules_primary": "If a representative of the Republican party is sworn in as Governor of Georgia for the term beginning in 2027, then the market resolves to Yes.",
+        "rules_secondary": "This market is eligible for accelerated determination after a consensus of media organizations project the winner. See full rules for details.",
+        "settlement_timer_seconds": 1800,
+        "status": "active",
+        "strike_type": "structured",
+        "subtitle": "Republican party:: Republican party",
+        "ticker": "GOVPARTYGA-26-R",
+        "title": "Will Republicans win the Georgia governor race?",
+        "updated_time": "2026-10-04T20:00:00Z",
+        "volume_24h_fp": "7500.00",
+        "volume_fp": "250000.00",
+        "yes_ask_dollars": "0.4400",
+        "yes_ask_size_fp": "5000.00",
+        "yes_bid_dollars": "0.4300",
+        "yes_bid_size_fp": "5000.00",
+        "yes_sub_title": "Rick Jackson"
+       }
+      ],
+      "mutually_exclusive": true,
+      "product_metadata": {
+       "competition": "Governor",
+       "competition_scope": "Election"
+      },
+      "series_ticker": "GOVPARTYGA",
+      "settlement_sources": [
+       {
+        "name": "United States Congress",
+        "url": "https://www.congress.gov/"
+       }
+      ],
+      "strike_period": "",
+      "sub_title": "In 2026",
+      "title": "Georgia governor winner?"
+     }
+    ],
+    "cursor": "CgwI8LnUxwYQwP7NsQISC1NFTkFURU1FLTI2"
+   }
+  },
+  {
+   "request": "GET https://api.elections.kalshi.com/trade-api/v2/events?status=open&with_nested_markets=true&limit=200&cursor=CgwI8LnUxwYQwP7NsQISC1NFTkFURU1FLTI2",
+   "status": 200,
+   "body": {
+    "events": [],
+    "cursor": ""
+   }
+  },
+  {
+   "request": "GET https://api.elections.kalshi.com/trade-api/v2/events/SENATENE-26?with_nested_markets=true",
+   "status": 200,
+   "body": {
+    "event": {
+     "category": "Elections",
+     "collateral_return_type": "MECNET",
+     "event_ticker": "SENATENE-26",
+     "exchange_index": 0,
+     "last_updated_ts": "0001-01-01T00:00:00Z",
+     "markets": [
+      {
+       "can_close_early": true,
+       "close_time": "2027-11-03T15:00:00Z",
+       "created_time": "2024-12-03T05:20:37.159771Z",
+       "custom_strike": {
+        "political_party": "57fa2293-3102-463b-9087-68cd9f6da0a6",
+        "politician": "79a41654-264c-4f8b-af6c-66d7e0b857c8"
+       },
+       "early_close_condition": "This market will close early following the swearing in of the Senator for the seat in question.",
+       "event_ticker": "SENATENE-26",
+       "exchange_index": 0,
+       "expected_expiration_time": "2027-01-04T15:00:00Z",
+       "expiration_time": "2027-11-03T15:00:00Z",
+       "expiration_value": "",
+       "last_price_dollars": "0.6800",
+       "latest_expiration_time": "2027-11-03T15:00:00Z",
+       "liquidity_dollars": "0.0000",
+       "market_type": "binary",
+       "no_ask_dollars": "0.3300",
+       "no_bid_dollars": "0.3200",
+       "no_sub_title": "Pete Ricketts",
+       "notional_value_dollars": "1.0000",
+       "occurrence_datetime": "2027-01-03T15:00:00Z",
+       "open_interest_fp": "120000.00",
+       "open_time": "2024-12-03T15:00:00Z",
+       "previous_price_dollars": "0.6800",
+       "previous_yes_ask_dollars": "0.6850",
+       "previous_yes_bid_dollars": "0.6750",
+       "price_level_structure": "tapered_deci_cent",
+       "price_ranges": [
+        {
+         "end": "0.1000",
+         "start": "0.0000",
+         "step": "0.0010"
+        },
+        {
+         "end": "0.9000",
+         "start": "0.1000",
+         "step": "0.0100"
+        },
+        {
+         "end": "1.0000",
+         "start": "0.9000",
+         "step": "0.0010"
+        }
+       ],
+       "result": "",
+       "rules_primary": "If a representative of the Republican party is sworn in as a Senator of Nebraska for the term beginning in 2027, then the market resolves to Yes.",
+       "rules_secondary": "This market is eligible for accelerated determination after a consensus of media organizations project the winner. See full rules for details.",
+       "settlement_timer_seconds": 1800,
+       "status": "active",
+       "strike_type": "structured",
+       "subtitle": "Republican party:: Republican party",
+       "ticker": "SENATENE-26-R",
+       "title": "Will Republicans win the Senate race in Nebraska?",
+       "updated_time": "2026-10-04T20:00:00Z",
+       "volume_24h_fp": "7500.00",
+       "volume_fp": "250000.00",
+       "yes_ask_dollars": "0.6800",
+       "yes_ask_size_fp": "5000.00",
+       "yes_bid_dollars": "0.6700",
+       "yes_bid_size_fp": "5000.00",
+       "yes_sub_title": "Pete Ricketts"
+      },
+      {
+       "can_close_early": true,
+       "close_time": "2027-11-03T15:00:00Z",
+       "created_time": "2024-12-03T05:20:37.159771Z",
+       "custom_strike": {
+        "political_party": "57fa2293-3102-463b-9087-68cd9f6da0a6",
+        "politician": "79a41654-264c-4f8b-af6c-66d7e0b857c8"
+       },
+       "early_close_condition": "This market will close early following the swearing in of the Senator for the seat in question.",
+       "event_ticker": "SENATENE-26",
+       "exchange_index": 0,
+       "expected_expiration_time": "2027-01-04T15:00:00Z",
+       "expiration_time": "2027-11-03T15:00:00Z",
+       "expiration_value": "",
+       "last_price_dollars": "0.3200",
+       "latest_expiration_time": "2027-11-03T15:00:00Z",
+       "liquidity_dollars": "0.0000",
+       "market_type": "binary",
+       "no_ask_dollars": "0.6900",
+       "no_bid_dollars": "0.6800",
+       "no_sub_title": "Dan Osborn",
+       "notional_value_dollars": "1.0000",
+       "occurrence_datetime": "2027-01-03T15:00:00Z",
+       "open_interest_fp": "120000.00",
+       "open_time": "2024-12-03T15:00:00Z",
+       "previous_price_dollars": "0.3200",
+       "previous_yes_ask_dollars": "0.3250",
+       "previous_yes_bid_dollars": "0.3150",
+       "price_level_structure": "tapered_deci_cent",
+       "price_ranges": [
+        {
+         "end": "0.1000",
+         "start": "0.0000",
+         "step": "0.0010"
+        },
+        {
+         "end": "0.9000",
+         "start": "0.1000",
+         "step": "0.0100"
+        },
+        {
+         "end": "1.0000",
+         "start": "0.9000",
+         "step": "0.0010"
+        }
+       ],
+       "result": "",
+       "rules_primary": "If Dan Osborn is sworn in as a Senator of Nebraska for the term beginning in 2027, then the market resolves to Yes.",
+       "rules_secondary": "This market is eligible for accelerated determination after a consensus of media organizations project the winner. See full rules for details.",
+       "settlement_timer_seconds": 1800,
+       "status": "active",
+       "strike_type": "structured",
+       "subtitle": "Dan Osborn:: Independent",
+       "ticker": "SENATENE-26-I",
+       "title": "Will Dan Osborn win the Senate race in Nebraska?",
+       "updated_time": "2026-10-04T20:00:00Z",
+       "volume_24h_fp": "7500.00",
+       "volume_fp": "250000.00",
+       "yes_ask_dollars": "0.3200",
+       "yes_ask_size_fp": "5000.00",
+       "yes_bid_dollars": "0.3100",
+       "yes_bid_size_fp": "5000.00",
+       "yes_sub_title": "Dan Osborn"
+      }
+     ],
+     "mutually_exclusive": true,
+     "product_metadata": {
+      "competition": "Senate",
+      "competition_scope": "Election"
+     },
+     "series_ticker": "SENATENE",
+     "settlement_sources": [
+      {
+       "name": "United States Congress",
+       "url": "https://www.congress.gov/"
+      }
+     ],
+     "strike_period": "",
+     "sub_title": "In 2026",
+     "title": "Nebraska Senate winner?"
+    },
+    "markets": []
+   }
+  },
+  {
+   "request": "GET https://api.elections.kalshi.com/trade-api/v2/events?series_ticker=KXSENATETXR&status=settled&with_nested_markets=true",
+   "status": 200,
+   "body": {
+    "events": [
+     {
+      "category": "Elections",
+      "collateral_return_type": "MECNET",
+      "event_ticker": "KXSENATETXR-26",
+      "exchange_index": 0,
+      "last_updated_ts": "0001-01-01T00:00:00Z",
+      "markets": [
+       {
+        "can_close_early": true,
+        "close_time": "2026-05-27T03:00:00Z",
+        "created_time": "2024-12-03T05:20:37.159771Z",
+        "custom_strike": {
+         "political_party": "57fa2293-3102-463b-9087-68cd9f6da0a6",
+         "politician": "79a41654-264c-4f8b-af6c-66d7e0b857c8"
+        },
+        "early_close_condition": "This market will close early following the swearing in of the Senator for the seat in question.",
+        "event_ticker": "KXSENATETXR-26",
+        "exchange_index": 0,
+        "expected_expiration_time": "2026-05-27T03:00:00Z",
+        "expiration_time": "2026-05-27T03:00:00Z",
+        "expiration_value": "",
+        "last_price_dollars": "0.9900",
+        "latest_expiration_time": "2026-05-27T03:00:00Z",
+        "liquidity_dollars": "0.0000",
+        "market_type": "binary",
+        "no_ask_dollars": "0.0000",
+        "no_bid_dollars": "0.0000",
+        "no_sub_title": "Ken Paxton",
+        "notional_value_dollars": "1.0000",
+        "occurrence_datetime": "2027-01-03T15:00:00Z",
+        "open_interest_fp": "120000.00",
+        "open_time": "2024-12-03T15:00:00Z",
+        "previous_price_dollars": "0.9900",
+        "previous_yes_ask_dollars": "0.9950",
+        "previous_yes_bid_dollars": "0.9850",
+        "price_level_structure": "tapered_deci_cent",
+        "price_ranges": [
+         {
+          "end": "0.1000",
+          "start": "0.0000",
+          "step": "0.0010"
+         },
+         {
+          "end": "0.9000",
+          "start": "0.1000",
+          "step": "0.0100"
+         },
+         {
+          "end": "1.0000",
+          "start": "0.9000",
+          "step": "0.0010"
+         }
+        ],
+        "result": "yes",
+        "rules_primary": "If Ken Paxton is the Republican nominee for the 2026 Texas Senate election, then the market resolves to Yes.",
+        "rules_secondary": "This market is eligible for accelerated determination after a consensus of media organizations project the winner. See full rules for details.",
+        "settlement_timer_seconds": 1800,
+        "status": "finalized",
+        "strike_type": "structured",
+        "subtitle": ":: Democratic party",
+        "ticker": "KXSENATETXR-26-KPAX",
+        "title": "Will Ken Paxton be the Republican nominee for Senate in Texas?",
+        "updated_time": "2026-10-04T20:00:00Z",
+        "volume_24h_fp": "7500.00",
+        "volume_fp": "250000.00",
+        "yes_ask_dollars": "0.0000",
+        "yes_ask_size_fp": "5000.00",
+        "yes_bid_dollars": "0.0000",
+        "yes_bid_size_fp": "5000.00",
+        "yes_sub_title": "Ken Paxton",
+        "settlement_value_dollars": "1.0000"
+       }
+      ],
+      "mutually_exclusive": true,
+      "product_metadata": {
+       "competition": "Senate primary",
+       "competition_scope": "Election"
+      },
+      "series_ticker": "KXSENATETXR",
+      "settlement_sources": [
+       {
+        "name": "United States Congress",
+        "url": "https://www.congress.gov/"
+       }
+      ],
+      "strike_period": "",
+      "sub_title": "In 2026",
+      "title": "Texas Republican Senate nominee?"
+     }
+    ],
+    "cursor": ""
+   }
+  },
+  {
+   "request": "GET https://api.elections.kalshi.com/trade-api/v2/series?category=Elections",
+   "status": 200,
+   "body": {
+    "series": [
+     {
+      "ticker": "SENATENH",
+      "frequency": "custom",
+      "title": "New Hampshire Senate winner",
+      "category": "Elections",
+      "tags": [
+       "Senate"
+      ],
+      "settlement_sources": [
+       {
+        "name": "United States Congress",
+        "url": "https://www.congress.gov/"
+       }
+      ],
+      "contract_url": "",
+      "fee_type": "quadratic",
+      "fee_multiplier": 1
+     },
+     {
+      "ticker": "CONTROLS",
+      "frequency": "custom",
+      "title": "Senate control",
+      "category": "Elections",
+      "tags": [
+       "Senate"
+      ],
+      "settlement_sources": [
+       {
+        "name": "United States Senate",
+        "url": "https://www.senate.gov/"
+       }
+      ],
+      "contract_url": "",
+      "fee_type": "quadratic",
+      "fee_multiplier": 1
+     },
+     {
+      "ticker": "KXHOUSERACE",
+      "frequency": "custom",
+      "title": "House race winner",
+      "category": "Elections",
+      "tags": [
+       "House"
+      ],
+      "settlement_sources": [
+       {
+        "name": "United States Congress",
+        "url": "https://www.congress.gov/"
+       }
+      ],
+      "contract_url": "",
+      "fee_type": "quadratic",
+      "fee_multiplier": 1
+     },
+     {
+      "ticker": "KXSENATETXR",
+      "frequency": "custom",
+      "title": "Texas Republican Senate nominee",
+      "category": "Elections",
+      "tags": [
+       "Primaries"
+      ],
+      "settlement_sources": [],
+      "contract_url": "",
+      "fee_type": "quadratic",
+      "fee_multiplier": 1
+     }
+    ],
+    "cursor": ""
+   },
+   "_note": "series objects ILLUSTRATIVE; field names from kalshi_python_sync models/series.py (ticker, frequency, title, category, tags, settlement_sources, contract_url, contract_terms_url, product_metadata, fee_type, fee_multiplier, additional_prohibitions)"
+  },
+  {
+   "request": "GET https://api.elections.kalshi.com/trade-api/v2/events/NOPE-26",
+   "status": 404,
+   "body": {
+    "error": {
+     "code": "not_found",
+     "message": "not found"
+    }
+   }
+  },
+  {
+   "request": "GET https://api.elections.kalshi.com/trade-api/v2/events?status=open&limit=200",
+   "status": 429,
+   "headers": {
+    "Retry-After": "1"
+   },
+   "body": {
+    "error": {
+     "code": "too_many_requests",
+     "message": "too many requests"
+    }
+   }
+  }
+ ]
+}

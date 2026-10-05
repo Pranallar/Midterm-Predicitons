@@ -1404,3 +1404,116 @@ def build_report(*, now: float, surges: Sequence[Surge], bands: Sequence[HighBan
         backtest=backtest,
         assumptions=_assumptions(mode, bal, sizing, leader, rank, days_left, value),
     )
+
+
+# =========================================================================== paper-trading additions
+# Package B of docs/PAPER_TRADING.md (§5). Skeletons: the existing functions above keep working
+# unchanged until package B rewires build_report onto generate_signals + sizing policies.
+
+import re  # noqa: E402
+from dataclasses import dataclass as _dataclass, field as _field  # noqa: E402
+
+from .models import (  # noqa: E402
+    FairValue,
+    RaceRef,
+    StrategyInputs,
+    StrategyParams,
+)
+
+# States whose count usually runs past the Cup's closeout window (or uses ranked-choice runoffs).
+SLOW_COUNT_STATES = frozenset({"AK", "AZ", "NV", "CA", "WA", "OR", "UT", "ME"})
+RCV_STATES = frozenset({"AK", "ME"})
+# Option labels that make a multi-outcome market exhaustive (a catch-all outcome exists).
+CATCH_ALL_RE = re.compile(r"\b(any other|other|someone else|field|none of the above)\b", re.IGNORECASE)
+
+
+@_dataclass
+class RaceGroup:
+    """Mutually exclusive outcomes of one race: separate binary markets sharing a race key, or the
+    outcomes of one multi-outcome market."""
+
+    key: str  # race_key, or "market:<id>"
+    exchange_ids: List[str]
+    exhaustive: bool  # exactly one member must win (a YES basket is riskless only then)
+    source: str  # "race" | "market" | "relationship"
+    market_ids: List[str] = _field(default_factory=list)
+    why_exhaustive: str = ""
+
+
+def idea_id_for(kind: str, *, exchange_id: Optional[str] = None, legs: Sequence[Mapping[str, Any]] = (),
+                side: Optional[str] = None, surge_id: Optional[int] = None, extra: str = "") -> str:
+    """The stable idea key: ``"<kind>:x<eid>:<side>[:s<surge_id>][:<extra>]"`` for single-outcome
+    ideas, ``"<kind>:set:<eid1>+<eid2>...:<sides>"`` (legs sorted by exchange id) for sets."""
+    raise NotImplementedError
+
+
+def settles_before(settlement_date: Optional[str], cup_end: Optional[float], margin_s: float = 3600.0) -> Optional[bool]:
+    """True only when the market settles at least ``margin_s`` before the Cup end (a settlementDate
+    equal to the Cup end is the end-of-Cup closeout, not a resolution: False); None when unknown."""
+    raise NotImplementedError
+
+
+def called_prob(race: Optional[RaceRef], favourite_price: Optional[float], params: StrategyParams) -> float:
+    """P(the race is called, so prices go to ~0/1, before the Cup's closeout window):
+    favourite >= 0.95 -> called_prob_safe (0.80 in RCV_STATES); state in SLOW_COUNT_STATES ->
+    called_prob_slow; known race elsewhere -> called_prob_fast; unknown race -> the mean of fast and slow."""
+    raise NotImplementedError
+
+
+def regime_ev(resolution_gap: float, convergence_gain: float, regime: str, called: float,
+              params: StrategyParams, *, settles_before_end: Optional[bool] = None) -> Tuple[float, str]:
+    """Expected value per share of holding a contract, under the settlement regime (§5.2):
+
+    * resolved_outcomes, or the market settles before the Cup end: ``resolution_gap`` (fair - entry);
+    * vwap_closeout: ``called * resolution_gap + (1 - called) * unconverged_share * convergence_gain``;
+    * unknown: the smaller of the two.
+
+    Returns (ev, one sentence saying which rule applied)."""
+    raise NotImplementedError
+
+
+def value_opportunity(exchange_id: str, fv: FairValue, point: Optional[PricePoint], info: Optional[ExchangeInfo],
+                      race: Optional[RaceRef], inputs: StrategyInputs, params: StrategyParams) -> Optional[Opportunity]:
+    """Buy the side the outside fair value says is cheap, net of the spread and the exit cost, with a
+    regime-aware edge (§5.2). None when no side clears ``min_value_edge``, the fair value is not
+    usable / too old, or the quote is one-sided."""
+    raise NotImplementedError
+
+
+def group_races(infos: Mapping[str, ExchangeInfo], races: Mapping[str, RaceRef],
+                constraints: Optional[Mapping[str, Any]] = None) -> List[RaceGroup]:
+    """Every mutually exclusive group with >= 2 open members (§5.3.1), deduplicated by member set."""
+    raise NotImplementedError
+
+
+def basket_opportunities(inputs: StrategyInputs, params: StrategyParams) -> List[Opportunity]:
+    """NO baskets (YES bids sum > 1 + basket_min_edge) on every group, YES baskets (YES asks sum <
+    1 - basket_min_edge) only on exhaustive groups; depth-limited, with an early-exit plan (§5.3)."""
+    raise NotImplementedError
+
+
+def hole_opportunities(inputs: StrategyInputs, params: StrategyParams) -> List[Opportunity]:
+    """Resting maker bids far below liquid favourites to catch liquidity holes (§5.4)."""
+    raise NotImplementedError
+
+
+def hole_candidates(inputs: StrategyInputs, params: Optional[StrategyParams] = None) -> List[str]:
+    """Outcomes that would qualify for a hole order if a recent book confirmed the touch depth
+    (two-sided quote, spread <= hole_max_spread, favourite mid >= hole_min_mid, no open surge) but
+    have no stored book younger than book_max_age_s: the paper runner reads their books (priority 4).
+    At most 2 x hole_max_exchanges, tightest spread first, then exchange id."""
+    raise NotImplementedError
+
+
+def report_from_inputs(inputs: StrategyInputs, *, sizing: str = "conservative",
+                       fair_value_status: Optional[Mapping[str, Any]] = None) -> StrategyReport:
+    """build_report with every field taken from ``inputs`` (what web.DashboardApp uses, §5.7)."""
+    raise NotImplementedError
+
+
+def generate_signals(inputs: StrategyInputs, params: Optional[StrategyParams] = None) -> List[Opportunity]:
+    """Every idea of every kind for these inputs, UNSIZED (suggested_shares 0, sizing None), each with
+    idea_id, race_key, bet, exit_plan, order_type, limit_price and max_units. Deterministic: sorted by
+    score descending, then idea_id. This is what both the paper engine and build_report consume (§5.1)."""
+    raise NotImplementedError
+

@@ -14,7 +14,7 @@ from __future__ import annotations
 import dataclasses
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Protocol, Sequence, Set, Tuple
 
 VERDICT_NEWS = "news"
 VERDICT_PARTICIPANTS = "participants"
@@ -44,6 +44,8 @@ def _plain(value: Any) -> Any:
         return {k: _plain(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
         return [_plain(v) for v in value]
+    if isinstance(value, (set, frozenset)):  # e.g. MarketObservation.open_ids: a sorted list in JSON
+        return sorted((_plain(v) for v in value), key=str)
     if isinstance(value, float) and value != value:  # NaN is not valid JSON
         return None
     return value
@@ -246,6 +248,21 @@ class Opportunity(_Serializable):
     # average price (per share, or per set) of filling the suggested size from the book.
     depth_checked: Optional[bool] = None
     fill_price: Optional[float] = None
+    # ---- added for docs/PAPER_TRADING.md; all optional, so older payloads keep their shape ----
+    idea_id: Optional[str] = None  # stable key (see strategy.idea_id_for): the same idea keeps its id across builds
+    race_key: Optional[str] = None  # RaceRef.race_key of the outcome, or of the set's race
+    bet: Optional["BetShape"] = None  # payoff shape the sizing policies size from
+    exit_plan: Optional["ExitPlan"] = None  # when and how the position is closed
+    order_type: str = "taker"  # "taker": take the book now (IOC) | "maker": rest a limit order until expires_at
+    limit_price: Optional[float] = None  # worst CONTRACT price accepted per share (per set for set ideas)
+    expires_at: Optional[float] = None  # maker orders only
+    max_units: Optional[float] = None  # depth cap (shares or sets) at limit_price in the decision-time book; None = unknown
+    fair_value: Optional[float] = None  # fair value of the CONTRACT bought (YES or NO) when one was used
+    fair_source: Optional[str] = None  # FairValue.source of that value
+    settlement_regime: Optional[str] = None  # the regime the edge was computed under (REGIMES)
+    profit_per_capital_day: Optional[float] = None  # edge / (cost x days the capital stays tied up)
+    sizing: Optional[Dict[str, Any]] = None  # SizeDecision.to_dict() under the report's sizing policy
+    alt_sizing: Optional[Dict[str, Any]] = None  # SizeDecision.to_dict() under the other policy (chaser <-> conservative)
 
 
 @dataclass
@@ -283,3 +300,696 @@ class StrategyReport(_Serializable):
         "Read-only analysis. Nothing is traded automatically; estimates are heuristics, "
         "not guarantees."
     )
+    # ---- added for docs/PAPER_TRADING.md ----
+    sizing_policy: str = "conservative"  # POLICIES: which policy sized suggested_shares
+    sizing: Optional[Dict[str, Any]] = None  # SizingPolicy.explain() for the report policy (+ "alternative")
+    settlement_regime: str = "unknown"  # REGIMES
+    fair_value: Optional[Dict[str, Any]] = None  # {"mode", "usable", "total", "providers": {...}} or None
+
+
+# =========================================================================== paper trading
+# Shared types for fair value, new idea kinds, sizing policies, the paper-trading engine and the
+# backtest. The spec is docs/PAPER_TRADING.md; field meanings there are normative. Conventions on
+# top of the module docstring:
+#
+# * "YES price" = a YES-denominated price (books, quotes, tape). "Contract price" = the price of the
+#   contract named by ``side`` ("yes" -> YES price, "no" -> 1 - YES price). Orders, fills, positions
+#   and trades are in contract prices; books and quotes are always YES prices.
+# * "units" are shares for single-outcome ideas and sets (one share of every leg) for set ideas.
+# * Every list/dict field defaults to empty; every Optional defaults to None (unknown).
+
+REGIME_UNKNOWN = "unknown"
+REGIME_RESOLVED = "resolved_outcomes"  # unresolved Cup markets wait for real outcomes and pay 1/0
+REGIME_VWAP = "vwap_closeout"  # unresolved markets are cashed at an admin-reviewed ~5h VWAP at the Cup end
+REGIMES = (REGIME_UNKNOWN, REGIME_RESOLVED, REGIME_VWAP)
+
+KIND_FADE = "fade"
+KIND_CARRY = "carry"
+KIND_ARBITRAGE = "arbitrage"
+KIND_WATCH = "watch"
+KIND_VALUE = "value"
+KIND_BASKET = "basket"
+KIND_HOLE = "hole"
+IDEA_KINDS = (KIND_VALUE, KIND_BASKET, KIND_HOLE, KIND_FADE, KIND_CARRY, KIND_ARBITRAGE, KIND_WATCH)
+TRADE_KINDS = (KIND_VALUE, KIND_BASKET, KIND_HOLE, KIND_FADE, KIND_CARRY, KIND_ARBITRAGE)  # watch never trades
+SET_KINDS = (KIND_ARBITRAGE, KIND_BASKET)  # multi-leg ideas: legs + unit "sets"
+
+POLICY_CONSERVATIVE = "conservative"
+POLICY_CHASER = "chaser"
+POLICIES = (POLICY_CONSERVATIVE, POLICY_CHASER)
+
+FV_MANUAL = "manual"
+FV_POLYMARKET = "polymarket"
+FV_KALSHI = "kalshi"
+FV_BLEND = "blend"
+FV_DEMO = "demo"
+FV_SOURCES = (FV_MANUAL, FV_POLYMARKET, FV_KALSHI, FV_BLEND, FV_DEMO)
+FV_CONF_HIGH = "high"
+FV_CONF_MEDIUM = "medium"
+FV_CONF_LOW = "low"
+
+
+# --------------------------------------------------------------------------- fair value
+
+
+@dataclass(frozen=True)
+class RaceRef(_Serializable):
+    """One outcome's place in a race, parsed from its title (see fairvalue.parse_race)."""
+
+    race_key: str  # "2026:SENATE:NH" | "2026:GOVERNOR:GA" | "2026:HOUSE:AZ-01" | "2026:SENATE_CONTROL:US" | "2026:HOUSE_CONTROL:US"
+    office: str  # "SENATE" | "GOVERNOR" | "HOUSE" | "SENATE_CONTROL" | "HOUSE_CONTROL"
+    state: str  # USPS code ("NH"), "US" for chamber control
+    district: Optional[str] = None  # "AZ-01" for House seats, else None
+    party: str = "O"  # "D" | "R" | "I" | "L" | "G" | "O" (other / any other candidate)
+    candidate: Optional[str] = None  # a named candidate when the outcome names one
+    source: str = "title"  # "title" | "option" | "override"
+
+
+@dataclass
+class FairValueQuote(_Serializable):
+    """One external venue's (or the manual file's) view of one Super Market outcome (YES prices)."""
+
+    venue: str  # FV_SOURCES member
+    external_id: str  # Polymarket market id, Kalshi ticker, "manual:<line>", "demo:<eid>"
+    label: str = ""  # human-readable: "Chris Pappas (D) - New Hampshire Senate Election Winner"
+    bid: Optional[float] = None
+    ask: Optional[float] = None
+    last: Optional[float] = None
+    mid: Optional[float] = None
+    raw_value: Optional[float] = None  # venue probability before race normalisation
+    value: Optional[float] = None  # after race normalisation; None = not usable
+    spread: Optional[float] = None
+    bid_size: Optional[float] = None
+    ask_size: Optional[float] = None
+    fetched_at: Optional[float] = None  # our clock when the response arrived
+    venue_updated_at: Optional[float] = None  # the venue's own timestamp, if any (not a quote time on Gamma)
+    match_kind: str = "EXACT"  # "EXACT" | "NEAR" | "MANUAL"
+    match_confidence: float = 0.0  # 0..1
+    flags: List[str] = field(default_factory=list)  # "last-trade-only", "placeholder", "stale", "suspect-sum", "wide"
+
+
+@dataclass
+class FairValue(_Serializable):
+    """The combined fair value of one Super Market outcome (probability that YES wins)."""
+
+    exchange_id: str
+    value: Optional[float]  # YES probability; None when nothing usable exists
+    source: str  # FV_SOURCES member ("blend" when several venues were combined)
+    confidence: str = FV_CONF_LOW  # FV_CONF_*
+    usable: bool = False  # safe to trade on (fresh, matched, venues agree)
+    reason: str = ""  # one sentence: why usable / why not
+    bid: Optional[float] = None  # best external executable YES bid (for display)
+    ask: Optional[float] = None
+    as_of: Optional[float] = None  # the oldest fetched_at among the quotes used
+    agreement: Optional[float] = None  # max - min of venue values (None with one venue)
+    sources: List[FairValueQuote] = field(default_factory=list)
+    race_key: Optional[str] = None
+    party: Optional[str] = None
+    match_kind: str = "EXACT"  # "EXACT" | "NEAR" | "MANUAL"
+    match_confidence: float = 0.0
+    note: Optional[str] = None  # the manual entry's note
+    manual_updated_at: Optional[float] = None
+
+
+@dataclass
+class FairValueRecord(_Serializable):
+    """One stored fair-value observation (store table ``fair_values``) for replays."""
+
+    ts: float  # when it was recorded (our clock); a replay may use it at decision time t only if ts <= t - latency
+    exchange_id: str
+    value: Optional[float]
+    source: str
+    bid: Optional[float] = None
+    ask: Optional[float] = None
+    confidence: str = FV_CONF_LOW
+    usable: bool = False
+    agreement: Optional[float] = None
+    detail: Dict[str, Any] = field(default_factory=dict)  # FairValue.to_dict() minus the bulky "sources"
+
+
+# --------------------------------------------------------------------------- idea shapes
+
+
+@dataclass
+class BetShape(_Serializable):
+    """What one unit of an idea pays, for sizing.
+
+    * ``binary``: pays ``gain`` with probability ``p`` and loses ``loss`` otherwise (a contract
+      held to 1/0: gain = 1 - cost, loss = cost; ``p`` is the *effective* win probability,
+      entry + expected edge, so that p - cost = EV per share).
+    * ``bracket``: a target/stop trade, same fields (gain to target, loss to stop).
+    * ``riskless``: a set paying at least ``floor`` per unit for ``cost``; ``gain`` = floor - cost.
+    * ``fixed``: small passive orders (holes): sized by ``cap_pct`` of equity, no Kelly.
+    """
+
+    kind: str  # "binary" | "bracket" | "riskless" | "fixed"
+    p: float  # win probability (1.0 for riskless)
+    gain: float  # per unit if it wins (> 0)
+    loss: float  # per unit at risk if it loses (0 for riskless)
+    cost: float  # cash per unit at the entry price (contract price, or set cost)
+    floor: Optional[float] = None  # riskless: guaranteed payoff per unit at settlement
+    cap_pct: Optional[float] = None  # fixed: stake cap as a share of equity
+
+
+@dataclass
+class ExitPlan(_Serializable):
+    """When a position opened from an idea is closed (evaluated by the paper engine every step).
+
+    Prices are the CONTRACT's executable bid (what selling fetches), per share; for baskets the
+    per-set proceeds of selling every leg. Rules are checked in this order: settlement,
+    ``exit_before_ts``, ``stop_bid``, ``target_bid`` (or the dynamic fair-value target), time stops.
+    """
+
+    kind: str  # "bracket" (fade) | "settle" (carry, arbitrage held) | "value" | "basket" | "hole"
+    target_bid: Optional[float] = None  # exit when the contract bid >= this
+    stop_bid: Optional[float] = None  # exit when the contract bid <= this
+    time_stop_ts: Optional[float] = None  # exit at the bid at/after this time
+    time_stop_after_fill_s: Optional[float] = None  # hole: exit this long after the entry fill
+    exit_before_ts: Optional[float] = None  # be flat before this (settlement regime / closeout window)
+    hold_to_resolution: bool = False  # otherwise keep it until one of the rules fires
+    dynamic_fv_target: bool = False  # value: target = current fair value (contract) - half spread - buffer
+    exit_buffer: float = 0.0  # value: the buffer in that formula
+    min_set_profit: Optional[float] = None  # basket: exit when set proceeds - set cost >= this
+    note: str = ""  # one sentence for the UI: "Exit when the YES bid reaches 0.565, or hold to resolution"
+
+
+@dataclass
+class StrategyParams(_Serializable):
+    """Every tunable of the idea generators (backtest sweeps set these by name)."""
+
+    # value (external fair value vs Super Market)
+    min_value_edge: float = 0.02  # per share, after spread, exit cost and the regime adjustment
+    value_exit_buffer: float = 0.005  # exit when the contract bid >= fv - half spread - this
+    fv_max_age_s: float = 300.0  # external fair values older than this are not traded on
+    manual_fv_max_age_s: float = 72 * 3600.0  # manual entries older than this are not traded on
+    longshot_shrink: float = 0.10  # buying a contract whose fair value is < 0.15: use fv x (1 - this)
+    called_prob_fast: float = 0.85  # P(race called before the closeout window), fast-count states
+    called_prob_slow: float = 0.40  # slow-count / ranked-choice states (strategy.SLOW_COUNT_STATES)
+    called_prob_safe: float = 0.97  # favourite side >= 0.95 (safe seats are called at poll close)
+    unconverged_share: float = 0.30  # share of an uncalled race's gap a VWAP closeout still realises
+    # basket (pair / set arbitrage)
+    basket_min_edge: float = 0.01  # per set: sum(YES bids) - 1 (NO basket), 1 - sum(YES asks) (YES basket)
+    basket_exit_fraction: float = 0.5  # exit when set profit now >= max(min profit, this x entry edge)
+    basket_exit_min_profit: float = 0.005  # per set
+    # hole (deep resting orders on liquid favourites)
+    hole_min_mid: float = 0.70  # favourite side's mid
+    hole_min_touch_qty: float = 200.0  # shares at the favourite's best bid in a recent book
+    hole_max_spread: float = 0.02
+    hole_depth_fraction: float = 0.25  # rest at floor_tick(ref x (1 - this))
+    hole_min_ticks_below: int = 6  # and at least this many ticks under the best bid
+    hole_ttl_s: float = 6 * 3600.0
+    hole_max_stake_pct: float = 0.01
+    hole_max_shares: int = 500
+    hole_max_exchanges: int = 4
+    hole_exit_buffer: float = 0.03  # exit when the bid recovers to ref - this
+    hole_time_stop_s: float = 12 * 3600.0
+    hole_fill_prob: float = 0.02  # prior, only for the score
+    # fade / carry
+    fade_horizon_h: float = 6.0
+    carry_max_entry: float = 0.995
+    # common
+    book_max_age_s: float = 900.0  # a stored book older than this does not cap max_units
+    settle_margin_s: float = 3600.0  # "settles before the Cup end" needs settlement this much earlier
+    closeout_buffer_s: float = 6 * 3600.0  # flat this long before the Cup end when the regime requires it
+
+
+# --------------------------------------------------------------------------- sizing
+
+
+@dataclass
+class LeaderboardSnapshot(_Serializable):
+    """Up to 100 leaderboard rows at one time (the tracker reads ``limit=100``, period all)."""
+
+    at: float
+    period: str = "all"
+    total: Optional[int] = None
+    my_rank: Optional[int] = None
+    initial_balance: Optional[float] = None
+    # [{"rank": int|None, "username": str|None, "pnl": float|None, "value": float|None}], best first
+    entries: List[Dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
+class BarEstimate(_Serializable):
+    """The estimated final top-3 balance (the bar a chaser must clear)."""
+
+    value: float  # the bar used for sizing
+    third_value: Optional[float] = None  # 3rd place now (initial + pnl, mid-Cup marks)
+    tenth_value: Optional[float] = None
+    hundredth_value: Optional[float] = None
+    growth_per_day: Optional[float] = None  # of 3rd place, from leaderboard history (clipped)
+    projected: bool = False  # value includes growth to the Cup end
+    method: str = "floor"  # "third" | "projected" | "floor"
+    explanation: List[str] = field(default_factory=list)
+
+
+@dataclass
+class ExposureSummary(_Serializable):
+    """What a portfolio already holds or has reserved, in cash at cost."""
+
+    gross_cost: float = 0.0  # open positions at cost + cash reserved by pending entry orders
+    by_race: Dict[str, float] = field(default_factory=dict)  # race_key (or "market:<id>") -> cost
+    by_idea: Dict[str, float] = field(default_factory=dict)  # idea_id -> cost
+    national_tilt_d: float = 0.0  # signed cost toward Democrats (YES D / NO R positive, YES R / NO D negative)
+    open_positions: int = 0
+
+
+@dataclass
+class SizingContext(_Serializable):
+    """Everything a SizingPolicy may use (built by build_report or by the paper engine)."""
+
+    now: float
+    equity: float  # liquidation value of the portfolio (cash + positions sold into the bids)
+    cash: float  # all cash (reserved included)
+    free_cash: float  # cash not reserved by pending orders: a size never needs more than this
+    start_capital: float
+    cup_end: float
+    days_left: float
+    exposure: ExposureSummary = field(default_factory=ExposureSummary)
+    bar: Optional[BarEstimate] = None
+    expected_profit: float = 0.0  # sum over open positions of qty x edge per unit at entry
+    my_rank: Optional[int] = None
+    regime: str = REGIME_UNKNOWN
+    all_collateral: bool = False  # riskless sets need only cost - floor in cash (ALL collateral)
+    races: Dict[str, "RaceRef"] = field(default_factory=dict)  # exchange_id -> race (for race caps and tilt)
+
+
+@dataclass
+class SizeDecision(_Serializable):
+    """How many units a policy buys of one idea, and why (every number explained in text)."""
+
+    idea_id: str
+    policy: str
+    units: int  # 0 = do not trade
+    stake: float  # cash committed (units x cash per unit)
+    kelly_fraction: Optional[float] = None  # of equity at risk, before caps
+    capped_by: List[str] = field(default_factory=list)  # "kelly", "idea_cap", "race_cap", "total_cap", "tilt_cap", "cash", "depth", "top_k", "goal", "zero_edge"
+    mode: Optional[str] = None  # chaser mode: "near" | "chase" | "swing" | "out_of_reach" | "unknown_bar"
+    lines: List[str] = field(default_factory=list)  # plain-English explanation, one sentence each
+
+
+class SizingPolicy(Protocol):
+    """Implemented by sizing.ConservativePolicy and sizing.ChaserPolicy (docs/PAPER_TRADING.md §5.6)."""
+
+    name: str
+    label: str
+
+    def size(self, opp: Opportunity, ctx: SizingContext) -> SizeDecision:
+        """Size one idea on its own (no other new ideas counted): what the Strategy view shows."""
+        ...
+
+    def size_all(self, opps: Sequence[Opportunity], ctx: SizingContext) -> Dict[str, SizeDecision]:
+        """Size new ideas together, best score first, each seeing the exposure of those before it
+        (what the paper engine uses). Keys are idea ids."""
+        ...
+
+    def explain(self, ctx: SizingContext) -> Dict[str, Any]:
+        """Portfolio-level explanation: {"policy", "label", "mode", "lines", "bar", "M", "markov_ceiling", "ev_multiple"}."""
+        ...
+
+
+# --------------------------------------------------------------------------- inputs and observations
+
+
+@dataclass
+class StrategyInputs(_Serializable):
+    """Everything the idea generators read at one decision time (live: pipeline.assemble_inputs;
+    replay: backtest.HistoricalMarket.inputs). Nothing in here may be newer than ``now``."""
+
+    now: float
+    cup_end: float
+    infos: Dict[str, ExchangeInfo] = field(default_factory=dict)  # open outcomes only
+    latest: Dict[str, PricePoint] = field(default_factory=dict)  # newest quote per outcome, .book attached when stored
+    surges: List[Surge] = field(default_factory=list)  # not closed, last 2 days, attribution analysed <= now
+    bands: List[HighBand] = field(default_factory=list)
+    constraints: Optional[Dict[str, Any]] = None
+    overround_rows: List[Dict[str, Any]] = field(default_factory=list)
+    fair_values: Dict[str, FairValue] = field(default_factory=dict)
+    races: Dict[str, RaceRef] = field(default_factory=dict)  # exchange_id -> race
+    backtest: Optional[BacktestResult] = None
+    balance: Optional[float] = None  # real account cash (sizing for the Strategy view)
+    initial_balance: Optional[float] = None
+    account_value: Optional[float] = None
+    leader_value: Optional[float] = None
+    my_rank: Optional[int] = None
+    leaderboard: Optional[LeaderboardSnapshot] = None
+    bar: Optional[BarEstimate] = None
+    settlement_regime: str = REGIME_UNKNOWN
+    params: Optional[StrategyParams] = None  # None = StrategyParams()
+
+
+@dataclass
+class Quote(_Serializable):
+    """The bulk-price touch of one outcome at one snapshot (YES prices, no sizes)."""
+
+    exchange_id: str
+    bid: Optional[float]
+    ask: Optional[float]
+    last: Optional[float]
+    ts: float  # when the snapshot was taken
+
+
+@dataclass
+class BookObservation(_Serializable):
+    """One order-book read (YES prices, best first) and when it was observed."""
+
+    exchange_id: str
+    observed_at: float  # our clock when the response arrived
+    bids: List[Tuple[float, float]] = field(default_factory=list)  # (YES price, quantity), highest first
+    asks: List[Tuple[float, float]] = field(default_factory=list)  # lowest first
+    source: str = "paper"  # "paper" | "tracker" | "attribution" | "overround" | "synthetic" (backtest)
+    sequence: Optional[int] = None  # asOf.sequence when the API gave one
+
+
+@dataclass
+class SettlementInfo(_Serializable):
+    """How one outcome resolved in the tournament scope."""
+
+    exchange_id: str
+    market_id: str
+    settled_with: Optional[str]  # the API's settledWith, verbatim ("YES", "NO", an option label, "REFUND")
+    settled_on: Optional[float] = None
+    payout_yes: Optional[float] = None  # 1.0 YES won, 0.0 YES lost, None = refund or unknown
+    refund: bool = False
+    detected_at: Optional[float] = None
+
+
+@dataclass
+class MarketObservation(_Serializable):
+    """What the paper engine may know at ``now`` (live: built each step; replay: by the adapter)."""
+
+    now: float
+    cup_end: float
+    quotes: Dict[str, Quote] = field(default_factory=dict)
+    books: Dict[str, BookObservation] = field(default_factory=dict)  # the newest observation per exchange
+    trades: Dict[str, List[TradeRecord]] = field(default_factory=dict)  # tape read since the paper cursor, oldest first
+    settlements: Dict[str, SettlementInfo] = field(default_factory=dict)
+    open_ids: Set[str] = field(default_factory=set)  # outcomes on the open list AND quoted by the last bulk read
+    infos: Dict[str, ExchangeInfo] = field(default_factory=dict)
+    fair_values: Dict[str, FairValue] = field(default_factory=dict)
+    races: Dict[str, RaceRef] = field(default_factory=dict)
+
+
+# --------------------------------------------------------------------------- paper configuration
+
+
+@dataclass
+class PortfolioSpec(_Serializable):
+    portfolio_id: str  # "policy:conservative", "kind:value", ...
+    label: str
+    policy: str  # POLICIES member
+    kinds: Optional[List[str]] = None  # None = every TRADE_KINDS member
+    start_capital: Optional[float] = None  # None = the run's start capital
+
+
+def default_portfolios() -> List[PortfolioSpec]:
+    """Two sizing policies on every kind, plus one conservative portfolio per kind (equal capital)."""
+    return [
+        PortfolioSpec("policy:conservative", "All ideas, conservative sizing (quarter-Kelly, 8% cap)", POLICY_CONSERVATIVE),
+        PortfolioSpec("policy:chaser", "All ideas, chaser sizing (goal-based)", POLICY_CHASER),
+        PortfolioSpec("kind:value", "Value vs outside fair value only", POLICY_CONSERVATIVE, [KIND_VALUE]),
+        PortfolioSpec("kind:basket", "Pair and set baskets only", POLICY_CONSERVATIVE, [KIND_BASKET]),
+        PortfolioSpec("kind:hole", "Liquidity-hole resting orders only", POLICY_CONSERVATIVE, [KIND_HOLE]),
+        PortfolioSpec("kind:fade", "Fades of participant spikes only", POLICY_CONSERVATIVE, [KIND_FADE]),
+        PortfolioSpec("kind:carry", "High-90s carry only", POLICY_CONSERVATIVE, [KIND_CARRY]),
+        PortfolioSpec("kind:arbitrage", "Engine-reported arbitrage only", POLICY_CONSERVATIVE, [KIND_ARBITRAGE]),
+    ]
+
+
+@dataclass
+class PaperConfig(_Serializable):
+    portfolios: List[PortfolioSpec] = field(default_factory=default_portfolios)
+    headline_portfolio: str = "policy:conservative"
+    target_hours: float = 24.0
+    start_capital: Optional[float] = None  # None: account value at reset, else cash, else the initial balance, else 100,000
+    regime: str = REGIME_UNKNOWN
+    all_collateral: bool = False
+    reads_per_min: int = 20  # the paper worker's own limiter (on top of the client's 90/min)
+    max_book_reads_per_step: int = 8
+    max_trade_reads_per_step: int = 2
+    book_depth: int = 20
+    min_latency_s: float = 2.0  # a fill uses only observations at least this long after the decision
+    max_fill_delay_s: float = 120.0  # a taker order with no usable observation by then expires unfilled
+    stale_quote_s: float = 120.0  # no decisions, fills or exits on an outcome whose bulk quote is older
+    mark_book_max_age_s: float = 900.0  # liquidation marks walk a book at most this old, else the touch
+    consumed_memory_s: float = 900.0  # liquidity a portfolio took stays taken in later books this long
+    queue_haircut: float = 0.5  # maker fills from prints AT the limit price, after the queue ahead
+    trade_poll_s: float = 60.0  # tape read per exchange with resting orders at most this often
+    mark_refresh_s: float = 300.0  # book re-read per open position at most this often
+    reentry_cooldown_s: float = 1800.0  # an idea that closed may not re-enter for this long
+    maker_cancel_after_missing_steps: int = 2  # cancel a resting order once its idea is absent this many steps
+    max_open_positions: int = 40  # per portfolio
+    max_new_orders_per_step: int = 10  # per portfolio
+    params: StrategyParams = field(default_factory=StrategyParams)
+    demo: bool = False
+
+
+# --------------------------------------------------------------------------- paper records
+
+
+@dataclass
+class PaperOrder(_Serializable):
+    order_id: str  # "<portfolio_id>:o<counter>"
+    portfolio_id: str
+    idea_id: str
+    kind: str
+    purpose: str  # "entry" | "exit"
+    order_type: str  # "taker" | "maker"
+    exchange_id: str
+    market_id: str
+    side: str  # "yes" | "no": the contract
+    action: str  # "buy" | "sell"
+    qty: float  # shares of this leg
+    limit_price: float  # contract price: max for buys, min for sells
+    created_at: float  # decision time
+    expires_at: Optional[float] = None
+    # "pending" (taker, waiting for a fill observation) | "resting" (maker) | "cancelling" (maker: still
+    # fillable by prints up to cancel_at until a tape read after cancel_at is processed) | "filled" |
+    # "cancelled" | "expired"
+    status: str = "pending"
+    filled_qty: float = 0.0
+    avg_fill_price: Optional[float] = None
+    reserved_cash: float = 0.0  # buy orders: cash held back until filled or closed
+    reason: str = ""  # why it was placed (one sentence)
+    close_reason: Optional[str] = None  # why it ended unfilled / partly filled
+    closed_at: Optional[float] = None
+    group_id: Optional[str] = None  # basket legs share one group id (= basket_id)
+    queue_ahead: Optional[float] = None  # maker: displayed quantity ahead at placement (None = unknown)
+    last_trade_ts: Optional[float] = None  # maker: tape processed up to here
+    seen_trade_ids: List[str] = field(default_factory=list)  # maker: tape ids already counted (bounded, newest 500)
+    missing_steps: int = 0  # maker: consecutive steps its idea was absent from the signals
+    cancel_at: Optional[float] = None  # maker: when the engine decided to cancel (or expires_at); prints up to it still count
+    title: str = ""
+    option: Optional[str] = None
+
+
+@dataclass
+class PaperFill(_Serializable):
+    fill_id: str
+    order_id: str
+    portfolio_id: str
+    exchange_id: str
+    market_id: str
+    side: str
+    action: str  # "buy" | "sell" | "settle"
+    qty: float
+    price: float  # contract price
+    ts: float  # when the fill was simulated (the step time)
+    liquidity: str  # "taker" | "maker" | "settlement"
+    purpose: str  # "entry" | "exit" | "settlement"
+    kind: str
+    idea_id: str
+    book_at: Optional[float] = None  # observed_at of the book (taker) or the newest print used (maker)
+    latency_s: Optional[float] = None  # book_at - order.created_at
+    levels: List[Tuple[float, float]] = field(default_factory=list)  # (contract price, qty) walked
+    trade_ids: List[str] = field(default_factory=list)  # maker: the prints that filled it
+    reason: str = ""
+    group_id: Optional[str] = None
+    title: str = ""
+    option: Optional[str] = None
+
+
+@dataclass
+class PaperPosition(_Serializable):
+    position_id: str  # "<portfolio_id>:<exchange_id>"
+    portfolio_id: str
+    exchange_id: str
+    market_id: str
+    side: str  # the contract held
+    qty: float
+    avg_cost: float  # contract price
+    cost: float  # cost basis of the open qty
+    opened_at: float
+    idea_id: str
+    kind: str
+    edge_per_unit: float = 0.0  # the idea's expected edge per share at entry (for expected_profit)
+    race_key: Optional[str] = None
+    basket_id: Optional[str] = None  # legs of one basket share it
+    exit_plan: Optional[ExitPlan] = None
+    realized_pnl: float = 0.0  # from partial exits so far
+    collateral_advance: float = 0.0  # all_collateral: cash advanced against the set's floor (repaid on close)
+    status: str = "open"  # "open" | "frozen" | "closed"
+    flags: List[str] = field(default_factory=list)  # "depth_unknown", "closed_no_ruling", "stale_quote", "post_cup"
+    first_fill_at: Optional[float] = None
+    updated_at: Optional[float] = None
+    liq_value: Optional[float] = None  # selling qty into the bids now (depth-aware)
+    mark_value: Optional[float] = None  # qty x contract mid mark (reference only)
+    fv_value: Optional[float] = None  # qty x contract fair value (model, reference only)
+    last_marked_at: Optional[float] = None
+    title: str = ""
+    option: Optional[str] = None
+
+
+@dataclass
+class PaperTrade(_Serializable):
+    """One closed round trip (a position, or every leg of a basket, back to zero)."""
+
+    trade_id: str
+    portfolio_id: str
+    idea_id: str
+    kind: str
+    exchange_ids: List[str]
+    opened_at: float
+    closed_at: float
+    qty: float  # shares (sets for baskets)
+    cost: float
+    proceeds: float  # sales + settlement payouts (+ refunds)
+    pnl: float  # proceeds - cost
+    exit_reason: str  # "target" | "stop" | "time" | "settled" | "refund" | "converged" | "fair_value" | "regime" | "legging" | "reset"
+    race_key: Optional[str] = None
+    title: str = ""
+    legs: List[Dict[str, Any]] = field(default_factory=list)  # [{"exchange_id", "side", "qty", "avg_cost", "avg_exit"}]
+    return_pct: Optional[float] = None  # pnl / cost
+    hold_hours: Optional[float] = None
+    profit_per_capital_day: Optional[float] = None  # pnl / (cost x max(hold days, 1/24))
+
+
+@dataclass
+class EquityPoint(_Serializable):
+    portfolio_id: str
+    ts: float
+    cash: float  # all cash (reserved included)
+    reserved_cash: float
+    liq_value: float  # cash + positions at liquidation value - outstanding collateral advances
+    mark_value: float  # cash + positions at mid marks - advances
+    fv_value: Optional[float]  # cash + positions at fair value where known (else liquidation) - advances
+    open_positions: int
+
+
+@dataclass
+class Verdict(_Serializable):
+    """An honest statement of what a run shows (docs/PAPER_TRADING.md §6.9)."""
+
+    portfolio_id: str
+    level: str  # "insufficient" | "inconclusive" | "positive" | "negative"
+    sentence: str
+    hours_run: float
+    closed_trades: int
+    clusters: int  # distinct races (or markets) among closed trades
+    pnl_liq: float  # realised + unrealised at liquidation value
+    pnl_ex_best: float  # pnl_liq without the single best closed trade
+    best_trade_pnl: Optional[float] = None
+    mean_trade_pnl: Optional[float] = None
+    ci_low: Optional[float] = None  # cluster-bootstrap CI of the mean closed-trade P&L
+    ci_high: Optional[float] = None
+    ci_level: float = 0.90
+    win_rate: Optional[float] = None
+    win_rate_low: Optional[float] = None  # Wilson interval
+    win_rate_high: Optional[float] = None
+    max_drawdown: Optional[float] = None  # fraction of peak liquidation equity
+    thresholds: Dict[str, float] = field(default_factory=dict)  # {"min_hours", "min_trades", "min_clusters"}
+    reasons: List[str] = field(default_factory=list)  # why this level
+    caveats: List[str] = field(default_factory=list)
+
+
+@dataclass
+class PortfolioSummary(_Serializable):
+    portfolio_id: str
+    label: str
+    policy: str
+    kinds: Optional[List[str]]
+    start_capital: float
+    cash: float
+    reserved_cash: float
+    positions_liq: float
+    positions_mark: float
+    positions_fv: Optional[float]
+    equity_liq: float
+    equity_mark: float
+    equity_fv: Optional[float]
+    realized_pnl: float
+    unrealized_pnl_liq: float
+    pnl_liq: float  # equity_liq - start_capital
+    pnl_liq_pct: float  # pnl_liq / start_capital
+    pnl_mark: float
+    max_drawdown: float  # fraction of peak equity_liq
+    max_drawdown_abs: float
+    fills: int
+    orders_open: int
+    positions_open: int
+    trades_closed: int
+    wins: int
+    losses: int
+    win_rate: Optional[float]
+    # kind -> {"pnl_realized", "pnl_unrealized_liq", "pnl_liq", "trades_closed", "wins", "win_rate", "fills", "positions_open"}
+    by_kind: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    exposure: Optional[ExposureSummary] = None
+    sizing: Optional[Dict[str, Any]] = None  # SizingPolicy.explain()
+    verdict: Optional[Verdict] = None
+    last_step_at: Optional[float] = None
+
+
+@dataclass
+class StepReport(_Serializable):
+    now: float
+    step: int
+    fills: int = 0
+    orders_created: int = 0
+    orders_expired: int = 0
+    orders_cancelled: int = 0
+    settled: int = 0
+    exits_started: int = 0
+    signals: int = 0
+    book_reads: int = 0
+    trade_reads: int = 0
+    reads_skipped: int = 0  # wanted but not read (budget)
+    errors: List[str] = field(default_factory=list)
+    duration_s: Optional[float] = None
+
+
+# --------------------------------------------------------------------------- backtest
+
+
+@dataclass
+class BacktestConfig(_Serializable):
+    start: Optional[float] = None  # default: end - hours
+    end: Optional[float] = None  # default: the newest stored tick
+    hours: float = 24.0
+    step_s: float = 300.0  # decision grid
+    latency_s: float = 60.0  # fills use the first observation at least this long after a decision
+    warmup_s: float = 6 * 3600.0  # history before start used only for detection lookbacks, never traded
+    assumed_spread: float = 0.02  # candle-only quotes: close -/+ half of this, on the tick
+    assumed_touch_qty: float = 100.0  # synthetic books: shares at the touch only
+    volume_share: float = 0.10  # synthetic depth and candle fills: at most this share of the bucket volume
+    use_book_snapshots: bool = True
+    use_fair_values: bool = True
+    paper: PaperConfig = field(default_factory=PaperConfig)
+    params_overrides: Dict[str, Any] = field(default_factory=dict)  # StrategyParams field -> value
+    label: str = ""
+
+
+@dataclass
+class BacktestReport(_Serializable):
+    generated_at: float
+    config: BacktestConfig
+    window: Dict[str, Any] = field(default_factory=dict)  # {"start", "end", "hours", "steps"}
+    # {"exchanges", "decision_steps", "tick_share", "candle_share", "book_snapshot_share",
+    #  "synthetic_book_share", "fair_value_share", "tape_share"}
+    coverage: Dict[str, Any] = field(default_factory=dict)
+    assumptions: List[str] = field(default_factory=list)
+    portfolios: List[PortfolioSummary] = field(default_factory=list)
+    equity: Dict[str, List[List[float]]] = field(default_factory=dict)  # portfolio_id -> [[ts, equity_liq], ...]
+    trades: List[PaperTrade] = field(default_factory=list)
+    verdicts: Dict[str, Verdict] = field(default_factory=dict)
+    sweep: Optional[List[Dict[str, Any]]] = None  # [{"params", "label", "pnl_liq", "trades_closed", "verdict_level", "max_drawdown"}]
+    warnings: List[str] = field(default_factory=list)

@@ -1,0 +1,554 @@
+{
+ "_fixture": {
+  "built_by": "_build_fixtures.py (offline). Re-run to regenerate.",
+  "snapshot_time_for_illustrative_prices": "2026-10-04T20:00:00Z",
+  "templates_real_capture": [
+   "https://github.com/nullif1ed/sigprediction/blob/main/fixtures/polymarket-nh-senate.json (real GET /events?slug=new-hampshire-senate-election-winner element, updatedAt 2026-10-01)",
+   "https://github.com/nullif1ed/sigprediction/blob/main/fixtures/kalshi-senatenh-26.json (real GET /events/SENATENH-26?with_nested_markets=true, updated_time 2026-09-15)"
+  ],
+  "id_sources": [
+   "https://github.com/DanielCWeng/predictions-cup/blob/main/data/mappings/sig_polymarket_2026.csv (237 SIG markets -> Polymarket market/condition/token ids, 'VERIFIED' by that participant, 2026-10-04)",
+   "https://github.com/grissou/prediction-market-maker/blob/main/ref_map.json (229 'race|party' -> Polymarket winner-market ids + groupItemTitle notes, 2026-10-01)",
+   "https://github.com/christiano7777777/sig-arb-bot/blob/main/kalshi_map.json (109 races -> Kalshi event/market tickers, 2026-10-05)"
+  ],
+  "shape_sources": [
+   "https://github.com/Polymarket/py-sdk (src/polymarket/_internal/actions/gamma.py, models/gamma/*.py; commit b543c9d 2026-10-01)",
+   "https://github.com/Polymarket/agent-skills/blob/main/market-data.md",
+   "https://docs.polymarket.com/developers/gamma-markets-api/overview (search snippet only; site blocked)",
+   "https://pypi.org/project/kalshi_python_sync/ 3.2.0 (generated from Kalshi OpenAPI; models/market.py etc.)",
+   "https://docs.kalshi.com/getting_started/fixed_point_migration (search snippet only; site blocked)"
+  ],
+  "prices": "Only the NH Senate objects carry real captured prices. All other prices are ILLUSTRATIVE (WebSearch snippets of Kalshi/Polymarket news, late Sep-early Oct 2026). Never treat them as live.",
+  "what": "Gamma /public-search + CLOB read endpoints (book, midpoint, prices-history) + Data API v2 prices-history.",
+  "unsure_fields": [
+   "public-search pagination keys hasMore/totalResults per py-sdk models/gamma/search.py; events[] there may be trimmed",
+   "/book: bids ASCENDING (best bid = LAST element), asks DESCENDING (best ask = LAST) per py-sdk OrderBook repr; timestamp = epoch MILLISECONDS string; prices/sizes are STRINGS",
+   "prices-history 'p' semantics (mid vs last trade) not documented in what we could read; treat as a mid-like indicative price, NOT executable",
+   "Data API v2 /v2/prices-history envelope {data:[...], pagination:{has_more,next_cursor}} from py-sdk data_envelope.py; window max 15 days",
+   "CLOB /price side semantics CONFLICT: docs snippet says side=BUY -> best bid; Polymarket/agent-skills says BUY -> best ask. Do not use /price; use /book or Gamma bestBid/bestAsk"
+  ]
+ },
+ "responses": [
+  {
+   "request": "GET https://gamma-api.polymarket.com/public-search?q=Maine%20Senate%20election%20winner&limit_per_type=10",
+   "status": 200,
+   "body": {
+    "events": [
+     {
+      "id": "57690",
+      "ticker": "maine-senate-election-winner",
+      "slug": "maine-senate-election-winner",
+      "title": "Maine Senate Election Winner",
+      "description": "This market will resolve according to the winner of the 2026 midterm Maine U.S. Senate election, inclusive of any run-offs.\n\nA candidate shall be considered to represent a party in the event that he or she is the nominee of the party in question. Candidates other than the Democratic or Republican nominee (e.g., Greens, Libertarian, independent) may be added at a later date.\n\nCandidates who run as independents will not be encompassed by the \u201cDemocrat\u201d or \u201cRepublican\u201d options regardless of any affiliation they may have with the party.\n\nThe candidates may be named in the contract for the convenience of traders. In the event that any named candidate is replaced as the nominee of their respective party prior to election day, the name in the contract will be updated and the market will resolve based on the replacement nominee of the party.\n\nThe resolution source for this market is the Associated Press, Fox News, and NBC. This market will resolve once all three sources call the race for the same candidate. If all three sources haven\u2019t called the race in this state for the same candidate, this market will resolve based on the official certification.",
+      "resolutionSource": "",
+      "startDate": "2025-10-13T21:36:20.324541Z",
+      "creationDate": "2025-10-13T21:43:31.13958Z",
+      "endDate": "2026-11-04T04:59:00Z",
+      "image": "https://polymarket-upload.s3.us-east-2.amazonaws.com/hn-36333d31b8.png",
+      "icon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/hn-36333d31b8.png",
+      "active": true,
+      "closed": false,
+      "archived": false,
+      "new": false,
+      "featured": false,
+      "restricted": true,
+      "liquidity": 589162.0,
+      "volume": 4304671.9,
+      "openInterest": 145350.080761,
+      "sortBy": "price",
+      "createdAt": "2025-10-10T19:07:24.328697Z",
+      "updatedAt": "2026-10-04T20:00:00Z",
+      "competitive": 0.8880797495615106,
+      "volume24hr": 4864.785852,
+      "volume1wk": 63146.94542,
+      "volume1mo": 203059.28859799998,
+      "volume1yr": 289136.77623400005,
+      "enableOrderBook": true,
+      "liquidityClob": 589162.0,
+      "negRisk": true,
+      "negRiskMarketID": "0x000000000000000000000000000000000000000000000000000001681ecbca00",
+      "commentCount": 2,
+      "markets": [
+       {
+        "id": "630772",
+        "question": "Will the Democrats win the Maine Senate race in 2026?",
+        "conditionId": "0x66bbf6d55e0296278858b3147689f3df9259374f158f9f028b608baa322a639c",
+        "slug": "will-the-democrats-win-the-maine-senate-race-in-2026",
+        "endDate": "2026-11-04T04:59:00Z",
+        "liquidity": "301122.0",
+        "startDate": "2025-10-13T21:36:20.324541Z",
+        "image": "https://polymarket-upload.s3.us-east-2.amazonaws.com/will-the-democrats-win-the-new-hampshire-senate-race-in-2026-mT71NDA15Lti.jpg",
+        "icon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/will-the-democrats-win-the-new-hampshire-senate-race-in-2026-mT71NDA15Lti.jpg",
+        "outcomes": "[\"Yes\", \"No\"]",
+        "outcomePrices": "[\"0.585\", \"0.415\"]",
+        "volume": "2316551.2",
+        "active": true,
+        "closed": false,
+        "marketMakerAddress": "",
+        "createdAt": "2025-10-10T19:07:25.215601Z",
+        "updatedAt": "2026-10-04T20:00:00Z",
+        "new": false,
+        "featured": false,
+        "submitted_by": "0x91430CaD2d3975766499717fA0D66A78D814E5c5",
+        "archived": false,
+        "resolvedBy": "0x2F5e3684cb1F318ec51b00Edba38d79Ac2c0aA9d",
+        "restricted": true,
+        "groupItemTitle": "Troy Jackson (D)",
+        "groupItemThreshold": "0",
+        "questionID": "0x000000000000000000000000000000000000000000000000000001681ecbcaf4",
+        "enableOrderBook": true,
+        "orderPriceMinTickSize": 0.01,
+        "orderMinSize": 5,
+        "volumeNum": 2316551.2,
+        "liquidityNum": 301122.0,
+        "endDateIso": "2026-11-04",
+        "startDateIso": "2025-10-13",
+        "hasReviewedDates": true,
+        "volume24hr": 46331.02,
+        "volume1wk": 26433.930433999998,
+        "volume1mo": 81925.59814399997,
+        "volume1yr": 140862.41205800002,
+        "clobTokenIds": "[\"7589880081658059374445882095611024032084645048848237404312287942463647821549\", \"6136336712352911156426560180855478229745540927722899997193789497766196705020\"]",
+        "comboStatus": "disabled",
+        "umaBond": "2500",
+        "umaReward": "20",
+        "volume24hrClob": 1441.115852,
+        "volume1wkClob": 26433.930433999998,
+        "volume1moClob": 81925.59814399997,
+        "volume1yrClob": 140862.41205800002,
+        "volumeClob": 140862.41205800002,
+        "liquidityClob": 129873.0591,
+        "makerBaseFee": 1000,
+        "takerBaseFee": 1000,
+        "customLiveness": 0,
+        "acceptingOrders": true,
+        "negRisk": true,
+        "negRiskMarketID": "0x000000000000000000000000000000000000000000000000000001681ecbca00",
+        "negRiskRequestID": "0x6d207a1ebee61257666aa793731a1c7aa518d3015451132d5e8aec64263535f7",
+        "ready": false,
+        "funded": false,
+        "acceptingOrdersTimestamp": "2025-10-13T21:35:59Z",
+        "cyom": false,
+        "competitive": 0.8880797495615106,
+        "pagerDutyNotificationEnabled": false,
+        "approved": true,
+        "rewardsMinSize": 60,
+        "rewardsMaxSpread": 6.5,
+        "spread": 0.01,
+        "oneDayPriceChange": 0.01,
+        "oneMonthPriceChange": 0.02,
+        "lastTradePrice": 0.59,
+        "bestBid": 0.58,
+        "bestAsk": 0.59,
+        "automaticallyActive": true,
+        "clearBookOnStart": true,
+        "seriesColor": "blue",
+        "showGmpSeries": false,
+        "showGmpOutcome": false,
+        "manualActivation": false,
+        "negRiskOther": false,
+        "umaResolutionStatuses": "[]",
+        "pendingDeployment": false,
+        "deploying": false,
+        "deployingTimestamp": "2025-10-13T21:04:31.014482Z",
+        "rfqEnabled": false,
+        "holdingRewardsEnabled": false,
+        "feesEnabled": true,
+        "feeType": "politics_fees",
+        "feeSchedule": {
+         "exponent": 1,
+         "rate": 0.04,
+         "takerOnly": true,
+         "rebateRate": 0.25
+        },
+        "version": "v1"
+       },
+       {
+        "id": "630773",
+        "question": "Will the Republicans win the Maine Senate race in 2026?",
+        "conditionId": "0x2c00cb09722a0f0501c5e49131b898ed57bb5c075db4dc2bcbc14908f45b8c48",
+        "slug": "will-the-republicans-win-the-maine-senate-race-in-2026",
+        "endDate": "2026-11-04T04:59:00Z",
+        "liquidity": "288040.0",
+        "startDate": "2025-10-13T21:36:20.324541Z",
+        "image": "https://polymarket-upload.s3.us-east-2.amazonaws.com/will-the-democrats-win-the-new-hampshire-senate-race-in-2026-mT71NDA15Lti.jpg",
+        "icon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/will-the-democrats-win-the-new-hampshire-senate-race-in-2026-mT71NDA15Lti.jpg",
+        "outcomes": "[\"Yes\", \"No\"]",
+        "outcomePrices": "[\"0.415\", \"0.585\"]",
+        "volume": "1988120.7",
+        "active": true,
+        "closed": false,
+        "marketMakerAddress": "",
+        "createdAt": "2025-10-10T19:07:25.215601Z",
+        "updatedAt": "2026-10-04T20:00:00Z",
+        "new": false,
+        "featured": false,
+        "submitted_by": "0x91430CaD2d3975766499717fA0D66A78D814E5c5",
+        "archived": false,
+        "resolvedBy": "0x2F5e3684cb1F318ec51b00Edba38d79Ac2c0aA9d",
+        "restricted": true,
+        "groupItemTitle": "Susan Collins (R)",
+        "groupItemThreshold": "0",
+        "questionID": "0x000000000000000000000000000000000000000000000000000001681ecbcaf5",
+        "enableOrderBook": true,
+        "orderPriceMinTickSize": 0.01,
+        "orderMinSize": 5,
+        "volumeNum": 1988120.7,
+        "liquidityNum": 288040.0,
+        "endDateIso": "2026-11-04",
+        "startDateIso": "2025-10-13",
+        "hasReviewedDates": true,
+        "volume24hr": 39762.41,
+        "volume1wk": 26433.930433999998,
+        "volume1mo": 81925.59814399997,
+        "volume1yr": 140862.41205800002,
+        "clobTokenIds": "[\"2142948285506077695096498341598672159464223074468931276310105532825810210121\", \"43295283577056639281694071578249936735369407445693289764095672178175084599787\"]",
+        "comboStatus": "disabled",
+        "umaBond": "2500",
+        "umaReward": "20",
+        "volume24hrClob": 1441.115852,
+        "volume1wkClob": 26433.930433999998,
+        "volume1moClob": 81925.59814399997,
+        "volume1yrClob": 140862.41205800002,
+        "volumeClob": 140862.41205800002,
+        "liquidityClob": 129873.0591,
+        "makerBaseFee": 1000,
+        "takerBaseFee": 1000,
+        "customLiveness": 0,
+        "acceptingOrders": true,
+        "negRisk": true,
+        "negRiskMarketID": "0x000000000000000000000000000000000000000000000000000001681ecbca00",
+        "negRiskRequestID": "0x6d207a1ebee61257666aa793731a1c7aa518d3015451132d5e8aec64263535f7",
+        "ready": false,
+        "funded": false,
+        "acceptingOrdersTimestamp": "2025-10-13T21:35:59Z",
+        "cyom": false,
+        "competitive": 0.8880797495615106,
+        "pagerDutyNotificationEnabled": false,
+        "approved": true,
+        "rewardsMinSize": 60,
+        "rewardsMaxSpread": 6.5,
+        "spread": 0.01,
+        "oneDayPriceChange": -0.01,
+        "oneMonthPriceChange": 0.02,
+        "lastTradePrice": 0.41,
+        "bestBid": 0.41,
+        "bestAsk": 0.42,
+        "automaticallyActive": true,
+        "clearBookOnStart": true,
+        "seriesColor": "blue",
+        "showGmpSeries": false,
+        "showGmpOutcome": false,
+        "manualActivation": false,
+        "negRiskOther": false,
+        "umaResolutionStatuses": "[]",
+        "pendingDeployment": false,
+        "deploying": false,
+        "deployingTimestamp": "2025-10-13T21:04:31.014482Z",
+        "rfqEnabled": false,
+        "holdingRewardsEnabled": false,
+        "feesEnabled": true,
+        "feeType": "politics_fees",
+        "feeSchedule": {
+         "exponent": 1,
+         "rate": 0.04,
+         "takerOnly": true,
+         "rebateRate": 0.25
+        },
+        "version": "v1"
+       }
+      ],
+      "tags": [
+       {
+        "id": "104030",
+        "label": "Maine Midterm",
+        "slug": "maine-midterm"
+       },
+       {
+        "id": "104093",
+        "label": "Senate Elections",
+        "slug": "senate-midterms",
+        "forceShow": false,
+        "createdAt": "2026-03-04T19:51:03.007216Z",
+        "updatedAt": "2026-09-24T18:00:03.002079Z",
+        "isCarousel": false
+       },
+       {
+        "id": "102289",
+        "label": "Midterms",
+        "slug": "midterms",
+        "createdAt": "2025-06-19T20:54:40.884795Z",
+        "updatedAt": "2026-04-17T20:51:49.953987Z"
+       },
+       {
+        "id": "144",
+        "label": "Elections",
+        "slug": "elections",
+        "forceShow": false,
+        "publishedAt": "2023-11-02 21:24:31.008+00",
+        "updatedBy": 13,
+        "createdAt": "2023-11-02T21:24:31.198Z",
+        "updatedAt": "2026-04-17T17:22:31.696566Z",
+        "forceHide": true
+       },
+       {
+        "id": "2",
+        "label": "Politics",
+        "slug": "politics",
+        "forceShow": false,
+        "publishedAt": "2023-10-25 18:55:50.674+00",
+        "updatedBy": 13,
+        "createdAt": "2023-10-25T18:55:50.681Z",
+        "updatedAt": "2026-04-17T20:39:54.201881Z",
+        "forceHide": true
+       },
+       {
+        "id": "106217",
+        "label": "Key Senate Races",
+        "slug": "senate-tossups",
+        "forceShow": false,
+        "createdAt": "2026-09-15T17:36:32.952977Z",
+        "updatedAt": "2026-09-15T19:00:01.771793Z",
+        "isCarousel": false
+       }
+      ],
+      "cyom": false,
+      "showAllOutcomes": true,
+      "showMarketImages": true,
+      "enableNegRisk": true,
+      "automaticallyActive": true,
+      "gmpChartMode": "default",
+      "negRiskAugmented": true,
+      "estimateValue": false,
+      "cumulativeMarkets": false,
+      "pendingDeployment": false,
+      "deploying": false,
+      "deployingTimestamp": "2025-10-13T20:55:23.074484Z",
+      "eventMetadata": {
+       "context_requires_regen": false
+      },
+      "version": "v1"
+     },
+     {
+      "id": "41210",
+      "ticker": "maine-democratic-senate-primary-winner",
+      "slug": "maine-democratic-senate-primary-winner",
+      "title": "Maine Democratic Senate Primary Winner",
+      "active": true,
+      "closed": true,
+      "endDate": "2026-06-09T00:00:00Z",
+      "markets": []
+     }
+    ],
+    "tags": [
+     {
+      "id": "104030",
+      "label": "Maine Midterm",
+      "slug": "maine-midterm",
+      "event_count": 14
+     }
+    ],
+    "profiles": [],
+    "pagination": {
+     "hasMore": false,
+     "totalResults": 2
+    }
+   }
+  },
+  {
+   "request": "GET https://clob.polymarket.com/book?token_id=82410058691149830741200014405570918770267839390767234397030380747995715352939",
+   "status": 200,
+   "body": {
+    "market": "0xfc5c740e4617eb9908ceada7c91bfbe1cd41f172d703ef811d544e60a7a70bb5",
+    "asset_id": "82410058691149830741200014405570918770267839390767234397030380747995715352939",
+    "timestamp": "1791144000000",
+    "hash": "6f3c0d9a0b5d4c1e9e9f0a7b2c3d4e5f60718293",
+    "tick_size": "0.01",
+    "min_order_size": "5",
+    "neg_risk": true,
+    "last_trade_price": "0.85",
+    "bids": [
+     {
+      "price": "0.80",
+      "size": "5200"
+     },
+     {
+      "price": "0.82",
+      "size": "3100"
+     },
+     {
+      "price": "0.84",
+      "size": "1800"
+     },
+     {
+      "price": "0.85",
+      "size": "950.5"
+     }
+    ],
+    "asks": [
+     {
+      "price": "0.90",
+      "size": "4000"
+     },
+     {
+      "price": "0.88",
+      "size": "2100"
+     },
+     {
+      "price": "0.87",
+      "size": "1500"
+     },
+     {
+      "price": "0.86",
+      "size": "720"
+     }
+    ]
+   }
+  },
+  {
+   "request": "GET https://clob.polymarket.com/midpoint?token_id=82410058691149830741200014405570918770267839390767234397030380747995715352939",
+   "status": 200,
+   "body": {
+    "mid": "0.855"
+   }
+  },
+  {
+   "request": "GET https://clob.polymarket.com/prices-history?market=82410058691149830741200014405570918770267839390767234397030380747995715352939&startTs=1791057600&endTs=1791144000&fidelity=60",
+   "status": 200,
+   "body": {
+    "history": [
+     {
+      "t": 1791057600,
+      "p": 0.84
+     },
+     {
+      "t": 1791061200,
+      "p": 0.84
+     },
+     {
+      "t": 1791064800,
+      "p": 0.84
+     },
+     {
+      "t": 1791068400,
+      "p": 0.85
+     },
+     {
+      "t": 1791072000,
+      "p": 0.845
+     },
+     {
+      "t": 1791075600,
+      "p": 0.845
+     },
+     {
+      "t": 1791079200,
+      "p": 0.845
+     },
+     {
+      "t": 1791082800,
+      "p": 0.845
+     },
+     {
+      "t": 1791086400,
+      "p": 0.845
+     },
+     {
+      "t": 1791090000,
+      "p": 0.84
+     },
+     {
+      "t": 1791093600,
+      "p": 0.85
+     },
+     {
+      "t": 1791097200,
+      "p": 0.85
+     },
+     {
+      "t": 1791100800,
+      "p": 0.85
+     },
+     {
+      "t": 1791104400,
+      "p": 0.85
+     },
+     {
+      "t": 1791108000,
+      "p": 0.845
+     },
+     {
+      "t": 1791111600,
+      "p": 0.845
+     },
+     {
+      "t": 1791115200,
+      "p": 0.845
+     },
+     {
+      "t": 1791118800,
+      "p": 0.855
+     },
+     {
+      "t": 1791122400,
+      "p": 0.855
+     },
+     {
+      "t": 1791126000,
+      "p": 0.85
+     },
+     {
+      "t": 1791129600,
+      "p": 0.85
+     },
+     {
+      "t": 1791133200,
+      "p": 0.85
+     },
+     {
+      "t": 1791136800,
+      "p": 0.85
+     },
+     {
+      "t": 1791140400,
+      "p": 0.85
+     }
+    ]
+   }
+  },
+  {
+   "request": "GET https://data-api.polymarket.com/v2/prices-history?token_id=82410058691149830741200014405570918770267839390767234397030380747995715352939&start=1791133200&end=1791144000&bucket_seconds=3600",
+   "status": 200,
+   "body": {
+    "data": [
+     {
+      "timestamp": 1791133200,
+      "price": 0.85,
+      "resolution_seconds": 3600
+     },
+     {
+      "timestamp": 1791136800,
+      "price": 0.85,
+      "resolution_seconds": 3600
+     },
+     {
+      "timestamp": 1791140400,
+      "price": 0.85,
+      "resolution_seconds": 3600
+     }
+    ],
+    "pagination": {
+     "has_more": false,
+     "next_cursor": null
+    }
+   }
+  },
+  {
+   "request": "GET https://clob.polymarket.com/book?token_id=1",
+   "status": 404,
+   "body": {
+    "error": "No orderbook exists for the requested token id"
+   }
+  }
+ ]
+}
