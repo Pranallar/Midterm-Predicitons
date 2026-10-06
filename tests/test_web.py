@@ -41,6 +41,7 @@ from conftest import price as api_price
 
 import supermarket_bot.attribution as attribution_mod
 import supermarket_bot.demo as demo_mod
+import supermarket_bot.moves as moves_mod
 import supermarket_bot.news as news_mod
 import supermarket_bot.strategy as strategy_mod
 import supermarket_bot.tracker as tracker_mod
@@ -85,6 +86,7 @@ GET_ENDPOINTS = (
     "/api/health", "/api/status", "/api/markets", "/api/markets?q=arizona", "/api/surges", "/api/highband",
     "/api/exchange/9001", "/api/exchange/9002", "/api/strategy",
     "/api/paper", "/api/backtest", "/api/fairvalue",  # docs/PAPER_TRADING.md §7.4
+    "/api/moves", "/api/moves?state=open&limit=5",  # docs/OUTSIDE_MOVES.md §18.2
 )
 
 # Demo scenario ids (docs/DESIGN.md, Demo section; seed 7).
@@ -439,8 +441,9 @@ def test_status_shape_and_counts(pipe: SimpleNamespace) -> None:
     # docs/PAPER_TRADING.md §10.5: the paper trader, fair-value mode, sizing and regime were added.
     assert status["features"] == {
         "analysis": True, "news": True, "llm": False, "paper": True, "fair_value": "auto", "sizing": "conservative",
-        "regime": "unknown",
+        "regime": "unknown", "moves": False,  # docs/OUTSIDE_MOVES.md §18.3: build_demo() without moves=True
     }
+    assert status["moves"] is None and status["tracker"]["read_budget"]["moves"] is None
 
     counts = status["counts"]
     assert COUNT_KEYS <= set(counts)
@@ -2563,6 +2566,7 @@ FAIRVALUE_KEYS = {"now", "enabled", "mode", "last_refresh_at", "providers", "man
 FV_ROW_KEYS = {
     "exchange_id", "market_id", "title", "option", "race_key", "party", "sm_bid", "sm_ask", "sm_mid", "fair", "matches",
     "gap", "edge_yes", "edge_no", "near", "suspect", "snippets", "unmatched_reason",
+    "move",  # docs/OUTSIDE_MOVES.md §18.4: the outcome's open outside-move alert, or null
 }
 SIM_HOURS = 1.05  # past the scripted NV basket (T0+4..30 min), WY hole (20 min), ME settlement (40 min) and NE triple (60 min)
 
@@ -2871,3 +2875,970 @@ def test_backtest_endpoint_without_enough_data_or_a_backtest(small: SimpleNamesp
     app.backtest()
     app.wait_paper_backtest(60)
     assert app.backtest()["status"] == "unavailable"
+
+
+# --------------------------------------------------------------------------- integration regressions (round 3)
+
+
+def test_ui_11_near_match_only_when_a_near_match_exists(sim: SimpleNamespace) -> None:
+    """ui-11: the chamber-control outcomes (9014-9017) have no outside match, yet their FairValue carries the race's
+    NEAR kind: they must not be flagged or counted as near matches, nor offer "Turn this match off" / "Trade this
+    near match" snippets for a match that does not exist (pinning one stays possible)."""
+    data = sim.app.fairvalue()
+    rows = {r["exchange_id"]: r for r in data["rows"]}
+    for r in data["rows"]:
+        fair = r["fair"] or {}
+        has_near = any(m.get("kind") == "NEAR" for m in r["matches"]) or (
+            fair.get("match_kind") == "NEAR" and fair.get("value") is not None)
+        assert r["near"] is has_near, r["exchange_id"]
+        if r["snippets"]["trade_near"] is not None:
+            assert r["near"] is True
+        if not r["matches"] and fair.get("value") is None:
+            assert r["snippets"]["disable"] is None and r["snippets"]["trade_near"] is None, r["exchange_id"]
+    assert data["counts"]["near"] == sum(1 for r in data["rows"] if r["near"])
+    for eid in ("9014", "9015", "9016", "9017"):
+        r = rows[eid]
+        assert r["matches"] == [] and r["near"] is False and r["snippets"]["disable"] is None
+        assert r["snippets"]["pin"] is not None
+    matched = next(r for r in data["rows"] if r["matches"])
+    assert matched["snippets"]["disable"] is not None  # a real match can still be turned off
+
+
+def test_lookahead_1_dashboard_backtest_counts_a_run_that_already_ended(tmp_path: Path) -> None:
+    """lookahead-1: the dashboard used only the CURRENT run's start; after a run ended (completed, reset, settings
+    changed) and a new one started, a replay of the same hours said overlap 0. Every stored run counts now."""
+    from supermarket_bot import pipeline
+
+    runtime, clock = fast_demo(tmp_path)
+    try:
+        pipeline.run_simulation(runtime, clock, hours=1.0, step_s=30.0, end_run=True)  # "completed"
+        first = runtime.store.paper_run_times()
+        assert len(first) == 1 and first[0]["ended_at"] is not None
+        pipeline.run_simulation(runtime, clock, hours=0.1, step_s=30.0, end_run=False)  # a new run starts
+        current = runtime.tracker.paper_view()["run"]
+        assert current["run_id"] != first[0]["run_id"]
+        app = runtime.app
+        app.backtest()
+        app.wait_paper_backtest(120)
+        data = app.backtest()
+        assert data["status"] == "ready", data["error"]
+        report = data["report"]
+        window = report["window"]
+        start = max(window["start"], first[0]["started_at"])
+        assert report["overlap_hours"] == pytest.approx((window["end"] - start) / 3600.0, abs=1e-3)
+        assert report["overlap_hours"] > 1.0  # not just the ~0.1 h of the new run
+        assert any("not an independent check" in w for w in report["warnings"])
+    finally:
+        runtime.app.wait_paper_backtest(120)
+        runtime.close()
+
+
+def test_live_5_sighup_while_starting_stops_cleanly_and_restores_the_handler(tmp_path: Path,
+                                                                            monkeypatch: pytest.MonkeyPatch) -> None:
+    """live-5: closing the terminal (SIGHUP) stops the dashboard like Ctrl-C, so the tracker stops and releases
+    its lease, instead of killing the process with the lease held."""
+    import os
+    import signal
+
+    if threading.current_thread() is not threading.main_thread() or not hasattr(signal, "SIGHUP"):
+        pytest.skip("needs the main thread and SIGHUP")
+
+    class Unhandled(Exception):
+        pass
+
+    def fallback(signum: int, frame: Any) -> None:  # only reached if run_dashboard installed no handler
+        raise Unhandled("SIGHUP reached the test's own handler")
+
+    original = signal.signal(signal.SIGHUP, fallback)  # never let a regression kill the test run
+    before = signal.getsignal(signal.SIGHUP)
+
+    def slow_start(settings: Any, args: Any, out: Any = None, **kwargs: Any) -> Any:
+        os.kill(os.getpid(), signal.SIGHUP)
+        time.sleep(5)
+        raise AssertionError("SIGHUP did not interrupt the start-up")
+
+    monkeypatch.setattr(web, "build_live", slow_start)
+    settings = Settings(api_key=FAKE_KEY, tournament="cup", data_dir=tmp_path)
+    err = io.StringIO()
+    try:
+        assert web.run_dashboard(settings, _dashboard_args(tmp_path, "--no-browser"), out=io.StringIO(), err=err) == 130
+        assert "Stopped before the dashboard started." in err.getvalue()
+        assert signal.getsignal(signal.SIGHUP) is before  # restored
+    finally:
+        signal.signal(signal.SIGHUP, original)
+
+
+def test_live_5_sighup_under_nohup_is_left_alone() -> None:
+    import signal
+
+    if threading.current_thread() is not threading.main_thread() or not hasattr(signal, "SIGHUP"):
+        pytest.skip("needs the main thread and SIGHUP")
+    original = signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    try:
+        previous = web._install_sigterm(threading.Event())
+        try:
+            assert signal.getsignal(signal.SIGHUP) == signal.SIG_IGN  # `nohup ... dashboard` keeps running
+            assert signal.SIGHUP not in (previous or {})
+        finally:
+            web._restore_sigterm(previous)
+    finally:
+        signal.signal(signal.SIGHUP, original)
+
+
+def test_live_5_a_dashboard_closed_by_sighup_releases_its_lease(tmp_path: Path) -> None:
+    """The real process: `dashboard --demo` ended by SIGHUP exits cleanly and leaves no lease behind, so starting
+    again at once continues the run."""
+    import os
+    import signal
+    import subprocess
+    import sys
+
+    if not hasattr(signal, "SIGHUP"):
+        pytest.skip("needs SIGHUP")
+    repo = Path(__file__).resolve().parents[1]
+    data = tmp_path / "data"
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "supermarket_bot", "dashboard", "--demo", "--no-browser", "--port", "0", "--no-news",
+         "--interval", "2", "--data-dir", str(data), "--fair-value", "off"],
+        cwd=str(repo), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        env={**os.environ, "PYTHONUNBUFFERED": "1"})
+    try:
+        lines: List[str] = []
+        deadline = time.monotonic() + 60
+        assert proc.stdout is not None
+        while time.monotonic() < deadline:
+            line = proc.stdout.readline()
+            if not line:
+                break
+            lines.append(line)
+            if "Dashboard running" in line:
+                break
+        assert any("Dashboard running" in line for line in lines), "".join(lines)
+        db = data / "demo" / "tracker.sqlite3"
+        assert wait_for_lease(db, present=True), "the tracker never took its lease"
+        proc.send_signal(signal.SIGHUP)
+        rest, _ = proc.communicate(timeout=30)
+        assert proc.returncode == 0, "".join(lines) + rest
+        assert "Stopping the dashboard" in rest
+        assert _lease_of(db) is None
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=10)
+
+
+def _lease_of(db: Path) -> Any:
+    ro = TrackerStore.open_read_only(db)
+    try:
+        return ro.lease("tracker")
+    finally:
+        ro.close()
+
+
+def wait_for_lease(db: Path, present: bool, timeout: float = 20.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if db.is_file():
+            try:
+                held = _lease_of(db) is not None
+            except Exception:
+                held = False
+            if held is present:
+                return True
+        time.sleep(0.2)
+    return False
+
+
+# --------------------------------------------------------------------------- outside-move alerts (docs/OUTSIDE_MOVES.md §18)
+
+MOVES_KEYS = [  # §18.2, in order; every key always present
+    "now", "enabled", "available", "error", "demo", "poll_s", "last_step_at", "steps", "watching", "venues", "counts",
+    "actionable_ids", "alerts", "suppressed", "summary", "thresholds", "book_reads", "caveats",
+]
+NO_SUPPRESSED = {"thin": 0, "single_tick": 0, "disagree": 0, "near": 0, "suspect": 0, "stale": 0, "placeholder": 0,
+                 "match": 0, "no_cup": 0}
+MOVES_THRESHOLDS = {
+    "windows_s": [60.0, 300.0, 900.0, 3600.0], "abs_min": {"60": 0.03, "300": 0.04, "900": 0.05, "3600": 0.07},
+    "k_sigma": 4.0, "warmup_factor": 1.5, "max_spread": 0.05, "min_liquidity_usd": 5000.0, "min_top_size": 100.0,
+    "follow_fraction": 0.5, "lag_track_s": 3600.0, "human_delay_s": 240.0, "exit_after_s": 1800.0, "min_edge": 0.01,
+}
+MOVES_STATUS_KEYS = {"enabled", "poll_s", "last_step_at", "steps", "open", "actionable", "actionable_alerts", "venues",
+                     "last_error"}
+ANNOTATION_KEYS = {"alert_id", "status", "status_label", "state", "direction", "move", "lag_gap_now", "detected_at",
+                   "actionable"}
+ALERT_KEYS = {f.name for f in fields(moves_mod.MoveAlert)}
+MOVES_MINUTES = 20  # §18.5: lead_short (~c+90) and lead_long (~c+195) alerted, never (~c+285) still lagging
+MOVES_NO_ALERT_IDS = {"9038", "9041"}  # the thin spike and the venue disagreement must never alert (§15.2)
+
+
+def disabled_moves_body(now: float, demo: bool) -> Dict[str, Any]:
+    """The disabled /api/moves body, written out as §18.2 states it."""
+    return {
+        "now": now, "enabled": False, "available": False, "error": moves_mod.MOVES_OFF_ERROR, "demo": demo, "poll_s": None,
+        "last_step_at": None, "steps": 0, "watching": {"outcomes": 0, "matched": 0, "venues": 0}, "venues": [],
+        "counts": {"open": 0, "lagging": 0, "actionable": 0, "today": 0, "closed_today": 0,
+                   "suppressed_today": dict(NO_SUPPRESSED)},
+        "actionable_ids": [], "alerts": [], "suppressed": [], "summary": None, "thresholds": None, "book_reads": None,
+        "caveats": [],
+    }
+
+
+def example_l_alert(**overrides: Any) -> Dict[str, Any]:
+    """The §18.2 example alert (Example L, abbreviated where the server does not look)."""
+    alert: Dict[str, Any] = {
+        "alert_id": "mv-1104-1791208800", "exchange_id": "1104", "market_id": "552",
+        "title": "Will the Democratic Party win the North Carolina Senate?", "option": "YES", "race_key": "2026:SENATE:NC",
+        "party": "D", "race_label": "North Carolina Senate (D)", "direction": 1, "window_s": 300.0, "windows": [300.0],
+        "venues": ["polymarket", "kalshi"], "confirmation": "two venues", "venue_moves": [], "t_base": 1791208800.0,
+        "t_move": 1791208960.0, "outside_before": 0.5175, "outside_after": 0.5725, "outside_now": 0.5725, "move": 0.055,
+        "peak_move": 0.055, "threshold": 0.044, "sigma": 0.011, "vol_known": True, "uncertainty": 0.02,
+        "detected_at": 1791209115.0, "updated_at": 1791209115.0, "grown_at": 1791209115.0, "state": "open",
+        "status": "lagging", "status_label": "Cup lagging",
+        "reason": "The outside price moved +5.5 pts in 5 min; the Cup has moved +0.0 pts over the same time (now 0.512).",
+        "cup": {"base": None, "ref": None, "now": None, "move_same_window": 0.0, "move_lookback": 0.0, "half_cross_ts": None,
+                "short_history": False},
+        "lag_gap": 0.055, "lag": {"eligible": True, "outcome": "pending"}, "closed_at": None, "cup_now": None,
+        "lag_gap_now": 0.055, "level_gap_now": 0.06,
+        "trade": {"side": "yes", "action": "buy", "text": "Buy YES at 0.520", "limit": 0.52, "max_limit": 0.525,
+                  "outside_value": 0.565, "uncertainty": 0.02, "cup_half_spread": 0.0075, "edge_per_share": 0.0375,
+                  "edge_after_uncertainty": 0.0175, "edge_at_resolution": 0.045, "shares_at_limit": 300.0,
+                  "shares_to_max": 750.0, "book_source": "read", "book_age_s": 2.0, "computed_at": 1791209115.0,
+                  "note": moves_mod.MOVES_TRADE_NOTE},
+        "trade_note": None, "actionable": True, "linked": [], "flags": [], "demo": False,
+    }
+    alert.update(overrides)
+    return alert
+
+
+def compact_of(alert: Mapping[str, Any]) -> Dict[str, Any]:
+    """What the watcher's ``open_alert_for`` publishes for an open alert."""
+    return {key: alert[key] for key in ANNOTATION_KEYS}
+
+
+def fake_summary(alerts: List[Dict[str, Any]], **overrides: Any) -> Dict[str, Any]:
+    """A published watcher summary (§12.4: the §18.2 body without the keys web.py adds)."""
+    open_ = [a for a in alerts if a["state"] == "open"]
+    venues = [moves_mod.VenueStatus(venue=v, label=moves_mod.VENUE_LABELS[v], status="ok", matched=231, quoted=230,
+                                    budget_used=25, budget_limit=45).to_dict() for v in ("polymarket", "kalshi")]
+    summary: Dict[str, Any] = {
+        "poll_s": 15.0, "last_step_at": NOW, "steps": 3, "watching": {"outcomes": 237, "matched": 231, "venues": 2},
+        "venues": venues,
+        "counts": {"open": len(open_), "lagging": sum(1 for a in open_ if a["status"] == "lagging"),
+                   "actionable": sum(1 for a in open_ if a["actionable"]), "today": len(alerts),
+                   "closed_today": len(alerts) - len(open_), "suppressed_today": dict(NO_SUPPRESSED, thin=2)},
+        "actionable_ids": [a["alert_id"] for a in open_ if a["actionable"]], "alerts": alerts,
+        "suppressed": [{"exchange_id": "9", "title": "t", "race_label": "r", "reason": "thin", "reason_label": "x",
+                        "at": NOW - 5, "window_s": 60.0, "venues": ["kalshi"], "move": 0.05, "threshold": 0.03,
+                        "detail": "Kalshi's book was 10 pts wide during the move."}],
+        "summary": moves_mod.LagSummary().to_dict(), "thresholds": dict(MOVES_THRESHOLDS),
+        "caveats": list(moves_mod.MOVES_CAVEATS),
+    }
+    summary.update(overrides)
+    return summary
+
+
+class FakeWatcher:
+    """A watcher stand-in (docs/OUTSIDE_MOVES.md §2.2): canned published summary and status, open alerts by outcome."""
+
+    poll_s = 15.0
+
+    def __init__(self, summary: Optional[Dict[str, Any]] = None, *, status: Optional[Dict[str, Any]] = None,
+                 demo: bool = False, fail: Optional[BaseException] = None) -> None:
+        self._summary = summary if summary is not None else fake_summary([])
+        self._status = status if status is not None else {
+            "enabled": True, "poll_s": 15.0, "last_step_at": NOW, "steps": 3, "open": 0, "actionable": 0,
+            "actionable_alerts": [], "venues": {"ok": 2, "total": 2}, "last_error": None}
+        self.demo = demo
+        self.fail = fail
+        self.alert_calls: List[Tuple[Any, ...]] = []
+        self.closed = 0
+
+    def summary(self) -> Dict[str, Any]:
+        if self.fail is not None:
+            raise self.fail
+        return self._summary
+
+    def status(self) -> Dict[str, Any]:
+        return self._status
+
+    def open_alert_for(self, exchange_id: str) -> Optional[Dict[str, Any]]:
+        for alert in self._summary.get("alerts") or []:
+            if alert["exchange_id"] == str(exchange_id) and alert["state"] == "open":
+                return compact_of(alert)
+        return None
+
+    def alerts(self, state: Optional[str] = None, since: Optional[float] = None, limit: Optional[int] = None) -> List[Any]:
+        self.alert_calls.append((state, since, limit))
+        return list(self._summary.get("alerts") or [])
+
+    def close(self) -> None:
+        self.closed += 1
+
+
+@pytest.fixture(scope="module")
+def mv(tmp_path_factory: Any) -> Iterator[SimpleNamespace]:
+    """§18.5: ``build_demo(moves=True, clock=SimClock)`` + ``run_simulation(..., moves_every_s=15)`` for 20 simulated
+    minutes (the paper trader on, as in the dashboard), served over HTTP."""
+    from supermarket_bot import pipeline
+
+    data_dir = tmp_path_factory.mktemp("moves-dashboard")
+    runtime, clock = fast_demo(data_dir, moves=True)
+    try:
+        pipeline.run_simulation(runtime, clock, hours=MOVES_MINUTES / 60.0, step_s=30.0, end_run=False, moves_every_s=15.0)
+        with serve(runtime.app) as srv:
+            yield SimpleNamespace(runtime=runtime, app=runtime.app, tracker=runtime.tracker, watcher=runtime.moves,
+                                  clock=clock, http=HTTP(srv.port), data_dir=data_dir)
+    finally:
+        runtime.app.wait_backtest(10)
+        runtime.app.wait_paper_backtest(120)
+        runtime.close()
+
+
+def test_moves_disabled_body_exactly(pipe: SimpleNamespace) -> None:
+    assert pipe.app.moves is None and pipe.runtime.moves is None and pipe.tracker.moves is None
+    body = assert_json_safe(pipe.app.outside_moves())
+    assert body == disabled_moves_body(pipe.clock.now, True)
+    assert list(body) == MOVES_KEYS
+    assert pipe.app.outside_moves(state="closed", since=0.0, limit=500) == body  # filters change nothing when off
+    assert web.moves_payload(None, 5.0, enabled=False, demo=False) == disabled_moves_body(5.0, False)
+    # a published summary never turns a disabled body on
+    assert web.moves_payload(fake_summary([example_l_alert()]), 5.0, enabled=False, demo=False) == disabled_moves_body(5.0, False)
+
+
+def test_moves_disabled_over_http(client: HTTP, pipe: SimpleNamespace) -> None:
+    resp = client.get("/api/moves")
+    assert resp.status == 200 and resp.headers["cache-control"] == "no-store"
+    assert_security_headers(resp)
+    assert resp.json() == disabled_moves_body(pipe.clock.now, True)
+    assert client.get("/api/moves?state=open&since=0&limit=1").json() == disabled_moves_body(pipe.clock.now, True)
+    data = assert_json_error(client.get("/api/moves?state=nope"), 400)  # the query is checked even when off
+    assert data == {"error": "state must be open, closed or all."}
+    status = client.get("/api/status").json()
+    assert status["features"]["moves"] is False and status["moves"] is None
+    assert status["tracker"]["read_budget"]["moves"] is None
+
+
+def test_moves_enabled_body_on_the_fast_demo(mv: SimpleNamespace) -> None:
+    from supermarket_bot.moves import MOVES_CAVEATS, MOVES_DEMO_CAVEAT, MOVES_TRADE_NOTE, SUPPRESS_REASONS, VENUE_LABELS
+
+    body = assert_json_safe(mv.app.outside_moves())
+    assert list(body) == MOVES_KEYS
+    assert (body["enabled"], body["available"], body["error"], body["demo"]) == (True, True, None, True)
+    assert body["now"] == mv.clock() and body["last_step_at"] == mv.clock() and body["poll_s"] == 15.0
+    assert body["steps"] == MOVES_MINUTES * 2 * 2 + 1  # §16: a watcher step at each 30-s step and one sub-step between
+    assert body["watching"]["matched"] == 7 and body["watching"]["venues"] == 2 and body["watching"]["outcomes"] >= 7
+    assert [v["venue"] for v in body["venues"]] == ["demo-a", "demo-b"]
+    for v in body["venues"]:
+        assert set(v) == {f.name for f in fields(moves_mod.VenueStatus)}
+        assert v["label"] == VENUE_LABELS[v["venue"]] and v["status"] == "ok" and v["matched"] == 7
+
+    alerts = body["alerts"]
+    assert alerts and all(set(a) == ALERT_KEYS for a in alerts)
+    eids = {a["exchange_id"] for a in alerts}
+    assert {"9035", "9036"} <= eids, eids  # lead_short and lead_long
+    assert not eids & MOVES_NO_ALERT_IDS, eids  # the thin spike and the one-venue move never alert
+    assert all(a["demo"] is True for a in alerts)
+    states = [a["state"] for a in alerts]
+    assert states == sorted(states, key=lambda s: s != "open")  # open first ...
+    open_ = [a for a in alerts if a["state"] == "open"]
+    closed = [a for a in alerts if a["state"] == "closed"]
+    assert [a["actionable"] for a in open_] == sorted((a["actionable"] for a in open_), reverse=True)  # actionable first
+    assert [a["detected_at"] for a in closed] == sorted((a["detected_at"] for a in closed), reverse=True)  # newest first
+
+    counts = body["counts"]
+    assert counts["open"] == len(open_) and counts["today"] == len(alerts) and counts["closed_today"] == len(closed)
+    assert counts["lagging"] == sum(1 for a in open_ if a["status"] == "lagging")
+    assert list(counts["suppressed_today"]) == list(SUPPRESS_REASONS)
+    for reason in ("single_tick", "thin", "disagree"):  # §15.2: the thin spike (single print, then thin) and 9041
+        assert counts["suppressed_today"][reason] >= 1, counts
+    assert {s["exchange_id"] for s in body["suppressed"]} >= MOVES_NO_ALERT_IDS
+    assert {s["reason"] for s in body["suppressed"]} >= {"single_tick", "thin", "disagree"}
+
+    # the actionable ids: open lagging alerts with a suggestion that keeps >= 1 cent after the spread and the doubt
+    assert body["actionable_ids"] and counts["actionable"] == len(body["actionable_ids"])
+    by_id = {a["alert_id"]: a for a in alerts}
+    for aid in body["actionable_ids"]:
+        a = by_id[aid]
+        assert (a["state"], a["status"], a["actionable"]) == ("open", "lagging", True)
+        trade = a["trade"]
+        assert re.fullmatch(r"Buy (YES|NO) at 0\.\d{3}", trade["text"]) and trade["note"] == MOVES_TRADE_NOTE
+        assert round(trade["limit"] / 0.005, 6) == round(trade["limit"] / 0.005)  # on the Cup's 0.005 tick
+        assert trade["limit"] <= trade["max_limit"] + 1e-9
+        assert trade["edge_after_uncertainty"] >= moves_mod.MOVES_MIN_EDGE - 1e-9
+    for a in alerts:  # a live suggestion only on an open lagging alert (a closed one keeps only what it said)
+        if a["trade"] is not None:
+            assert (a["state"], a["status"]) == ("open", "lagging"), a["alert_id"]
+
+    summary = body["summary"]
+    assert set(summary) == {f.name for f in fields(moves_mod.LagSummary)}
+    assert summary["small_sample"] is True and summary["sentence"].startswith("Only ")  # a few demo moves: says so
+    assert body["thresholds"] == MOVES_THRESHOLDS
+    assert set(body["book_reads"]) == {"used", "limit", "room"} and body["book_reads"]["limit"] == web.FAST_READS_PER_MIN
+    assert body["caveats"] == list(MOVES_CAVEATS) + [MOVES_DEMO_CAVEAT]
+
+
+def test_moves_texts_never_promise_a_sure_thing(mv: SimpleNamespace) -> None:
+    text = web.encode_json(mv.app.outside_moves(limit=500)).decode("utf-8").lower()
+    text += web.encode_json(mv.app.status()).decode("utf-8").lower()
+    assert "sure thing" in text  # the suggestions carry the note ...
+    for match in re.finditer("sure thing", text):  # ... and only ever as "not a sure thing"
+        assert text[max(0, match.start() - 6):match.start()] == "not a ", text[match.start() - 80:match.end() + 20]
+    for match in re.finditer("guarantee", text):
+        assert text[max(0, match.start() - 6):match.start()] == "not a ", text[match.start() - 80:match.end() + 20]
+
+
+def test_moves_http_matches_the_app_and_filters(mv: SimpleNamespace) -> None:
+    resp = mv.http.get("/api/moves")
+    assert resp.status == 200 and resp.headers["content-type"] == web.JSON_TYPE
+    assert resp.headers["cache-control"] == "no-store"
+    assert_security_headers(resp)
+    full = resp.json()
+    assert full == json.loads(web.encode_json(mv.app.outside_moves()))
+    alerts = full["alerts"]
+    assert len(alerts) >= 4
+    ids = [a["alert_id"] for a in alerts]
+
+    def get(query: str) -> Dict[str, Any]:
+        r = mv.http.get("/api/moves?" + query)
+        assert r.status == 200, r.body[:300]
+        body = r.json()
+        assert list(body) == MOVES_KEYS and body["counts"] == full["counts"]  # only the alert list is filtered
+        return body
+
+    opened = get("state=open")["alerts"]
+    assert opened and all(a["state"] == "open" for a in opened)
+    assert [a["alert_id"] for a in opened] == [a["alert_id"] for a in alerts if a["state"] == "open"]
+    closed = get("state=closed")["alerts"]
+    assert closed and all(a["state"] == "closed" for a in closed)
+    assert [a["alert_id"] for a in closed] == [a["alert_id"] for a in alerts if a["state"] == "closed"]
+    assert get("state=all") == full and get("state=ALL") == full and get("state=&since=&limit=") == full
+    assert [a["alert_id"] for a in get("limit=1")["alerts"]] == ids[:1]
+    assert [a["alert_id"] for a in get("limit=500")["alerts"]] == ids
+    assert [a["alert_id"] for a in get("state=closed&limit=2")["alerts"]] == [a["alert_id"] for a in closed][:2]
+    cut = sorted(a["detected_at"] for a in alerts)[len(alerts) // 2]
+    recent = get(f"since={cut}")["alerts"]
+    assert [a["alert_id"] for a in recent] == [a["alert_id"] for a in alerts if a["detected_at"] >= cut]
+    assert 0 < len(recent) < len(alerts)
+    assert get(f"since={mv.clock() + 1}")["alerts"] == []
+    assert mv.app.outside_moves(state="open", since=cut, limit=1)["alerts"] == [
+        a for a in alerts if a["state"] == "open" and a["detected_at"] >= cut][:1]
+    head = mv.http.request("HEAD", "/api/moves")
+    assert head.status == 200 and head.body == b"" and int(head.headers["content-length"]) > 0
+    assert_security_headers(head)
+
+
+@pytest.mark.parametrize("query, message", [
+    ("state=bogus", web.MOVES_STATE_ERROR), ("state=opened", web.MOVES_STATE_ERROR), ("state=1", web.MOVES_STATE_ERROR),
+    ("since=abc", web.MOVES_SINCE_ERROR), ("since=nan", web.MOVES_SINCE_ERROR), ("since=inf", web.MOVES_SINCE_ERROR),
+    ("since=-1", web.MOVES_SINCE_ERROR), ("since=2026-10-05", web.MOVES_SINCE_ERROR),
+    ("limit=0", web.MOVES_LIMIT_ERROR), ("limit=501", web.MOVES_LIMIT_ERROR), ("limit=1.5", web.MOVES_LIMIT_ERROR),
+    ("limit=abc", web.MOVES_LIMIT_ERROR), ("limit=-3", web.MOVES_LIMIT_ERROR), ("limit=1e2", web.MOVES_LIMIT_ERROR),
+    ("limit=99999999", web.MOVES_LIMIT_ERROR),
+])
+def test_moves_bad_queries_are_400(mv: SimpleNamespace, query: str, message: str) -> None:
+    resp = mv.http.get(f"/api/moves?{query}")
+    assert assert_json_error(resp, 400) == {"error": message}
+    assert resp.headers["cache-control"] == "no-store"
+
+
+def test_moves_query_parser() -> None:
+    from urllib.parse import parse_qs
+
+    def parse(text: str) -> Tuple[Optional[str], Dict[str, Any]]:
+        return web.moves_query(parse_qs(text, keep_blank_values=True))
+
+    assert parse("") == (None, {"state": None, "since": None, "limit": None})
+    assert parse("state=Closed&since=1791208800.5&limit=+20") == (
+        None, {"state": "closed", "since": 1791208800.5, "limit": 20})
+    assert parse("state=all&limit=500&since=0") == (None, {"state": "all", "since": 0.0, "limit": 500})
+    assert parse("limit=1")[1]["limit"] == 1
+    assert parse("state=x")[0] == "state must be open, closed or all."
+    assert parse("since=x")[0] == "since must be a number of seconds since 1970."
+    assert parse("limit=x")[0] == "limit must be a whole number from 1 to 500."
+
+
+def test_moves_post_and_put_are_refused_like_other_get_routes(mv: SimpleNamespace) -> None:
+    resp = mv.http.post("/api/moves")
+    assert_json_error(resp, 405)
+    assert resp.headers["allow"] == "GET, HEAD"
+    for method in ("PUT", "DELETE", "PATCH"):
+        resp = mv.http.request(method, "/api/moves", headers={"Content-Type": "application/json", "Origin": mv.http.origin})
+        assert_json_error(resp, 405)
+        assert resp.headers["allow"] == "GET, HEAD, POST"
+    assert_json_error(mv.http.post("/api/moves/mv-9035-1"), 404)
+    assert_json_error(mv.http.get("/api/moves/mv-9035-1"), 404)
+    assert_json_error(mv.http.post("/api/moves", Origin="http://evil.example"), 403)  # same-origin rule first
+
+
+def test_moves_status_additions(mv: SimpleNamespace) -> None:
+    status = assert_json_safe(mv.app.status())
+    assert status["features"]["moves"] is True and status["features"]["fair_value"] == "auto"
+    moves = status["moves"]
+    assert set(moves) == MOVES_STATUS_KEYS and moves["enabled"] is True and moves["last_error"] is None
+    assert moves == status["tracker"]["moves"]  # tracker_summary keeps the raw key too
+    body = mv.app.outside_moves()
+    assert moves["steps"] == body["steps"] and moves["open"] == body["counts"]["open"]
+    assert moves["actionable"] == len(body["actionable_ids"]) >= 1
+    assert [a["alert_id"] for a in moves["actionable_alerts"]] == body["actionable_ids"][:10]
+    for note in moves["actionable_alerts"]:
+        assert set(note) == {"alert_id", "exchange_id", "headline", "body", "detected_at"}
+        assert note["headline"].startswith("Cup lagging: ") and note["body"].endswith("Not a sure thing.")
+    assert moves["venues"] == {"ok": 2, "total": 2}
+    budget = status["tracker"]["read_budget"]["moves"]
+    assert set(budget) == {"used", "limit", "room"} and budget == body["book_reads"]
+    assert not any(p["source"] == tracker_mod.MOVES_PROBLEM for p in status["problems"])
+    with serve(mv.app) as srv:
+        served = HTTP(srv.port).get("/api/status").json()
+    assert served["moves"] == json.loads(web.encode_json(moves)) and served["features"]["moves"] is True
+
+
+def test_moves_fairvalue_rows_and_strategy_on_the_fast_demo(mv: SimpleNamespace) -> None:
+    body = mv.app.outside_moves()
+    open_by_eid = {a["exchange_id"]: a for a in body["alerts"] if a["state"] == "open"}
+    assert open_by_eid
+    data = assert_json_safe(mv.app.fairvalue())
+    rows = {r["exchange_id"]: r for r in data["rows"]}
+    assert all(set(r) == FV_ROW_KEYS for r in data["rows"])
+    for eid, row in rows.items():
+        alert = open_by_eid.get(eid)
+        if alert is None:
+            assert row["move"] is None, eid
+        else:
+            assert row["move"] == web.move_annotation(alert) and set(row["move"]) == ANNOTATION_KEYS
+    assert any(rows[eid]["move"] is not None for eid in open_by_eid if eid in rows)
+    report = mv.app.strategy()
+    for opp in report["opportunities"]:  # the demo's value ideas are on other outcomes (no fair value for 9035-9041)
+        assert ("outside_move" in opp) == (opp.get("kind") == "value" and opp.get("exchange_id") in open_by_eid)
+
+
+def test_moves_alerts_file_has_one_opened_line_per_alert(mv: SimpleNamespace) -> None:
+    path = mv.data_dir / "demo" / moves_mod.MOVES_ALERTS_FILE
+    assert mv.watcher.alerts_path == path
+    lines = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    assert lines and {line["event"] for line in lines} <= {"opened", "status", "closed"}
+    opened = [line["alert"]["alert_id"] for line in lines if line["event"] == "opened"]
+    assert len(opened) == len(set(opened))
+    assert set(opened) == {a["alert_id"] for a in mv.app.outside_moves(limit=500)["alerts"]}
+    assert all(line["at_iso"].endswith("Z") for line in lines)
+
+
+def test_moves_reads_are_lock_free(mv: SimpleNamespace) -> None:
+    """§12.3: the web handlers read the watcher's published summary and status without its lock (a long step can
+    hold it), so /api/moves, /api/status and the annotations never wait for a step."""
+    watcher = mv.watcher
+    held, release = threading.Event(), threading.Event()
+
+    def hold() -> None:
+        with watcher._lock:
+            held.set()
+            release.wait(10)
+
+    mv.app.fairvalue()  # built once before (both are cached on the frozen SimClock)
+    mv.app.strategy()
+    thread = threading.Thread(target=hold, name="test-hold-watcher-lock", daemon=True)
+    thread.start()
+    try:
+        assert held.wait(5)
+        started = time.monotonic()
+        assert mv.app.outside_moves()["available"] is True
+        assert mv.app.status()["moves"]["enabled"] is True
+        mv.app.fairvalue()
+        mv.app.strategy()
+        assert time.monotonic() - started < 2.0
+    finally:
+        release.set()
+        thread.join(5)
+
+
+def test_moves_concurrent_requests_with_a_watcher_never_deadlock(mv: SimpleNamespace) -> None:
+    """Cached /api/strategy and /api/fairvalue answers are annotated outside the app's lock (a cache hit used to
+    re-enter it), so many concurrent requests with a watcher all finish."""
+    calls = [mv.app.strategy, mv.app.fairvalue, mv.app.outside_moves, mv.app.status,
+             lambda: mv.app.outside_moves(state="closed", limit=3)] * 6
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(fn) for fn in calls]
+        results = [f.result(timeout=60) for f in futures]
+    assert all(isinstance(r, dict) for r in results)
+    for path in ("/api/strategy", "/api/strategy", "/api/fairvalue", "/api/moves?state=open"):
+        assert mv.http.get(path).status == 200
+
+
+def test_moves_body_from_a_fake_watcher(make_app: Callable[..., web.DashboardApp]) -> None:
+    closed = example_l_alert(alert_id="mv-7-1", exchange_id="7", state="closed", status="already_moved",
+                             status_label="Cup already moved", actionable=False, trade=None, detected_at=NOW - 900.0,
+                             closed_at=NOW - 300.0)
+    summary = fake_summary([example_l_alert(), closed])
+    watcher = FakeWatcher(summary, status={**FakeWatcher().status(), "last_error": "Kalshi was slow."})
+    budget = SimpleNamespace(status=lambda: {"used": 1, "limit": 4, "room": 3})
+    tracker = FakeTracker({"status": {}})
+    tracker.moves_budget = budget  # type: ignore[attr-defined]
+    app = make_app(tracker, moves=watcher)
+    body = assert_json_safe(app.outside_moves())
+    assert list(body) == MOVES_KEYS
+    assert (body["now"], body["enabled"], body["available"], body["demo"]) == (NOW, True, True, False)
+    assert body["error"] == "Kalshi was slow."  # the watcher's last_error
+    assert body["alerts"] == summary["alerts"] and body["venues"] == summary["venues"]
+    assert body["counts"] == summary["counts"] and body["actionable_ids"] == ["mv-1104-1791208800"]
+    assert body["suppressed"] == summary["suppressed"] and body["summary"] == summary["summary"]
+    assert body["thresholds"] == MOVES_THRESHOLDS and body["caveats"] == list(moves_mod.MOVES_CAVEATS)
+    assert body["book_reads"] == {"used": 1, "limit": 4, "room": 3}
+    assert watcher.alert_calls == []  # an unfiltered request reads only the published summary
+    assert [a["alert_id"] for a in app.outside_moves(state="closed")["alerts"]] == ["mv-7-1"]
+    assert [a["alert_id"] for a in app.outside_moves(since=NOW - 600.0)["alerts"]] == ["mv-1104-1791208800"]
+    assert [a["alert_id"] for a in app.outside_moves(since=1791209115.0)["alerts"]] == ["mv-1104-1791208800"]
+    assert app.outside_moves(since=1791209115.5)["alerts"] == []
+    assert [a["alert_id"] for a in app.outside_moves(limit=1)["alerts"]] == ["mv-1104-1791208800"]
+    assert watcher.alert_calls  # a filtered one asks for every alert in memory
+    # a demo dashboard always carries the demo caveat, even if a watcher forgot it
+    demo_body = make_app(FakeTracker({}), moves=FakeWatcher(summary), demo=True).outside_moves()
+    assert demo_body["demo"] is True and demo_body["caveats"][-1] == moves_mod.MOVES_DEMO_CAVEAT
+    status = app.status()
+    assert status["features"]["moves"] is True and status["moves"]["last_error"] == "Kalshi was slow."
+    assert status["tracker"]["read_budget"]["moves"] == {"used": 1, "limit": 4, "room": 3}
+
+
+def test_moves_body_before_the_first_step_and_from_a_broken_watcher(make_app: Callable[..., web.DashboardApp]) -> None:
+    fair_values = SimpleNamespace(mode="auto", providers=[], targets=lambda: [])
+    fresh = moves_mod.OutsideMoveWatcher(fair_values, clock=lambda: NOW)
+    body = assert_json_safe(make_app(FakeTracker({}), moves=fresh).outside_moves())
+    assert (body["enabled"], body["available"], body["error"], body["steps"]) == (True, False, None, 0)
+    assert body["alerts"] == [] and body["actionable_ids"] == [] and body["suppressed"] == [] and body["venues"] == []
+    assert body["summary"] == moves_mod.LagSummary().to_dict() and body["thresholds"] == MOVES_THRESHOLDS
+    assert body["counts"]["suppressed_today"] == NO_SUPPRESSED and body["book_reads"] is None
+    broken = make_app(FakeTracker({}), moves=FakeWatcher(fail=RuntimeError("boom")))
+    data = assert_json_safe(broken.outside_moves())
+    assert (data["enabled"], data["available"], data["alerts"]) == (True, False, [])
+    assert "could not be read (RuntimeError)" in data["error"] and "boom" not in data["error"]
+    assert broken.strategy()["available"] in (True, False)  # the annotations never break other endpoints
+    with serve(broken) as srv:
+        assert HTTP(srv.port).get("/api/moves").status == 200
+
+
+def test_moves_secrets_never_reach_the_body(make_app: Callable[..., web.DashboardApp]) -> None:
+    alert = example_l_alert(reason=f"leaked {FAKE_KEY} in a sentence")
+    watcher = FakeWatcher(fake_summary([alert]),
+                          status={**FakeWatcher().status(), "last_error": f"proxy refused Bearer {FAKE_KEY}"})
+    app = make_app(FakeTracker({}), moves=watcher, secrets=[FAKE_KEY])
+    with serve(app) as srv:
+        http_client = HTTP(srv.port)
+        responses = [http_client.get(p) for p in ("/api/moves", "/api/moves?state=open", "/api/status")]
+        app.wait_backtest(10)
+    for resp in responses:
+        assert resp.status == 200
+        assert_security_headers(resp)
+        assert FAKE_KEY.encode() not in resp.body
+    body = responses[0].json()
+    assert "***" in body["error"] and "***" in body["alerts"][0]["reason"]
+
+
+def test_move_annotation() -> None:
+    alert = example_l_alert()
+    note = web.move_annotation(alert)
+    assert note == {"alert_id": "mv-1104-1791208800", "status": "lagging", "status_label": "Cup lagging", "state": "open",
+                    "direction": 1, "move": 0.055, "lag_gap_now": 0.055, "detected_at": 1791209115.0, "actionable": True}
+    assert web.move_annotation(compact_of(alert)) == note  # the watcher's compact open alert gives the same
+    assert web.move_annotation(None) is None and web.move_annotation({}) is None and web.move_annotation("x") is None
+    down = web.move_annotation({"alert_id": "mv-2-1", "status": "reverted", "direction": -1, "move": float("nan")})
+    assert down is not None and down["status_label"] == "Outside reverted" and down["direction"] == -1
+    assert down["move"] is None and down["actionable"] is False and down["state"] == "open"
+
+
+def test_moves_annotations_on_value_ideas_and_fair_value_rows(make_app: Callable[..., web.DashboardApp],
+                                                               monkeypatch: pytest.MonkeyPatch) -> None:
+    """§18.4 on a fake watcher: ``outside_move`` only on value ideas with an open alert (also through a leg); every
+    /api/fairvalue row gains ``move`` (null without one); nothing else changes and the cached report is not mutated."""
+    base = {
+        "target_price": None, "stop_price": None, "prob_win": 0.6, "edge": 0.03, "expected_return": 0.05,
+        "horizon_hours": None, "suggested_shares": 100, "suggested_cost": 52.0, "score": 0.5, "confidence": 0.7,
+        "rationale": [], "risks": [], "side": "yes", "entry_price": 0.52, "title": "t", "option": "YES", "legs": None,
+    }
+    report = {
+        "generated_at": NOW, "risk_mode": "balanced", "headline": "h", "assumptions": [],
+        "opportunities": [
+            dict(base, kind="value", exchange_id="1104", market_id="552"),  # its own open alert
+            dict(base, kind="value", exchange_id="2000", market_id="9"),  # no alert
+            dict(base, kind="value", exchange_id=None, market_id="10", legs=[  # an alert on one leg
+                {"exchange_id": "3000", "market_id": "10", "title": "t", "option": "A", "side": "yes", "price": 0.4},
+                {"exchange_id": "7", "market_id": "10", "title": "t", "option": "B", "side": "yes", "price": 0.5}]),
+            dict(base, kind="carry", exchange_id="1104", market_id="552"),  # not a value idea
+            dict(base, kind="value", exchange_id="7", market_id="11"),  # a CLOSED alert only
+        ],
+    }
+    calls = {"report": 0}
+
+    def fake_report(inputs: Any, **kwargs: Any) -> Dict[str, Any]:
+        calls["report"] += 1
+        return copy.deepcopy(report)
+
+    monkeypatch.setattr(strategy_mod, "report_from_inputs", fake_report)
+    lagging = example_l_alert()
+    leg_alert = example_l_alert(alert_id="mv-7-5", exchange_id="7", status="moved_first", status_label="Cup moved first",
+                                actionable=False, trade=None, direction=-1)
+    summary = fake_summary([lagging, leg_alert])
+    watcher = FakeWatcher(summary)
+    app = make_app(FakeTracker({}), moves=watcher)
+    data = assert_json_safe(app.strategy())
+    own, plain, legs, carry, closed_only = data["opportunities"]
+    assert own["outside_move"] == web.move_annotation(lagging) and set(own["outside_move"]) == ANNOTATION_KEYS
+    assert "outside_move" not in plain and "outside_move" not in carry
+    assert legs["outside_move"]["alert_id"] == "mv-7-5" and legs["outside_move"]["direction"] == -1
+    assert closed_only["outside_move"]["alert_id"] == "mv-7-5"  # the open alert of outcome 7
+    first = app.strategy()
+    assert app.strategy() is first and calls["report"] == 1  # cached, annotated once per published summary
+    cached = app._strategy_cache[2]  # the cached report itself is never annotated in place
+    assert all("outside_move" not in o for o in cached["opportunities"])
+    # the alert on 7 closes: the next published summary drops the annotation without rebuilding the report
+    watcher._summary = fake_summary([lagging, dict(leg_alert, state="closed")])
+    later = app.strategy()["opportunities"]
+    assert calls["report"] == 1 and "outside_move" not in later[2] and "outside_move" in later[0]
+    # without a watcher nothing is added
+    plain_app = make_app(FakeTracker({}))
+    assert all("outside_move" not in o for o in plain_app.strategy()["opportunities"])
+
+    rows = [{"exchange_id": eid, "title": eid} for eid in ("1104", "2000", "7")]
+    monkeypatch.setattr(web, "fairvalue_payload", lambda fv, quotes, now, history=None: {
+        "now": now, "enabled": True, "rows": copy.deepcopy(rows)})
+    fv = app.fairvalue()
+    assert [r["move"]["alert_id"] if r["move"] else None for r in fv["rows"]] == ["mv-1104-1791208800", None, None]
+    again = app.fairvalue()  # served from the 15-s cache: annotated again, the cache keeps no "move"
+    assert again["rows"] == fv["rows"] and all("move" not in r for r in app._fv_cache[1]["rows"])
+    assert all(r["move"] is None for r in plain_app.fairvalue()["rows"])
+
+
+def test_build_demo_with_moves_wires_the_watcher(tmp_path: Path) -> None:
+    from supermarket_bot.tracker import MOVES_READS_PER_MIN
+
+    runtime, clock = fast_demo(tmp_path, moves=True, paper=False)
+    try:
+        watcher = runtime.moves
+        assert watcher is not None and runtime.app.moves is watcher and runtime.tracker.moves is watcher
+        assert watcher.demo is True and watcher.poll_s == moves_mod.MOVES_POLL_S
+        assert watcher.alerts_path == tmp_path / "demo" / moves_mod.MOVES_ALERTS_FILE
+        assert [p.name for p in watcher._pollable()] == ["demo-a", "demo-b"]
+        # the scripted venues are not fair-value providers: the paper trader never sees their quotes (M12)
+        assert [p.name for p in runtime.fair_values.providers] == ["demo"]
+        assert runtime.demo_market.outside_moves is True
+        assert runtime.tracker.moves_reads_per_min == web.FAST_READS_PER_MIN  # a SimClock run never waits
+        body = runtime.app.outside_moves()  # built, not stepped yet
+        assert (body["enabled"], body["available"], body["error"], body["alerts"]) == (True, False, None, [])
+        assert body["summary"] == moves_mod.LagSummary().to_dict()
+        assert body["caveats"] == list(moves_mod.MOVES_CAVEATS) + [moves_mod.MOVES_DEMO_CAVEAT]
+    finally:
+        runtime.close()
+    assert runtime.tracker.moves.step().errors == ["The outside-move watcher is closed."]  # closed with the runtime
+
+    runtime, _ = fast_demo(tmp_path / "b", moves=True, paper=False, moves_poll_s=5, moves_book_reads_per_min=0)
+    try:
+        assert runtime.moves.poll_s == 5.0 and runtime.tracker.moves_reads_per_min == 0  # 0 means none, even fast
+    finally:
+        runtime.close()
+    real = web.build_demo(tmp_path / "c", 30.0, out=io.StringIO(), news=False, paper=False, moves=True)  # real time
+    try:
+        assert real.tracker.moves_reads_per_min == MOVES_READS_PER_MIN and real.moves.poll_s == 15.0
+    finally:
+        real.close()
+    real = web.build_demo(tmp_path / "d", 30.0, out=io.StringIO(), news=False, paper=False, moves=True,
+                          moves_book_reads_per_min=7)
+    try:
+        assert real.tracker.moves_reads_per_min == 7
+    finally:
+        real.close()
+    for bad in (4.9, 121, float("nan")):
+        with pytest.raises(ValueError, match="--moves-poll must be between 5 and 120 seconds"):
+            fast_demo(tmp_path / "e", moves=True, moves_poll_s=bad)
+
+
+@pytest.mark.parametrize("mode", ["manual", "off"])
+def test_build_demo_moves_need_fair_value_auto(tmp_path: Path, mode: str) -> None:
+    out = io.StringIO()
+    clock = demo_mod.SimClock(demo_mod.SIM_T0)
+    runtime = web.build_demo(tmp_path, 30.0, out=out, clock=clock, news=False, paper=False, fair_value=mode, moves=True)
+    try:
+        assert out.getvalue().splitlines().count("Outside-move alerts need --fair-value auto: off.") == 1
+        assert runtime.moves is None and runtime.app.moves is None and runtime.tracker.moves is None
+        assert runtime.demo_market.outside_moves is False  # exactly the demo without moves
+        assert runtime.app.outside_moves() == disabled_moves_body(clock(), True)
+        assert runtime.app.status()["features"]["moves"] is False
+    finally:
+        runtime.close()
+
+
+def test_build_demo_without_moves_prints_nothing_about_them(tmp_path: Path) -> None:
+    out = io.StringIO()
+    runtime = web.build_demo(tmp_path, 30.0, out=out, clock=demo_mod.SimClock(demo_mod.SIM_T0), news=False, paper=False,
+                             fair_value="manual")
+    try:
+        assert runtime.moves is None and runtime.demo_market.outside_moves is False
+        assert "Outside-move" not in out.getvalue()
+    finally:
+        runtime.close()
+
+
+def test_moves_restart_with_a_kept_database_continues_the_alerts(tmp_path: Path) -> None:
+    """``fresh_db=False`` keeps the store and alerts.jsonl (§18.1): a rebuilt demo continues the same alerts and
+    never writes a second "opened" line for one."""
+    from supermarket_bot import pipeline
+
+    runtime, clock = fast_demo(tmp_path, moves=True, paper=False)
+    try:
+        pipeline.run_simulation(runtime, clock, hours=8 / 60.0, step_s=30.0, end_run=False, moves_every_s=15.0)
+        before = {a["alert_id"]: a for a in runtime.app.outside_moves(limit=500)["alerts"]}
+        end = clock()
+    finally:
+        runtime.close()
+    assert before
+    clock2 = demo_mod.SimClock(end + 15.0)
+    again = web.build_demo(tmp_path, 30.0, out=io.StringIO(), clock=clock2, news=False, paper=False, moves=True,
+                           fresh_db=False)
+    try:
+        assert again.demo_market.t0 == demo_mod.SIM_T0  # the scripted events continue (D47)
+        pipeline.run_simulation(again, clock2, hours=60 / 3600.0, step_s=30.0, end_run=False, moves_every_s=15.0)
+        after = {a["alert_id"]: a for a in again.app.outside_moves(limit=500)["alerts"]}
+        assert set(before) <= set(after)
+        for aid, alert in before.items():
+            assert after[aid]["t_base"] == alert["t_base"] and after[aid]["detected_at"] == alert["detected_at"]
+    finally:
+        again.close()
+    lines = [json.loads(line) for line in (tmp_path / "demo" / "alerts.jsonl").read_text(encoding="utf-8").splitlines()]
+    opened = [line["alert"]["alert_id"] for line in lines if line["event"] == "opened"]
+    assert len(opened) == len(set(opened)) and set(before) <= set(opened)
+
+
+def test_simulation_options_moves_keys() -> None:
+    parse = build_parser().parse_args
+    on = web.simulation_options(parse(["dashboard"]))
+    assert (on["moves"], on["moves_poll_s"], on["moves_book_reads_per_min"]) == (True, 15.0, 4)
+    off = web.simulation_options(parse(["dashboard", "--no-moves", "--moves-poll", "30", "--moves-book-reads", "0"]))
+    assert (off["moves"], off["moves_poll_s"], off["moves_book_reads_per_min"]) == (False, 30.0, 0)
+    assert web.simulation_options(parse(["paper"]))["moves"] is False  # `paper` never runs the watcher
+    bare = web.simulation_options(SimpleNamespace())
+    assert (bare["moves"], bare["moves_poll_s"], bare["moves_book_reads_per_min"]) == (False, None, None)
+
+
+@pytest.mark.parametrize("value", ["4", "121", "nan", "-15"])
+def test_run_dashboard_rejects_a_bad_moves_poll(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str) -> None:
+    def never(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("built despite a bad --moves-poll")
+
+    monkeypatch.setattr(web, "build_demo", never)
+    monkeypatch.setattr(web, "build_live", never)
+    err = io.StringIO()
+    args = _dashboard_args(tmp_path, "--demo", "--no-browser", "--moves-poll", value)
+    assert web.run_dashboard(None, args, out=io.StringIO(), err=err) == 2
+    assert "--moves-poll must be between 5 and 120 seconds" in err.getvalue()
+
+
+def test_run_dashboard_demo_passes_the_moves_options(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: Dict[str, Any] = {}
+
+    def capture(data_dir: Path, interval: float, **kwargs: Any) -> Any:
+        seen.update(kwargs)
+        raise KeyboardInterrupt  # stop right there ("Stopped before the dashboard started.")
+
+    monkeypatch.setattr(web, "build_demo", capture)
+    args = _dashboard_args(tmp_path, "--demo", "--no-browser", "--moves-poll", "20", "--moves-book-reads", "2")
+    assert web.run_dashboard(None, args, out=io.StringIO(), err=io.StringIO()) == 130
+    assert (seen["moves"], seen["moves_poll_s"], seen["moves_book_reads_per_min"]) == (True, 20.0, 2)
+    seen.clear()
+    web.run_dashboard(None, _dashboard_args(tmp_path, "--demo", "--no-browser", "--no-moves"), out=io.StringIO(),
+                      err=io.StringIO())
+    assert seen["moves"] is False
+
+
+def test_runtime_close_closes_the_watcher_before_the_fair_values(tmp_path: Path) -> None:
+    order: List[str] = []
+
+    def thing(name: str, method: str = "close") -> Any:
+        return SimpleNamespace(**{method: lambda: order.append(name)})
+
+    runtime = web.Runtime(app=None, tracker=thing("tracker", "stop"), store=thing("store"), client=thing("client"),  # type: ignore[arg-type]
+                          context=None, news=thing("news"), fair_values=thing("fair values"), moves=thing("moves"))
+    runtime.close()
+    assert order == ["tracker", "news", "moves", "fair values", "client", "store"]
+
+
+def _live_moves_runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, args: Any) -> Tuple[web.Runtime, str]:
+    """``build_live`` over the demo API (no network: nothing is started, no outside request is made)."""
+    monkeypatch.delenv("SUPERMARKET_LLM", raising=False)
+    market = demo_mod.DemoMarket(seed=7)
+
+    def from_settings(cls: Any, settings: Settings, **kwargs: Any) -> SuperMarketClient:
+        return market.client(api_key=settings.api_key, transport=market.transport(), reads_per_min=10_000)
+
+    monkeypatch.setattr(SuperMarketClient, "from_settings", classmethod(from_settings))
+    settings = Settings(api_key=FAKE_KEY, tournament=demo_mod.DEMO_SLUG, data_dir=tmp_path)
+    out = io.StringIO()
+    return web.build_live(settings, args, out=out), out.getvalue()
+
+
+def test_build_live_builds_the_watcher_with_the_dashboard_options(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from supermarket_bot.fairvalue import FV_CAVEATS, OUTSIDE_READS_PER_MIN_WITH_MOVES  # noqa: F401
+    from supermarket_bot.tracker import MOVES_READS_PER_MIN
+
+    args = build_parser().parse_args(["dashboard", "--no-news", "--no-paper"])
+    runtime, text = _live_moves_runtime(tmp_path, monkeypatch, args)
+    try:
+        watcher = runtime.moves
+        assert watcher is not None and runtime.app.moves is watcher and runtime.tracker.moves is watcher
+        assert watcher.demo is False and watcher.poll_s == 15.0
+        assert watcher.alerts_path == tmp_path / demo_mod.DEMO_SLUG / moves_mod.MOVES_ALERTS_FILE
+        # the watcher polls the fair-value service's own providers: one host budget (45 a minute), one backoff
+        assert [p.name for p in watcher._pollable()] == [p.name for p in runtime.fair_values.providers]
+        assert [p.name for p in runtime.fair_values.providers] == ["polymarket", "kalshi"]
+        assert all(p.budget()["limit"] == OUTSIDE_READS_PER_MIN_WITH_MOVES for p in runtime.fair_values.providers)
+        assert runtime.tracker.moves_reads_per_min == MOVES_READS_PER_MIN
+        lines = text.splitlines()
+        notice = ("Outside-move alerts: Polymarket and Kalshi every 15 s (GET only, about 25 and 15 reads a minute); "
+                  "use --no-moves to stop.")
+        assert lines.index(notice) == lines.index(web.FV_AUTO_NOTICE) + 1
+        body = runtime.app.outside_moves()
+        assert (body["enabled"], body["available"], body["demo"], body["steps"]) == (True, False, False, 0)
+        assert body["caveats"] == list(moves_mod.MOVES_CAVEATS)
+        assert runtime.app.status()["features"]["moves"] is True
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize("argv, expect", [
+    (["dashboard", "--no-news", "--no-paper", "--no-moves"], "off"),
+    (["dashboard", "--no-news", "--no-paper", "--fair-value", "manual"], "notice"),
+    (["dashboard", "--no-news", "--no-paper", "--no-fair-value"], "notice"),
+    (["dashboard", "--no-news", "--no-paper", "--moves-poll", "30", "--moves-book-reads", "0"], "on"),
+])
+def test_build_live_moves_options(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, argv: List[str], expect: str) -> None:
+    runtime, text = _live_moves_runtime(tmp_path, monkeypatch, build_parser().parse_args(argv))
+    try:
+        if expect == "on":
+            assert runtime.moves is not None and runtime.moves.poll_s == 30.0
+            assert runtime.tracker.moves_reads_per_min == 0
+            assert ("Outside-move alerts: Polymarket and Kalshi every 30 s (GET only, about 15 and 9 reads a minute); "
+                    "use --no-moves to stop.") in text.splitlines()
+            return
+        assert runtime.moves is None and runtime.app.moves is None and runtime.tracker.moves is None
+        assert "Outside-move alerts: Polymarket" not in text
+        assert text.splitlines().count(web.MOVES_FV_NOTICE) == (1 if expect == "notice" else 0)
+        if runtime.fair_values is not None:  # without the watcher the hosts keep the 30-a-minute budget
+            assert all(p.budget()["limit"] == 30 for p in runtime.fair_values.providers)
+    finally:
+        runtime.close()
+
+
+def test_build_live_without_the_moves_option_builds_no_watcher(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """§18.5: an old caller's namespace (no ``no_moves`` attribute) means off."""
+    args = SimpleNamespace(interval=30.0, no_news=True, no_paper=True, fair_value="auto", tournament=None, public=False)
+    runtime, text = _live_moves_runtime(tmp_path, monkeypatch, args)
+    try:
+        assert runtime.moves is None and runtime.tracker.moves is None and runtime.app.moves is None
+        assert "Outside-move" not in text
+        assert runtime.app.outside_moves()["enabled"] is False
+    finally:
+        runtime.close()
+
+
+def test_moves_live_notice_numbers() -> None:
+    assert web.moves_live_notice(15.0) == ("Outside-move alerts: Polymarket and Kalshi every 15 s (GET only, about 25 "
+                                           "and 15 reads a minute); use --no-moves to stop.")
+    fast = web.moves_live_notice(5.0)
+    assert fast.startswith("Outside-move alerts: Polymarket and Kalshi every 5 s (GET only, about 65 and 39 reads")
+    assert "some polls will be skipped" in fast
+    assert "skipped" not in web.moves_live_notice(10.0)  # 35 a minute fits under 45 minus the refresh's 9

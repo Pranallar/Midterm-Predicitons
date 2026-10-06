@@ -320,3 +320,167 @@ def test_run_simulation_can_leave_the_run_open(tmp_path: Path) -> None:
         assert runtime.store.paper_load_run(None)["run_id"] == final["run"]["run_id"]
     finally:
         runtime.close()
+
+
+class _RecordingTracker:
+    """A tracker stand-in for run_simulation's call sequence (docs/OUTSIDE_MOVES.md §16)."""
+
+    def __init__(self, clock: SimClock, moves: bool = True, paper: bool = True) -> None:
+        self.clock = clock
+        self.moves = SimpleNamespace(poll_s=15.0) if moves else None
+        self.paper = paper
+        self.calls: List[Any] = []
+
+    def run_once(self) -> None:
+        self.calls.append(("run", self.clock()))
+
+    def backfill_step(self, n: int) -> int:
+        self.calls.append(("backfill", self.clock()))
+        return 0
+
+    def analyze_pending(self, n: int) -> int:
+        self.calls.append(("analyze", self.clock()))
+        return 0
+
+    def fair_value_step(self, now: float) -> bool:
+        self.calls.append(("fv", now))
+        return True
+
+    def paper_step(self, now: float) -> None:
+        self.calls.append(("paper", now))
+
+    def moves_step(self, now: float) -> None:
+        assert now == self.clock()  # the clock sits at the sub-tick the watcher is stepped at
+        self.calls.append(("moves", now))
+
+    def paper_view(self) -> Any:
+        return {"run": {"steps": sum(1 for c in self.calls if c[0] == "paper")}} if self.paper else None
+
+    def moves_view(self) -> Dict[str, Any]:
+        return {"steps": sum(1 for c in self.calls if c[0] == "moves")}
+
+    def paper_end(self, reason: str) -> None:
+        self.calls.append(("end", self.clock()))
+
+
+def _reference_loop(tracker: Any, clock: SimClock, hours: float, step_s: float) -> None:
+    """The loop of run_simulation before docs/OUTSIDE_MOVES.md (no moves_every_s): the expected call sequence."""
+    from supermarket_bot.fairvalue import FV_REFRESH_S
+
+    steps = max(0, int(round(hours * 3600.0 / step_s)))
+    next_fv = float(clock())
+    for i in range(steps + 1):
+        if i:
+            clock.advance(step_s)
+        tracker.run_once()
+        tracker.backfill_step(8)
+        tracker.analyze_pending(2)
+        now = float(clock())
+        if now >= next_fv - 1e-9:
+            tracker.fair_value_step(now)
+            while next_fv <= now + 1e-9:
+                next_fv += FV_REFRESH_S
+        tracker.paper_step(now)
+    tracker.paper_end("completed")
+
+
+def test_run_simulation_steps_the_watcher_at_the_step_and_sub_step_times() -> None:
+    clock = SimClock(SIM_T0)
+    tracker = _RecordingTracker(clock)
+    final = pipeline.run_simulation(SimpleNamespace(tracker=tracker), clock, hours=2 / 60, step_s=30.0, moves_every_s=15.0)
+    moves = [t - SIM_T0 for kind, t in tracker.calls if kind == "moves"]
+    assert moves == [0.0, 15.0, 30.0, 45.0, 60.0, 75.0, 90.0, 105.0, 120.0]  # the first one at the demo start
+    assert [t - SIM_T0 for kind, t in tracker.calls if kind == "run"] == [0.0, 30.0, 60.0, 90.0, 120.0]
+    assert clock() == SIM_T0 + 120 and final == {"run": {"steps": 5}}
+    # within one step: the watcher steps after the paper step, then at the sub-tick
+    first = [c[0] for c in tracker.calls[:7]]
+    assert first == ["run", "backfill", "analyze", "fv", "paper", "moves", "moves"]
+    # a sub-tick period that does not divide the step: sub-ticks strictly before the next step only
+    clock2 = SimClock(SIM_T0)
+    other = _RecordingTracker(clock2)
+    pipeline.run_simulation(SimpleNamespace(tracker=other), clock2, hours=90 / 3600, step_s=30.0, moves_every_s=20.0)
+    assert [t - SIM_T0 for kind, t in other.calls if kind == "moves"] == [0.0, 20.0, 30.0, 50.0, 60.0, 80.0, 90.0]
+    with pytest.raises(ValueError):
+        pipeline.run_simulation(SimpleNamespace(tracker=other), clock2, hours=0.01, step_s=30.0, moves_every_s=0.0)
+
+
+def test_run_simulation_without_moves_every_s_keeps_the_old_loop() -> None:
+    for moves_every_s, watcher in ((None, True), (None, False), (15.0, False)):
+        clock, ref_clock = SimClock(SIM_T0), SimClock(SIM_T0)
+        tracker, reference = _RecordingTracker(clock, moves=watcher), _RecordingTracker(ref_clock, moves=watcher)
+        pipeline.run_simulation(SimpleNamespace(tracker=tracker), clock, hours=0.1, step_s=30.0, moves_every_s=moves_every_s)
+        _reference_loop(reference, ref_clock, 0.1, 30.0)
+        assert tracker.calls == reference.calls and clock() == ref_clock()
+        assert not any(kind == "moves" for kind, _ in tracker.calls)
+
+
+def test_run_simulation_hands_the_moves_summary_over_without_a_paper_trader() -> None:
+    clock = SimClock(SIM_T0)
+    tracker = _RecordingTracker(clock, paper=False)
+    seen: List[Any] = []
+    final = pipeline.run_simulation(SimpleNamespace(tracker=tracker), clock, hours=10 / 60, step_s=30.0,
+                                    summary_every_s=300.0, on_summary=seen.append, moves_every_s=15.0, end_run=False)
+    assert seen == [{"steps": 21}, {"steps": 41}]  # at the step times 5 and 10 minutes in, after their watcher step
+    assert final == {"steps": 41}
+
+
+def test_run_simulation_with_moves_every_s_but_no_watcher_gives_the_same_paper_body(tmp_path: Path) -> None:
+    bodies = []
+    for i, every in enumerate((None, 15.0)):
+        clock = SimClock(SIM_T0)
+        runtime = web.build_demo(tmp_path / str(i), 30.0, out=io.StringIO(), clock=clock, news=False)
+        try:
+            pipeline.run_simulation(runtime, clock, hours=5 / 60, step_s=30.0, moves_every_s=every)
+            bodies.append(json.dumps(runtime.app.paper(), sort_keys=True, default=str))
+        finally:
+            runtime.close()
+    assert bodies[0] == bodies[1]
+
+
+# --------------------------------------------------------------------------- backtest vs the paper runs (lookahead-1)
+
+
+def test_lookahead_1_overlap_is_the_union_of_every_paper_run_inside_the_window() -> None:
+    H = 3600.0
+    assert pipeline.overlap_seconds([], 0.0, 10 * H) == 0.0
+    # two overlapping runs count once; a run outside the window does not count; a clipped run counts its part
+    runs = [(1 * H, 3 * H), (2 * H, 4 * H), (20 * H, 21 * H), (-5 * H, 0.5 * H)]
+    assert pipeline.overlap_seconds(runs, 0.0, 10 * H) == pytest.approx(3.5 * H)
+    assert pipeline.overlap_seconds([(0.0, float("inf"))], 2 * H, 5 * H) == pytest.approx(3 * H)
+
+
+def test_lookahead_1_paper_run_intervals_from_the_store(tmp_path: Path) -> None:
+    st = TrackerStore(tmp_path / "t.sqlite3")
+    try:
+        assert pipeline.paper_run_intervals(st, now=NOW) == []
+        st.paper_save_run("done", NOW - 7200, {}, {}, NOW - 7100)
+        st.paper_end_run("done", NOW - 3600)  # completed / reset / settings changed: all end the same way
+        st.paper_save_run("open", NOW - 1800, {}, {}, NOW - 60)
+        assert pipeline.paper_run_intervals(st, now=NOW) == [(NOW - 7200, NOW - 3600), (NOW - 1800, NOW)]
+        assert pipeline.paper_run_intervals(st, now=None) == [(NOW - 7200, NOW - 3600), (NOW - 1800, NOW - 60)]
+        assert pipeline.paper_run_intervals(SimpleNamespace(), now=NOW) == []  # a source without paper runs
+    finally:
+        st.close()
+
+
+def test_lookahead_1_apply_paper_overlap_sets_the_hours_and_one_warning() -> None:
+    from supermarket_bot.backtest import OVERLAP_WARNING
+
+    H = 3600.0
+    report = SimpleNamespace(window={"start": 0.0, "end": 2 * H}, overlap_hours=None,
+                             warnings=["Only 2.0 hours of data in this window: too little for a verdict."],
+                             coverage={"book_snapshot_share": 0.4})
+    pipeline.apply_paper_overlap(report, [(0.0, 2 * H)])  # a completed run over the whole window
+    assert report.overlap_hours == pytest.approx(2.0)
+    assert report.warnings[0] == OVERLAP_WARNING.format(h=2.0) + " " + pipeline.OVERLAP_BOOKS_NOTE
+    assert len(report.warnings) == 2
+    # idempotent, and replaces a smaller overlap the replay computed from the current run alone
+    report.warnings.append(OVERLAP_WARNING.format(h=0.1))
+    pipeline.apply_paper_overlap(report, [(0.0, 2 * H)])
+    assert sum("not an independent check" in w for w in report.warnings) == 1 and report.overlap_hours == 2.0
+    clean = SimpleNamespace(window={"start": 0.0, "end": H}, overlap_hours=None, warnings=[], coverage={})
+    pipeline.apply_paper_overlap(clean, [(5 * H, 6 * H)])
+    assert clean.overlap_hours == 0.0 and clean.warnings == []
+    none = SimpleNamespace(window={"start": 0.0, "end": H}, overlap_hours=None, warnings=[], coverage={})
+    pipeline.apply_paper_overlap(none, [])
+    assert none.overlap_hours is None  # no paper run stored: nothing to compare with

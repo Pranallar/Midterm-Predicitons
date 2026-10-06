@@ -112,7 +112,7 @@ def sample_attribution() -> Attribution:
 
 
 def test_schema_created_and_versioned(store: TrackerStore) -> None:
-    assert store.schema_version == SCHEMA_VERSION == 2  # schema v2: docs/PAPER_TRADING.md §7.1
+    assert store.schema_version == SCHEMA_VERSION == 3  # v2: docs/PAPER_TRADING.md §7.1; v3: docs/OUTSIDE_MOVES.md §14
     tables = {r[0] for r in store._query("SELECT name FROM sqlite_master WHERE type = 'table'")}
     assert {"markets", "exchanges", "ticks", "candles", "trades", "surges", "news_cache", "state"} <= tables
     indexes = {r[0] for r in store._query("SELECT name FROM sqlite_master WHERE type = 'index'")}
@@ -132,7 +132,7 @@ def test_file_database_uses_wal_and_persists(tmp_path) -> None:
 
     again = TrackerStore(str(path))
     try:
-        assert again.schema_version == 2
+        assert again.schema_version == 3
         assert again.tick_count() == 1
         assert again.get_state("k") == {"a": 1}
     finally:
@@ -717,3 +717,166 @@ def test_r2_fixcheck_3_record_surge_into_a_named_open_surge(store: TrackerStore)
     reverted.status = SURGE_REVERTED
     store.update_surge(reverted)
     assert store.record_surge(make_surge(eid="e9", end_ts=T0 + 400), into=sid).id != sid  # only open surges absorb
+
+
+# --------------------------------------------------------------------------- outside moves (schema v3, OUTSIDE_MOVES.md §14)
+
+
+def _sample(eid: str, venue: str, ts: float, value: Optional[float] = 0.52, **kw: Any) -> Dict[str, Any]:
+    from supermarket_bot.moves import OutsideSample
+
+    bid = None if value is None else round(value - 0.005, 6)
+    ask = None if value is None else round(value + 0.005, 6)
+    fields: Dict[str, Any] = dict(exchange_id=eid, venue=venue, ts=ts, bid=bid, ask=ask, value=value,
+                                  spread=None if value is None else 0.01, bid_size=500.0, ask_size=450.0,
+                                  liquidity=None, flags=[], external_id=f"{venue}:{eid}", match_kind="EXACT",
+                                  match_confidence=1.0)
+    fields.update(kw)
+    return OutsideSample(**fields).to_dict()
+
+
+def _move_alert(eid: str, detected: float, *, state: str = "open", status: str = "lagging", outcome: str = "pending",
+                lag_s: Optional[float] = None, race_key: Optional[str] = "2026:SENATE:NH", demo: bool = False,
+                t_base: Optional[float] = None) -> Dict[str, Any]:
+    from supermarket_bot.moves import MOVE_STATUS_LABELS, CupContext, CupQuote, MoveAlert, MoveLag
+
+    base = detected - 315.0 if t_base is None else t_base
+    quote = CupQuote(ts=detected - 15, bid=0.505, ask=0.52, mid=0.5125, last=0.51, spread=0.015)
+    lag = MoveLag(eligible=outcome != "excluded", outcome=outcome, t_move=base + 160, lag_s=lag_s,
+                  followed_at=None if lag_s is None else base + 160 + lag_s)
+    return MoveAlert(
+        alert_id=f"mv-{eid}-{int(base)}", exchange_id=eid, market_id="552", title="Will the Democratic Party win the New Hampshire Senate?",
+        option="YES", race_key=race_key, party="D", race_label="New Hampshire Senate (D)", direction=1, window_s=300.0,
+        windows=[300.0, 900.0], venues=["polymarket", "kalshi"], confirmation="two venues", venue_moves=[], t_base=base,
+        t_move=base + 160, outside_before=0.5175, outside_after=0.5725, outside_now=0.5725, move=0.055, peak_move=0.055,
+        threshold=0.044, sigma=0.011, vol_known=True, uncertainty=0.02, detected_at=detected, updated_at=detected + 30,
+        grown_at=detected, state=state, status=status, status_label=MOVE_STATUS_LABELS[status], reason="A reason.",
+        cup=CupContext(base=quote, now=quote, move_same_window=0.0), lag_gap=0.055, lag=lag,
+        closed_at=detected + 600 if state == "closed" else None, cup_now=quote, flags=["warm-up thresholds"], demo=demo,
+    ).to_dict()
+
+
+def test_v3_outside_quotes_upsert_order_and_filters(store: TrackerStore) -> None:
+    rows = [_sample("9035", "demo-b", T0 + 15), _sample("9035", "demo-a", T0 + 15), _sample("9036", "demo-a", T0),
+            _sample("9035", "demo-a", T0 + 30, value=None, flags=["one-sided"])]
+    assert store.add_outside_quotes(rows) == 4
+    assert store.add_outside_quotes([{"exchange_id": "x", "venue": "demo-a"}, {"venue": "demo-a", "ts": T0}, "junk"]) == 0
+    got = store.outside_quotes(T0)
+    assert [(r["ts"], r["exchange_id"], r["venue"]) for r in got] == [
+        (T0, "9036", "demo-a"), (T0 + 15, "9035", "demo-a"), (T0 + 15, "9035", "demo-b"), (T0 + 30, "9035", "demo-a")]
+    assert got[1] == rows[1]  # every OutsideSample key round-trips
+    assert got[3]["flags"] == ["one-sided"] and got[3]["value"] is None and got[3]["bid"] is None
+    assert [r["ts"] for r in store.outside_quotes(T0 + 1, T0 + 15)] == [T0 + 15, T0 + 15]
+    assert {r["exchange_id"] for r in store.outside_quotes(T0, exchange_ids=["9036"])} == {"9036"}
+    assert store.outside_quotes(T0, exchange_ids=[]) == []
+    # upsert by (exchange_id, venue, ts)
+    assert store.add_outside_quotes([_sample("9036", "demo-a", T0, value=0.6)]) == 1
+    assert [r["value"] for r in store.outside_quotes(T0, T0)] == [0.6]
+
+
+def test_v3_move_alerts_upsert_columns_filters_and_limit(store: TrackerStore) -> None:
+    a1 = _move_alert("9035", T0 + 100)
+    a2 = _move_alert("9036", T0 + 200, state="closed", status="already_moved", outcome="followed", lag_s=260.0)
+    a3 = _move_alert("9037", T0 + 300, demo=True, race_key=None)
+    assert store.put_move_alerts([a3, a1, a2]) == 3
+    assert store.put_move_alerts([{"alert_id": "x"}, {"exchange_id": "1"}, {"alert_id": "y", "exchange_id": "1"}]) == 0
+    assert store.move_alerts() == [a1, a2, a3]  # decoded data dicts, oldest first
+    assert store.move_alerts(since=T0 + 150) == [a2, a3] and store.move_alerts(until=T0 + 200) == [a1, a2]
+    assert store.move_alerts(state="closed") == [a2] and store.move_alerts(state="open") == [a1, a3]
+    assert store.move_alerts(limit=2) == [a2, a3]  # the newest ``limit``, oldest first
+    row = store._query("SELECT * FROM move_alerts WHERE alert_id = ?", (a2["alert_id"],))[0]
+    assert (row["exchange_id"], row["race_key"], row["state"], row["status"], row["lag_outcome"], row["lag_s"]) == (
+        "9036", "2026:SENATE:NH", "closed", "already_moved", "followed", 260.0)
+    assert row["detected_at"] == T0 + 200 and row["updated_at"] == T0 + 230 and row["closed_at"] == T0 + 800
+    assert store._query("SELECT demo, race_key FROM move_alerts WHERE exchange_id = '9037'")[0][:] == (1, None)
+    # an update replaces the row (same id): the status and lag columns follow the data
+    a1_closed = dict(a1, state="closed", status="reverted", lag=dict(a1["lag"], outcome="reverted"))
+    assert store.put_move_alerts([a1_closed]) == 1
+    assert store.move_alerts(state="closed") == [a1_closed, a2]
+    assert store._query("SELECT lag_outcome FROM move_alerts WHERE alert_id = ?", (a1["alert_id"],))[0][0] == "reverted"
+
+
+def test_v3_pruning_with_the_ticks(store: TrackerStore) -> None:
+    store.add_outside_quotes([_sample("e1", "kalshi", T0 - 3 * DAY - 1), _sample("e1", "kalshi", T0 - 3 * DAY + 1)])
+    old = _move_alert("e1", T0 - 30 * DAY - 1)
+    kept = _move_alert("e2", T0 - 30 * DAY + 1)
+    recent = _move_alert("e3", T0 - DAY)
+    store.put_move_alerts([old, kept, recent])
+    store.prune(T0)
+    assert [r["ts"] for r in store.outside_quotes(0.0)] == [T0 - 3 * DAY + 1]
+    assert store.move_alerts() == [kept, recent]
+    # the automatic prune runs on tick inserts (the first one after opening), relative to the newest tick
+    store.add_ticks(T0 + 3 * DAY + 2, [tick("e1", 0.5)])
+    assert store.outside_quotes(0.0) == [] and store.move_alerts() == [recent]
+
+
+def test_v3_the_store_implements_the_moves_persistence_contract() -> None:
+    """The same sequence on TrackerStore(":memory:") and moves.MemoryMovesPersistence gives equal results."""
+    from supermarket_bot.moves import MemoryMovesPersistence
+
+    stores = [TrackerStore(":memory:"), MemoryMovesPersistence()]
+    try:
+        results: List[List[Any]] = []
+        for st in stores:
+            out: List[Any] = []
+            out.append(st.add_outside_quotes([_sample("9035", "demo-a", T0 + 30), _sample("9035", "demo-b", T0 + 30),
+                                              _sample("9036", "demo-a", T0), _sample("9035", "demo-a", T0 + 15, value=None)]))
+            out.append(st.add_outside_quotes([_sample("9035", "demo-a", T0 + 30, value=0.55)]))  # upsert
+            out.append(st.outside_quotes(T0))
+            out.append(st.outside_quotes(T0 + 10, T0 + 30))
+            out.append(st.outside_quotes(T0, exchange_ids=["9036"]))
+            alerts = [_move_alert("9035", T0 + 300), _move_alert("9036", T0 + 100, state="closed", outcome="followed",
+                                                                   lag_s=200.0), _move_alert("9037", T0 + 200)]
+            out.append(st.put_move_alerts(alerts))
+            out.append(st.put_move_alerts([dict(alerts[0], state="closed")]))
+            out.append(st.move_alerts())
+            out.append(st.move_alerts(since=T0 + 150))
+            out.append(st.move_alerts(until=T0 + 200))
+            out.append(st.move_alerts(state="open"))
+            out.append(st.move_alerts(state="closed", limit=1))
+            out.append(st.move_alerts(limit=2))
+            results.append(out)
+        assert results[0] == results[1]
+    finally:
+        stores[0].close()
+
+
+def test_v3_open_read_only_serves_move_alerts(tmp_path) -> None:
+    path = tmp_path / "tracker.sqlite3"
+    live = TrackerStore(path)
+    try:
+        alert = _move_alert("9035", T0)
+        live.put_move_alerts([alert])
+        ro = TrackerStore.open_read_only(path)
+        try:
+            assert ro.move_alerts(since=T0 - 1) == [alert]
+            with pytest.raises(sqlite3.OperationalError):
+                ro.put_move_alerts([alert])
+        finally:
+            ro.close()
+    finally:
+        live.close()
+
+
+def test_v2_database_migrates_to_v3_keeping_its_data(tmp_path) -> None:
+    path = tmp_path / "v2.sqlite3"
+    conn = sqlite3.connect(str(path))
+    conn.executescript(store_mod._SCHEMA_V1 + "\n" + store_mod._SCHEMA_V2 + "\nPRAGMA user_version = 2;")
+    conn.execute("INSERT INTO ticks VALUES ('e1', ?, 0.5, 0.49, 0.51)", (T0,))
+    conn.execute("INSERT INTO fair_values (exchange_id, ts, value, source) VALUES ('e1', ?, 0.55, 'polymarket')", (T0,))
+    conn.execute("INSERT INTO paper_runs VALUES ('run-1', ?, '{}', '{}', ?, NULL)", (T0, T0))
+    conn.commit()
+    conn.close()
+    st = TrackerStore(path)
+    try:
+        assert st.schema_version == 3
+        assert st.tick_count() == 1 and [r.value for r in st.fair_value_history(T0 - 1)] == [0.55]
+        assert [r["run_id"] for r in st.paper_runs()] == ["run-1"]
+        tables = {r[0] for r in st._query("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        indexes = {r[0] for r in st._query("SELECT name FROM sqlite_master WHERE type = 'index'")}
+        assert {"outside_quotes", "move_alerts"} <= tables
+        assert {"outside_quotes_ts", "move_alerts_detected", "move_alerts_state"} <= indexes
+        st.put_move_alerts([_move_alert("e1", T0)])
+        assert len(st.move_alerts()) == 1
+    finally:
+        st.close()

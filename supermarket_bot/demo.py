@@ -53,6 +53,14 @@ real Cup grammar so the race matcher is exercised):
 * (l) a market that settles live: the Maine Senate debate market rises to 0.97 and settles YES at
   ``t0 + 40m`` (it then leaves the open list and the bulk prices).
 
+Outside-move scenarios (docs/OUTSIDE_MOVES.md §15; only with ``DemoMarket(outside_moves=True)``, markets 327-333,
+exchanges 9035-9041): two scripted outside venues (:class:`DemoOutsideVenue`, "Demo venue A/B") whose prices LEAD
+the Cup by a few minutes on some outcomes (lead_short, lead_long), move without the Cup ever following (never),
+spike on one thin print or a wide book (thin_spike: must not alert), follow a Cup move (cup_first), move and come
+back (reverts), or move on one venue only (disagree: must not alert). The script repeats every hour from ``t0``
+with the direction flipped each cycle; every scripted Cup move is 0.045 over at least 120 s, below the surge
+detector's thresholds, and the leads are scripted by design (D37, MOVES_DEMO_CAVEAT).
+
 :class:`DemoFairValueProvider` serves the scripted outside prices (and, for the liquid Michigan, Georgia,
 North Carolina and Maine Senate markets, an outside price that LEADS the Cup by 15 minutes, D37).
 :class:`SimClock` and :func:`no_wait` make fast simulated runs deterministic (D42).
@@ -144,6 +152,42 @@ FEED_LEAD_S = 15 * 60.0  # the leading outside feed is the Cup's own mid this mu
 FEED_LEADING_KEYS = ("mi-senate", "ga-senate", "nc-senate", "me-senate")  # exchanges 9003-9006
 DEMO_FEED_HALF_SPREAD = 0.005  # demo quotes: feed -/+ this (their uncertainty)
 
+# ---- outside-move scenarios (docs/OUTSIDE_MOVES.md §15; package "wiring"). They exist only with
+# DemoMarket(outside_moves=True) (build_demo(moves=True)), so every count of the default demo stays unchanged.
+# Appended after the paper markets: market ids 327-333, exchange ids 9035-9041. Published for the server and ui.
+MOVES_DEMO_VENUES: Tuple[str, ...] = ("demo-a", "demo-b")  # the two scripted outside venues ("Demo venue A/B")
+MOVES_DEMO_CYCLE_S = 3600.0  # the script repeats every hour from t0, with the direction flipped each cycle
+# (key, title, liquidity, base price): Cup grammar titles, one leg per race (no baskets), no fair-value feed
+MOVES_DEMO_MARKETS: Tuple[Tuple[str, str, str, float], ...] = (
+    ("nh-sen-d", "Will the Democratic Party win the New Hampshire Senate?", "liquid", 0.56),
+    ("oh-sen-r", "Will the Republican Party win the Ohio Senate?", "medium", 0.58),
+    ("wi-gov-d", "Will the Democratic Party win the Wisconsin Governor?", "medium", 0.52),
+    ("ga-gov-r", "Will the Republican Party win the Georgia Governor?", "medium", 0.62),
+    ("mn-sen-d", "Will the Democratic Party win the Minnesota Senate?", "liquid", 0.60),
+    ("pa-gov-r", "Will the Republican Party win the Pennsylvania Governor?", "medium", 0.40),
+    ("mi-gov-d", "Will the Democratic Party win the Michigan Governor?", "liquid", 0.50),
+)
+MOVES_DEMO_MARKET_IDS: Tuple[str, ...] = tuple(str(327 + i) for i in range(7))  # 327-333
+MOVES_DEMO_EXCHANGE_IDS: Tuple[str, ...] = tuple(str(9035 + i) for i in range(7))  # 9035-9041
+MOVES_DEMO_SCENARIOS: Dict[str, str] = {  # scenario -> exchange id (§15.2)
+    "lead_short": "9035",  # outside leads, the Cup follows 1-5 min later
+    "lead_long": "9036",  # outside leads, the Cup follows 6-12 min later
+    "never": "9037",  # outside moves, the Cup never follows (the gap persists)
+    "thin_spike": "9038",  # a single-print spike and a wide-book move on one venue: must NOT alert
+    "cup_first": "9039",  # the Cup moves 5 min before the outside: "Cup moved first"
+    "reverts": "9040",  # the outside moves and comes back before the Cup moves: "outside reverted"
+    "disagree": "9041",  # one venue moves, the other does not: must NOT alert
+}
+MOVES_DEMO_LEAD_SHORT_S: Tuple[float, ...] = (180.0, 60.0, 300.0, 120.0)  # lead_short Cup delay by cycle % 4
+MOVES_DEMO_LEAD_LONG_S: Tuple[float, ...] = (480.0, 720.0, 360.0, 600.0)  # lead_long Cup delay by cycle % 4
+MOVES_DEMO_CUP_MOVE = 0.045  # every scripted Cup move: 0.045 over >= 120 s (below the surge thresholds: 0.05 / 5 min)
+MOVES_DEMO_CUP_RAMP_S = 120.0
+MOVES_DEMO_NOISE_FREEZE_S = 360.0  # the Cup noise is held this long before and after a scripted Cup move
+MOVES_DEMO_VOL = 0.1  # Cup noise scale of the outside-move markets
+MOVES_DEMO_SIZE = 500.0  # outside touch sizes (contracts) on both venues
+_MOVES_DEMO_SPREAD = {"liquid": 0.01, "medium": 0.02}  # outside spreads by the market's liquidity class
+_MOVES_DEMO_KEYS = {key: scenario for scenario, key in zip(MOVES_DEMO_SCENARIOS, (m[0] for m in MOVES_DEMO_MARKETS))}
+
 
 # --------------------------------------------------------------------------- helpers
 
@@ -219,6 +263,34 @@ def _read_cursor(raw: Optional[str], kind: str) -> Optional[int]:
         return int(value)
     except (ValueError, UnicodeError, binascii.Error):
         raise _Fail(400, "INVALID_CURSOR", "Invalid or expired pagination cursor") from None
+
+
+def _ramp(ts: float, a: float, b: float, x: float) -> float:
+    """0 before ``a``, ``x`` from ``b`` on, linear in between (docs/OUTSIDE_MOVES.md §15.2)."""
+    if ts < a:
+        return 0.0
+    if ts >= b or b <= a:
+        return x
+    return x * (ts - a) / (b - a)
+
+
+def _liquidity_name(liq: Any) -> str:
+    for name, value in _LIQUIDITY.items():
+        if value is liq:
+            return name
+    return "medium"
+
+
+def _moves_market_specs() -> List[Tuple[str, str, str, str, List[Tuple[str, float]], Dict[str, Any]]]:
+    """The outside-move markets (§15.1) in the ``_MARKET_SPECS`` shape: settle at the Cup end, Cup noise 0.1."""
+    out: List[Tuple[str, str, str, str, List[Tuple[str, float]], Dict[str, Any]]] = []
+    for key, title, liq, base in MOVES_DEMO_MARKETS:
+        state = title.split(" win the ", 1)[1].rsplit(" ", 1)[0]
+        office = "U.S. Senate" if title.endswith("Senate?") else "Governor"
+        party = "Democratic" if "Democratic" in title else "Republican"
+        out.append((key, title, liq, CUP_END, [("YES", base)],
+                    {"office": office, "jurisdiction": state, "party": party, "vol": MOVES_DEMO_VOL}))
+    return out
 
 
 class SimClockStall(RuntimeError):
@@ -508,6 +580,7 @@ class _Exchange:
     scripted: List[Tuple[float, str, int]] = field(default_factory=list)
     quiet: List[Tuple[float, float]] = field(default_factory=list)
     initial_price: float = 0.5
+    moves: Optional[str] = None  # the outside-move scenario (MOVES_DEMO_SCENARIOS key) of a 9035-9041 outcome
 
     def offset(self, ts: float) -> float:
         """Scripted price offset: piecewise linear, right-continuous at steps, 0 before the first knot."""
@@ -576,7 +649,10 @@ class DemoMarket:
     """
 
     def __init__(self, seed: int = 7, now: Optional[float] = None, clock: Callable[[], float] = time.time, *,
-                 start: Optional[float] = None) -> None:
+                 start: Optional[float] = None, outside_moves: bool = False) -> None:
+        # docs/OUTSIDE_MOVES.md §15 (package "wiring"): ``outside_moves`` adds the MOVES_DEMO_MARKETS and their
+        # scripted outside venues; False (the default) builds exactly the demo the paper-trading tests know.
+        self.outside_moves = bool(outside_moves)
         self.seed = int(seed)
         self._clock = clock
         self._clock_start = float(clock())
@@ -635,7 +711,10 @@ class DemoMarket:
     def _build_markets(self) -> None:
         j = 0
         n = len(_MARKET_SPECS)
-        for i, (key, title, liq_name, settlement, options, details) in enumerate(_MARKET_SPECS):
+        specs = list(_MARKET_SPECS)
+        if self.outside_moves:  # appended, so every id above stays the same (327+ / 9035+)
+            specs += _moves_market_specs()
+        for i, (key, title, liq_name, settlement, options, details) in enumerate(specs):
             details = dict(details)
             market = _Market(
                 index=i,
@@ -643,7 +722,7 @@ class DemoMarket:
                 key=key,
                 title=title,
                 settlement_date=settlement or None,
-                created_at=self.history_start - (n - i) * 2 * HOUR,
+                created_at=self.history_start - (n - i) * 2 * HOUR if i < n else self.history_start - HOUR + (i - n) * MIN,
                 details=details,
                 target_sum=details.pop("target_sum", None),
             )
@@ -672,6 +751,7 @@ class DemoMarket:
                     ex.yes_bias = 0.15 if base >= 0.5 else -0.15
                 if mirror_key:
                     ex.mirror = self._by_key[mirror_key].exchanges[0]
+                ex.moves = _MOVES_DEMO_KEYS.get(key) if i >= n else None
                 market.exchanges.append(ex)
                 self.exchanges.append(ex)
                 self._exchange_by_id[ex.id] = ex
@@ -833,7 +913,7 @@ class DemoMarket:
                 "settlement_date": m.settlement_date,
                 "settles_before_cup_end": bool(settles and settles < cup_end),
             })
-        return {
+        out: Dict[str, Any] = {
             "t0": self.t0,
             "tournament_id": self.tournament_id,
             "slug": self.slug,
@@ -867,6 +947,10 @@ class DemoMarket:
                                               for k in ("mi-senate", "ga-senate", "nc-senate", "me-senate")],
                              "lead_s": FEED_LEAD_S},
         }
+        if self.outside_moves:  # docs/OUTSIDE_MOVES.md §15.1
+            out["outside_moves"] = {"exchange_ids": dict(MOVES_DEMO_SCENARIOS), "cycle_s": MOVES_DEMO_CYCLE_S,
+                                    "venues": list(MOVES_DEMO_VENUES)}
+        return out
 
     # ------------------------------------------------------------------ outside fair values (scripted)
 
@@ -912,6 +996,101 @@ class DemoMarket:
             return 0.99 if ts >= t0 else mid(ts)
         return None
 
+    def outside_quote(self, exchange_id: str, venue: str, ts: float) -> Optional[Tuple[float, float, float, float]]:
+        """The scripted outside venue's ``(bid, ask, bid_size, ask_size)`` for a MOVES_DEMO_MARKETS outcome at ``ts``
+        (docs/OUTSIDE_MOVES.md §15.2), None for any other outcome, another venue, a settled market or before
+        ``history_start``. Pure in (seed, exchange, venue, ts); YES prices rounded to 0.001."""
+        ex = self._exchange_by_id.get(str(exchange_id))
+        if ex is None or ex.moves is None or venue not in MOVES_DEMO_VENUES:
+            return None
+        ts = float(ts)
+        if ts < self.history_start or ex.market.is_settled(ts):
+            return None
+        spread = _MOVES_DEMO_SPREAD.get(_liquidity_name(ex.liq), 0.02)
+        size = MOVES_DEMO_SIZE
+        offset = 0.0
+        cycle = self._moves_cycle(ts)
+        if cycle is not None:
+            k, c, sign = cycle
+            scenario = ex.moves
+            if scenario == "lead_short":
+                offset = (0.06 if k % 2 else 0.0) + sign * _ramp(ts, c + 60, c + 75, 0.06)
+            elif scenario == "lead_long":
+                offset = (-0.06 if k % 2 else 0.0) - sign * _ramp(ts, c + 150, c + 180, 0.06)
+            elif scenario == "never":  # even cycles move up at c+240, odd cycles back down at c+900
+                if k % 2:
+                    offset = 0.07 - _ramp(ts, c + 900, c + 930, 0.07)
+                else:
+                    offset = _ramp(ts, c + 240, c + 270, 0.07)
+            elif scenario == "thin_spike":
+                if venue == "demo-a" and c + 120 <= ts <= c + 134:
+                    offset = sign * 0.09  # one print with a normal book: at most one 15-s poll sees it
+                elif venue == "demo-a" and c + 420 <= ts <= c + 600:
+                    offset, spread, size = sign * 0.06, 0.08, 20.0  # a sample, but a wide and thin book
+            elif scenario == "cup_first":
+                offset = (0.06 if k % 2 else 0.0) + sign * _ramp(ts, c + 660, c + 690, 0.06)
+            elif scenario == "reverts":
+                offset = sign * (_ramp(ts, c + 540, c + 570, 0.06) - _ramp(ts, c + 780, c + 840, 0.06))
+            elif scenario == "disagree":
+                if venue == "demo-a":
+                    offset = sign * (_ramp(ts, c + 300, c + 315, 0.05) - _ramp(ts, c + 900, c + 915, 0.05))
+        value = ex.base + offset
+        jitter = 0.0
+        if venue == "demo-b":  # venue B: +/- 0.005 on about a quarter of the 15-s buckets
+            bucket = math.floor(ts / 15.0)
+            if _unit(self.seed, 41, int(ex.id), bucket) < 0.25:
+                jitter = 0.005 if _unit(self.seed, 42, int(ex.id), bucket) < 0.5 else -0.005
+        bid = round(min(0.998, max(0.001, value - spread / 2 + jitter)), 3)
+        ask = round(min(0.999, max(bid + 0.001, value + spread / 2 + jitter)), 3)
+        return bid, ask, size, size
+
+    def _moves_cycle(self, ts: float) -> Optional[Tuple[int, float, int]]:
+        """(k, c, s) of the outside-move script at ``ts`` (§15.2): cycle k = floor((ts - t0) / 3600) from t0 on, its
+        start c and the sign s (+1 for even k, -1 for odd k); None before t0 (no scripted move in the history)."""
+        if ts < self.t0:
+            return None
+        k = int(math.floor((ts - self.t0) / MOVES_DEMO_CYCLE_S))
+        return k, self.t0 + k * MOVES_DEMO_CYCLE_S, (1 if k % 2 == 0 else -1)
+
+    def _moves_cup_ramp(self, ex: _Exchange, k: int) -> Optional[Tuple[float, float]]:
+        """``(start, end)`` of cycle ``k``'s scripted Cup move of an outside-move outcome, None when it has none."""
+        c = self.t0 + k * MOVES_DEMO_CYCLE_S
+        if ex.moves == "lead_short":
+            start = c + 60 + MOVES_DEMO_LEAD_SHORT_S[k % 4]
+        elif ex.moves == "lead_long":
+            start = c + 150 + MOVES_DEMO_LEAD_LONG_S[k % 4]
+        elif ex.moves == "cup_first":
+            start = c + 360
+        else:
+            return None
+        return start, start + MOVES_DEMO_CUP_RAMP_S
+
+    def _moves_cup_offset(self, ex: _Exchange, ts: float) -> float:
+        """The scripted Cup offset of an outside-move outcome (§15.2): 0.045 over 120 s, accumulated over cycles."""
+        cycle = self._moves_cycle(ts)
+        ramp = self._moves_cup_ramp(ex, cycle[0]) if cycle is not None else None
+        if cycle is None or ramp is None:
+            return 0.0
+        k, _, sign = cycle
+        a = MOVES_DEMO_CUP_MOVE
+        done = a if k % 2 else 0.0  # the completed cycles' moves sum to one move after an odd number of them
+        direction = -1.0 if ex.moves == "lead_long" else 1.0
+        return direction * (done + sign * _ramp(ts, ramp[0], ramp[1], a))
+
+    def _moves_noise_ts(self, ex: _Exchange, ts: float) -> float:
+        """The time an outside-move outcome's Cup noise is read at: frozen from MOVES_DEMO_NOISE_FREEZE_S before to
+        that long after each scripted Cup move, so every 5-minute Cup change around a move is exactly the scripted
+        0.045 (nine ticks) and never the surge detector's 0.05 by rounding; the noise catches up afterwards in one
+        ordinary step of at most a tick."""
+        if ex.moves not in ("lead_short", "lead_long", "cup_first"):
+            return ts
+        now_k = int(math.floor((ts - self.t0) / MOVES_DEMO_CYCLE_S)) if ts >= self.t0 else -1
+        for k in (now_k, now_k + 1):  # a freeze can start in the previous cycle
+            ramp = self._moves_cup_ramp(ex, k) if k >= 0 else None
+            if ramp is not None and ramp[0] - MOVES_DEMO_NOISE_FREEZE_S <= ts < ramp[1] + MOVES_DEMO_NOISE_FREEZE_S:
+                return ramp[0] - MOVES_DEMO_NOISE_FREEZE_S
+        return ts
+
     # ------------------------------------------------------------------ price model
 
     def _node(self, j: int, octave: int, k: int) -> float:
@@ -947,7 +1126,10 @@ class DemoMarket:
 
     def _fair(self, ex: _Exchange, ts: float) -> float:
         """Unrounded YES fair value at ``ts``."""
-        price = self._fair_raw(ex, ts) + ex.offset(ts)
+        if ex.moves is not None:  # only the outside-move outcomes (DemoMarket(outside_moves=True))
+            price = self._fair_raw(ex, self._moves_noise_ts(ex, ts)) + ex.offset(ts) + self._moves_cup_offset(ex, ts)
+        else:
+            price = self._fair_raw(ex, ts) + ex.offset(ts)
         return min(0.99, max(0.01, price))
 
     def _quote(self, ex: _Exchange, ts: float) -> Optional[Tuple[float, float, float]]:
@@ -1808,6 +1990,53 @@ class DemoFairValueProvider:
             log.warning("demo fair-value feed failed: %s", exc)
             return ProviderResult(venue="demo", status="error", errors=["The demo fair-value feed failed."])
         return ProviderResult(venue="demo", status="ok", quotes=quotes, requests=0)
+
+    def close(self) -> None:
+        pass
+
+
+class DemoOutsideVenue:
+    """One scripted outside venue of the outside-move demo (docs/OUTSIDE_MOVES.md §15.3): ``poll`` returns one
+    FairValueQuote per MOVES_DEMO_MARKETS target from ``DemoMarket.outside_quote`` (venue ``name``, external id
+    ``f"{name}:{eid}"``, EXACT, confidence 1.0, ``fetched_at`` = ``now``, sizes on the quote). No HTTP (requests 0,
+    ``budget()`` = {"used": 0, "limit": 0}); deterministic; never raises. Not a fair-value provider: the demo's
+    FairValueService keeps ``DemoFairValueProvider`` only, so the paper trader never sees these quotes."""
+
+    def __init__(self, market: DemoMarket, name: str) -> None:
+        self.market = market
+        self.name = str(name)
+
+    def poll(self, targets: Sequence[Any], now: float, *, deadline: Optional[float] = None) -> Any:
+        from .fairvalue import ProviderResult
+
+        quotes: Dict[str, FairValueQuote] = {}
+        try:
+            from .moves import VENUE_LABELS
+
+            label = VENUE_LABELS.get(self.name, self.name)
+            wanted = set(MOVES_DEMO_EXCHANGE_IDS)
+            for target in targets:
+                eid = str(getattr(target, "exchange_id", target))
+                if eid not in wanted:
+                    continue
+                quote = self.market.outside_quote(eid, self.name, float(now))
+                if quote is None:
+                    continue
+                bid, ask, bid_size, ask_size = quote
+                title = getattr(target, "title", "") or ""
+                quotes[eid] = FairValueQuote(
+                    venue=self.name, external_id=f"{self.name}:{eid}", label=f"{label}: {title}".strip(),
+                    bid=bid, ask=ask, last=None, mid=round((bid + ask) / 2, 6), spread=round(ask - bid, 6),
+                    bid_size=bid_size, ask_size=ask_size, fetched_at=float(now), match_kind="EXACT",
+                    match_confidence=1.0,
+                )
+        except Exception as exc:  # never raises
+            log.warning("demo outside venue %s failed: %s", self.name, exc)
+            return ProviderResult(venue=self.name, status="error", errors=[f"The demo venue {self.name} failed."])
+        return ProviderResult(venue=self.name, status="ok", quotes=quotes, requests=0)
+
+    def budget(self) -> Dict[str, int]:
+        return {"used": 0, "limit": 0}
 
     def close(self) -> None:
         pass

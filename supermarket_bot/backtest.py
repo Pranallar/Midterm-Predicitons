@@ -46,6 +46,7 @@ from .models import (
     MarketObservation,
     Opportunity,
     PaperConfig,
+    PortfolioSummary,
     PricePoint,
     Quote,
     SettlementInfo,
@@ -79,8 +80,8 @@ SWEEP_WARNING = (
     "prefer settings whose neighbours also do well, and confirm them on data recorded later."
 )
 OVERLAP_WARNING = (
-    "{h:.1f} h of this window were also seen by the live paper run: a backtest over the same data is not "
-    "an independent check, so agreement between the two is not evidence."
+    "{h:.1f} h of this window were also seen by a paper run (the current one, or one that ended or was reset): a "
+    "backtest over the same data is not an independent check, so agreement between the two is not evidence."
 )
 SIZING_ASSUMPTION = (
     "Depth before the bot started recording is synthetic (one level, a share of recent volume), so the "
@@ -259,6 +260,15 @@ class PreloadedHistory:
         self.lo = self.start - max(self.warmup_s, SURGE_LOOKBACK_S)
         self.errors: List[str] = []
         errs = self.errors
+        # the stored paper runs' times (metadata, not a decision input): a replay over hours a paper run saw is
+        # not an independent check (lookahead-1); a source without paper runs has none
+        self._paper_runs: List[Dict[str, Any]] = []
+        runs_fn = getattr(source, "paper_run_times", None)
+        if callable(runs_fn):
+            try:
+                self._paper_runs = [dict(r) for r in (runs_fn() or []) if isinstance(r, Mapping)]
+            except Exception as exc:
+                log.debug("could not read the paper runs: %s", exc)
         infos = _safe(errs, "the outcome list", source.exchanges, [])
         if exchange_ids is not None:
             wanted = {str(e) for e in exchange_ids}
@@ -317,6 +327,10 @@ class PreloadedHistory:
         self._tick_bounds = (min(all_ticks), max(all_ticks)) if all_ticks else None
         self._first_fetch_cache: Dict[str, Optional[float]] = {}
         self.errors = list(dict.fromkeys(errs))
+
+    def paper_run_times(self) -> List[Dict[str, Any]]:
+        """The source's paper runs (``store.paper_run_times()``) as read when the history was loaded."""
+        return [dict(r) for r in self._paper_runs]
 
     def covers(self, start: float, end: float, warmup_s: float) -> bool:
         lo = float(start) - max(float(warmup_s), SURGE_LOOKBACK_S)
@@ -580,7 +594,8 @@ def replay_fair_value(record: FairValueRecord, refresh: Optional[FairValueRefres
             fetched = [s if s is not None else float(refresh.ts) for s in stamps]
             if fetched:
                 newer = min(fetched)
-                if newer > as_of:
+                # lookahead-2: a refresh row's fetched_at never moves as_of past the availability time
+                if newer > as_of and newer <= float(t) - float(latency_s) + 1e-9:
                     as_of = newer
                     confirmed = True
     match_conf = _num(detail.get("match_confidence"))
@@ -765,6 +780,11 @@ class HistoricalMarket:
         for eid in self._eids:
             rec = h.latest_fair_value(eid, until, until - FV_LOOKBACK_S)
             if rec is None:
+                continue
+            if (str(rec.source) not in ("history", "manual") and _num(rec.as_of) is not None
+                    and float(rec.as_of) > until + _EPS):
+                # lookahead-2: a record whose quotes were fetched after its availability time (rows recorded
+                # before the refresh was stamped at its return carry the refresh START) did not exist yet.
                 continue
             if str(rec.source) == "history" and not cfg.use_history_fair_values:
                 continue
@@ -1262,11 +1282,12 @@ def run_backtest(source: HistorySource, config: Optional[BacktestConfig] = None,
     times = market.decision_times()
     paper_cfg = backtest_paper_config(cfg)
     current = [times[0] if times else start]
+    # the replay's capital is fixed (set by you, else the default): never re-based from the replayed leaderboard
     engine = _paper.PaperEngine(paper_cfg, persistence=_paper.MemoryPaperPersistence(), clock=lambda: current[0],
-                                code_version="backtest")
+                                code_version="backtest", rebase_default_capital=False)
     market.engine = engine
     capital = float(paper_cfg.start_capital) if paper_cfg.start_capital else _paper.DEFAULT_START_CAPITAL
-    source_label = "set by you" if paper_cfg.start_capital else "default 100,000"
+    source_label = "set by you" if paper_cfg.start_capital else _paper.DEFAULT_CAPITAL_SOURCE
     stopped = False
     steps_run = 0
     if times:
@@ -1296,12 +1317,28 @@ def run_backtest(source: HistorySource, config: Optional[BacktestConfig] = None,
     if cfg.live_run_started_at is not None:
         live = float(cfg.live_run_started_at)
         overlap = max(0.0, end - max(start, live)) / 3600.0
-        if overlap > 0:
-            warnings.append(OVERLAP_WARNING.format(h=overlap))
+    # lookahead-1: every paper run the store holds counts, not only the current run's start
+    from . import pipeline as _pipeline
+
+    try:
+        run_now: Optional[float] = float(clock())
+    except Exception:  # pragma: no cover - defensive
+        run_now = None
+    intervals = _pipeline.paper_run_intervals(pre, now=run_now)
+    if intervals:
+        overlap = max(overlap or 0.0, _pipeline.overlap_seconds(intervals, start, end) / 3600.0)
+    if overlap is not None and overlap > 0:
+        text = OVERLAP_WARNING.format(h=overlap)
+        if (coverage.get("book_snapshot_share") or 0.0) > 0:
+            text += " " + _pipeline.OVERLAP_BOOKS_NOTE  # those books are the paper run's own reads
+        warnings.insert(0, text)
     if stopped:
         warnings.append(f"Stopped early after {float(cfg.time_budget_s or 0):.0f} s of wall time: the replay covers "
                         f"{steps_run} of {len(times)} decision steps.")
     summaries = engine.portfolios(last_t)
+    assumed = assumed_fills_warning(summaries)
+    if assumed:
+        warnings.append(assumed)
     try:
         study = engine.study.summary()
     except Exception:
@@ -1318,6 +1355,24 @@ def run_backtest(source: HistorySource, config: Optional[BacktestConfig] = None,
         warnings=list(dict.fromkeys(warnings)), testability=market.testability(), study=study,
         overlap_hours=round(overlap, 6) if overlap is not None else None, stopped_early=stopped,
     )
+
+
+def assumed_fills_warning(summaries: Sequence[PortfolioSummary]) -> Optional[str]:
+    """accounting-4 (§6.12.2, D21/D22): the "P&L at liquidation" of a replay includes the ideas filled on assumed
+    liquidity (candle prints or synthetic one-level books), while every verdict leaves those ideas out and states
+    the P&L of the ideas it counts (``Verdict.pnl_liq``; the rest is ``Verdict.synthetic_pnl``). One sentence
+    naming, per portfolio with such ideas, how much of its P&L column is assumed; None when there are none."""
+    parts: List[str] = []
+    for s in summaries:
+        v = s.verdict
+        if v is None or not int(v.synthetic_excluded or 0):
+            continue
+        n = int(v.synthetic_excluded)
+        parts.append(f"{s.portfolio_id} {float(v.synthetic_pnl or 0.0):+,.2f} from {n} {'idea' if n == 1 else 'ideas'}")
+    if not parts:
+        return None
+    return ("The P&L at liquidation column includes assumed fills (candle prints or synthetic books) that the "
+            "verdicts leave out: " + "; ".join(parts) + ". The verdict sentences state the P&L without them.")
 
 
 def _parse_value(text: str) -> Any:
@@ -1383,7 +1438,8 @@ def _apply_combo(base: BacktestConfig, combo: Mapping[str, Any]) -> BacktestConf
 def sweep(source: HistorySource, base: BacktestConfig, grid: Mapping[str, Sequence[Any]], *,
           signal_fn: Optional[Callable[..., List[Opportunity]]] = None) -> BacktestReport:
     """Run every combination (at most MAX_SWEEP_RUNS); the returned report is the base config's run
-    with ``sweep`` rows for every combination (sorted by the headline portfolio's pnl_liq) and the
+    with ``sweep`` rows for every combination (sorted by the headline portfolio's verdict P&L: pnl_liq without
+    the assumed fills, ``verdict_pnl``; ``pnl_liq`` and ``synthetic_pnl`` are listed too) and the
     SWEEP_WARNING in ``warnings``. ``latency_s=30,120,300`` is the latency-sensitivity sweep the CLI
     offers as ``--latency-sweep``."""
     names = list(grid)
@@ -1414,11 +1470,19 @@ def sweep(source: HistorySource, base: BacktestConfig, grid: Mapping[str, Sequen
         rows.append({
             "params": dict(combo), "label": ", ".join(f"{k}={v}" for k, v in combo.items()),
             "pnl_liq": port.pnl_liq if port is not None else None,
+            # the verdict's P&L: without the ideas filled on assumed liquidity (accounting-4)
+            "verdict_pnl": port.verdict.pnl_liq if port is not None and port.verdict is not None else None,
+            "synthetic_pnl": port.verdict.synthetic_pnl if port is not None and port.verdict is not None else 0.0,
             "trades_closed": port.trades_closed if port is not None else 0,
             "verdict_level": port.verdict.level if port is not None and port.verdict is not None else None,
             "max_drawdown": port.max_drawdown if port is not None else None,
         })
-    rows.sort(key=lambda r: (-(r["pnl_liq"] if r["pnl_liq"] is not None else -float("inf")), r["label"]))
+    # ranked by the verdict's P&L (assumed fills left out, accounting-4), so assumed fills never pick the "best" settings
+    def rank(r: Mapping[str, Any]) -> float:
+        v = r["verdict_pnl"] if r["verdict_pnl"] is not None else r["pnl_liq"]
+        return -(v if v is not None else -float("inf"))
+
+    rows.sort(key=lambda r: (rank(r), r["label"]))
     report.sweep = rows
     report.warnings = list(report.warnings) + [SWEEP_WARNING.format(n=len(rows))]
     return report

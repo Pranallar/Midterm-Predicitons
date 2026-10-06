@@ -47,12 +47,13 @@
   const REQUEST_TIMEOUT_MS = 15000;
   const BOOK_PENDING_POLL_MS = 2000; // the server is still fetching the order book: ask again soon
   const ANALYZE_MSG_MS = 60000; // how long a Re-analyze confirmation or error stays on the card
-  const VIEWS = ['overview', 'markets', 'surges', 'high', 'strategy', 'sim'];
-  const VIEW_TITLES = { overview: 'Overview', markets: 'Markets', surges: 'Surges', high: 'High 90s', strategy: 'Strategy', sim: 'Simulation' };
+  const VIEWS = ['overview', 'markets', 'surges', 'moves', 'high', 'strategy', 'sim'];
+  const VIEW_TITLES = { overview: 'Overview', markets: 'Markets', surges: 'Surges', moves: 'Outside moves', high: 'High 90s', strategy: 'Strategy', sim: 'Simulation' };
   const VIEW_DATA = {
     overview: ['strategy', 'surges'],
     markets: ['markets'],
     surges: ['surges'],
+    moves: ['moves'],
     high: ['high'],
     strategy: ['strategy'],
     sim: ['paper', 'fairvalue', 'backtest'],
@@ -61,6 +62,7 @@
     status: '/api/status',
     markets: '/api/markets',
     surges: '/api/surges',
+    moves: '/api/moves',
     high: '/api/highband',
     strategy: '/api/strategy',
     paper: '/api/paper',
@@ -73,7 +75,7 @@
   const RANGE_LABELS = { '6h': '6 hours', '24h': '24 hours', '7d': '7 days' };
   const DATA_LABELS = {
     markets: 'the markets list', surges: 'the surges', high: 'the high-90s list', strategy: 'the strategy ideas',
-    paper: 'the simulation', fairvalue: 'the fair values', backtest: 'the backtest',
+    paper: 'the simulation', fairvalue: 'the fair values', backtest: 'the backtest', moves: 'the outside moves',
   };
   const DASH = '—';
   const MINUS = '−';
@@ -86,7 +88,7 @@
   const S = {
     view: 'overview',
     viewShown: false,
-    data: { status: null, markets: null, surges: null, high: null, strategy: null, paper: null, fairvalue: null, backtest: null },
+    data: { status: null, markets: null, surges: null, moves: null, high: null, strategy: null, paper: null, fairvalue: null, backtest: null },
     offset: 0, // server clock minus browser clock, in seconds
     failures: 0,
     failureText: '',
@@ -552,6 +554,14 @@
     hole: [['path', { d: 'M8 1.8v7.4M5.2 6.6L8 9.4l2.8-2.8' }], ['path', { d: 'M2.5 11v2.5h11V11' }]],
     trendDown: [['path', { d: 'M2.5 4.5l3 3 2.5-2 5.5 6' }], ['path', { d: 'M10 11.5h3.5V8' }]],
     copy: [['rect', { x: 5.5, y: 5.5, width: 8, height: 8, rx: 1.5 }], ['path', { d: 'M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2' }]],
+    // outside moves: an arrow into a clock (Cup lagging), a back arrow (Cup moved first), a U-turn (outside reverted)
+    lagClock: [['path', { d: 'M8.2 2.5a5.5 5.5 0 1 1-5.6 6.3' }], ['path', { d: 'M8.5 5.2v3.1l2.2 1.4' }], ['path', { d: 'M1.5 2.5l3.6 3.6M5.4 3v3.4H2' }]],
+    back: [['path', { d: 'M6.5 3.5L2 8l4.5 4.5' }], ['path', { d: 'M2.5 8h11' }]],
+    uturn: [['path', { d: 'M11.5 13.5V6.5a3.5 3.5 0 0 0-7 0v4.5' }], ['path', { d: 'M2 8.8l2.5 2.6L7 8.8' }]],
+    sound: [['path', { d: 'M2 6h2.5L8 3v10L4.5 10H2z' }], ['path', { d: 'M10.6 5.6a3.4 3.4 0 0 1 0 4.8M12.6 3.6a6.2 6.2 0 0 1 0 8.8' }]],
+    mute: [['path', { d: 'M2 6h2.5L8 3v10L4.5 10H2z' }], ['path', { d: 'M10.5 6l4 4M14.5 6l-4 4' }]],
+    bell: [['path', { d: 'M4 11V7.2a4 4 0 0 1 8 0V11l1.3 1.5H2.7z' }], ['path', { d: 'M6.5 14.2a1.6 1.6 0 0 0 3 0' }]],
+    bellOff: [['path', { d: 'M4 11V7.2a4 4 0 0 1 8 0V11l1.3 1.5H2.7z' }], ['path', { d: 'M6.5 14.2a1.6 1.6 0 0 0 3 0' }], ['path', { d: 'M2 2l12 12' }]],
   };
 
   function icon(name, cls) {
@@ -885,8 +895,15 @@
   function schedule(ms) {
     clearTimeout(S.pollTimer);
     S.pollTimer = null;
-    if (document.hidden) return;
+    if (document.hidden && !alertsInBackground()) return;
     S.pollTimer = setTimeout(poll, ms);
+  }
+
+  /** While the tab is hidden the dashboard stops polling, except /api/status while the user turned on sound or
+   *  desktop notifications for outside moves (§19.3, §19.4): they are for exactly that case. (Browsers slow a
+   *  hidden tab's timers, to about once a minute after a few minutes; an alert lasts longer than that.) */
+  function alertsInBackground() {
+    return !!((MV.sound && MV.audio) || (MV.notify && notifyState() === 'granted'));
   }
 
   function isOffline() {
@@ -900,17 +917,19 @@
     }
     clearTimeout(S.pollTimer);
     S.pollTimer = null;
-    if (document.hidden) return;
+    const background = document.hidden;
+    if (background && !alertsInBackground()) return;
     S.polling = true;
     // The view's own endpoints load alongside, each on its own: a slow or failing one never holds
     // up the status poll, and only a failing /api/status means the dashboard is offline.
-    for (const name of viewNeeds(S.view)) loadView(name);
+    if (!background) for (const name of viewNeeds(S.view)) loadView(name);
     let failed = null;
     try {
       const st = await getJSON(ENDPOINTS.status);
       S.data.status = st;
       if (num(st.now) != null) S.offset = st.now - Date.now() / 1000;
       noteRestart(st);
+      safe('moves-alerts', function () { onMovesStatus(st); });
     } catch (e) {
       // Any status failure counts (for example 421 when the page was opened at an address the
       // server does not accept): the banner then shows the server's own explanation.
@@ -1061,6 +1080,7 @@
     if (view === 'overview') renderOverview();
     else if (view === 'markets') renderMarkets();
     else if (view === 'surges') renderSurges();
+    else if (view === 'moves') renderMoves();
     else if (view === 'high') renderHigh();
     else if (view === 'strategy') renderStrategy();
     else if (view === 'sim') renderSim();
@@ -1457,6 +1477,12 @@
     setText($('nav-count-markets'), num(c.outcomes) > 0 ? fmtInt(c.outcomes) : '');
     setText($('nav-count-surges'), num(c.surges) > 0 ? fmtInt(c.surges) : '');
     setText($('nav-count-high'), num(c.high_band) > 0 ? fmtInt(c.high_band) : '');
+    // open lagging outside-move alerts with a suggestion (/api/status moves.actionable, §19.1)
+    const mv = S.data.status && S.data.status.moves && typeof S.data.status.moves === 'object' ? obj(S.data.status.moves) : {};
+    const lagging = num(mv.actionable);
+    setText($('nav-count-moves'), lagging > 0 ? fmtInt(lagging) : '');
+    setAttr($('nav-count-moves'), 'title', lagging > 0 ? plural(lagging, 'open lagging alert') + ' with a suggested hand trade' : null);
+    setText($('nav-moves-sr'), lagging > 0 ? ', ' + plural(lagging, 'open lagging alert') : '');
   }
 
   // ---------------------------------------------------------------- render: overview
@@ -1610,10 +1636,12 @@
   /** What an Overview idea item shows: an item is rebuilt only when one of these changes. */
   function lookIdeaView(o, i) {
     const href = ideaHref(o);
+    const fe = fillEdge(o); // the suggested size's edge at its expected average fill, as on the card
     return {
       href: href, rank: i + 1, label: outcomeLabel(o.title, ideaOption(o)), kind: str(o.kind), action: actionText(o),
-      side: num(o.prob_win) != null ? 'Win ' + fmtPct0(o.prob_win) : 'Return ' + fmtPctOf(o.expected_return),
-      edge: 'Edge ' + fmtSigned(o.edge) + '/' + sizeUnit(o, 1),
+      side: num(o.prob_win) != null ? (str(o.kind) === 'hole' ? 'Fill chance ' : 'Win ') + fmtPct0(o.prob_win)
+        : 'Return ' + fmtPctOf(fe ? fe.ret : o.expected_return),
+      edge: 'Edge ' + fmtSigned(fe ? fe.edge : o.edge) + '/' + sizeUnit(o, 1),
       eid: isStrategyHref(href) ? null : String(o.exchange_id),
     };
   }
@@ -2332,6 +2360,892 @@
     }
   }
 
+  // ---------------------------------------------------------------- render: outside moves (docs/OUTSIDE_MOVES.md §19)
+
+  const MOVES_SOUND_KEY = 'supermarket-dashboard:moves-sound';
+  const MOVES_NOTIFY_KEY = 'supermarket-dashboard:moves-notify';
+  // status -> [icon, label, tooltip] (the label is the server's status_label when it sends one)
+  const MOVE_STATUS = {
+    lagging: ['lagClock', 'Cup lagging', 'An outside price moved and the Cup has not caught up yet'],
+    already_moved: ['check', 'Cup already moved', 'The Cup has already moved at least half of the way: no edge left to chase'],
+    moved_first: ['back', 'Cup moved first', 'The Cup moved before the outside price did: the outside followed the Cup, not a lag'],
+    reverted: ['uturn', 'Outside reverted', 'The outside price came back before the Cup moved'],
+  };
+  // moves.SUPPRESS_REASONS (in this order) and SUPPRESS_LABELS, verbatim
+  const SUPPRESS_ORDER = ['thin', 'single_tick', 'disagree', 'near', 'suspect', 'stale', 'placeholder', 'match', 'no_cup'];
+  const SUPPRESS_LABELS = {
+    thin: 'thin or wide outside book',
+    single_tick: 'a single print that did not hold',
+    disagree: 'the other venue did not move',
+    near: 'near match (different settlement wording)',
+    suspect: 'suspect match (far from the Cup price)',
+    stale: 'stale or interrupted outside quotes',
+    placeholder: 'placeholder or one-sided outside quote',
+    match: 'match confidence too low',
+    no_cup: 'no recent Cup price to compare with',
+  };
+  const VENUE_NAMES = { polymarket: 'Polymarket', kalshi: 'Kalshi', 'demo-a': 'Demo venue A', 'demo-b': 'Demo venue B' };
+  // venue status -> [icon, words, class]
+  const VENUE_STATES = {
+    ok: ['checkCircle', 'answering', 'ok'],
+    partial: ['pulse', 'partly answering', 'partial'],
+    busy: ['refresh', 'reading (the fair-value refresh is using it)', 'busy'],
+    pending: ['clock', 'waiting for the first fair-value refresh to validate matches', 'pending'],
+    offline: ['cross', 'offline from this machine', 'offline'],
+    backoff: ['clock', 'waiting', 'backoff'],
+    error: ['warn', 'failing', 'error'],
+    disabled: ['closed', 'off', 'disabled'],
+  };
+  const MOVE_FLAG_TEXT = {
+    'warm-up thresholds': ['warm-up thresholds', 'Too little outside history yet to know how jumpy this outcome is, so the move had to be 1.5 times the usual minimum'],
+    'short Cup history': ['short Cup history', 'Less than 15 minutes of Cup prices before the move: an earlier Cup move could be missed'],
+    'wide Cup book': ['wide Cup book', 'The Cup spread is wider than 10 points: its mid price says little'],
+    gap: ['gap in the outside quotes', 'The outside quotes were interrupted inside the window'],
+  };
+  const MOVE_WINDOW_TEXT = { 60: 'in 1 min', 300: 'in 5 min', 900: 'in 15 min', 3600: 'in 1 hour' };
+  const MOVE_FILTERS = [['open', 'Open'], ['lagging', 'Lagging only'], ['all', 'All']];
+
+  const MV = {
+    parts: null, // the panels, built once: {head, venues, controls, list, summary, filtered, caveats, note}
+    filter: 'open', // 'open' | 'lagging' | 'all'
+    cards: new Map(), // alert id -> card element (kept while its data is unchanged)
+    sigs: {},
+    sound: false, // the user's choice (localStorage MOVES_SOUND_KEY)
+    audio: null, // the one AudioContext, created inside the Sound click (a user gesture)
+    notify: false, // desktop notifications wanted (localStorage MOVES_NOTIFY_KEY), only used once permission is granted
+    notifyBroken: false, // new Notification() threw (for example Android: only service workers may notify)
+    notifyAsking: false,
+    seen: null, // actionable alert ids already seen; null until the first status poll after the page loaded
+    filteredOpen: false,
+  };
+
+  function readFlag(key) {
+    try {
+      return window.localStorage.getItem(key) === 'on';
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function saveFlag(key, on) {
+    try {
+      if (on) window.localStorage.setItem(key, 'on');
+      else window.localStorage.removeItem(key);
+    } catch (e) {
+      /* private mode: the choice holds for this page only */
+    }
+  }
+
+  function audioCtor() {
+    return typeof window.AudioContext === 'function' ? window.AudioContext
+      : typeof window.webkitAudioContext === 'function' ? window.webkitAudioContext : null;
+  }
+
+  /** Create (or resume) the one AudioContext. Only called from a user gesture: browsers keep a context
+   *  created without one suspended (and warn). */
+  function ensureAudio() {
+    const Ctor = audioCtor();
+    if (!Ctor) return;
+    try {
+      if (!MV.audio) MV.audio = new Ctor();
+      if (MV.audio.state === 'suspended' && typeof MV.audio.resume === 'function') {
+        const r = MV.audio.resume();
+        if (r && typeof r.catch === 'function') r.catch(function () {});
+      }
+    } catch (e) {
+      MV.audio = null;
+    }
+  }
+
+  /** Two 880 Hz sine beeps of 0.12 s, 0.08 s apart, at gain 0.08 (§19.3). */
+  function beep() {
+    const ctx = MV.audio;
+    if (!ctx || ctx.state === 'closed') return;
+    try {
+      const t0 = (num(ctx.currentTime) || 0) + 0.02;
+      for (let i = 0; i < 2; i++) {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = 'sine';
+        osc.frequency.value = 880;
+        gain.gain.value = 0.08;
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        const at = t0 + i * 0.2;
+        osc.start(at);
+        osc.stop(at + 0.12);
+      }
+    } catch (e) {
+      /* a broken audio stack must never stop the poll */
+    }
+  }
+
+  function notifyState() {
+    if (MV.notifyBroken || typeof window.Notification !== 'function' || window.isSecureContext === false) return 'unsupported';
+    const p = window.Notification.permission;
+    return p === 'granted' || p === 'denied' ? p : 'default';
+  }
+
+  function showNotifications(list) {
+    if (!MV.notify || notifyState() !== 'granted') return;
+    for (const a of list.slice(0, 5)) {
+      try {
+        const n = new window.Notification(str(a.headline) || 'Outside move', { body: str(a.body), tag: str(a.alert_id) });
+        n.onclick = function () {
+          try {
+            window.focus();
+          } catch (e) {
+            /* ignore */
+          }
+          if (location.hash !== '#moves') location.hash = '#moves';
+          try {
+            n.close();
+          } catch (e) {
+            /* ignore */
+          }
+        };
+      } catch (e) {
+        MV.notifyBroken = true; // e.g. Chrome on Android only notifies from a service worker
+        safe('moves-controls', renderMovesControls);
+        return;
+      }
+    }
+  }
+
+  function sayMoves(text) {
+    if (!text) return;
+    if (S.drawer.id && $('drawer').open) {
+      announce(text); // the modal drawer makes live regions outside it inert
+      return;
+    }
+    const region = $('moves-announcer');
+    if (!region) return;
+    region.textContent = '';
+    setTimeout(function () { region.textContent = String(text); }, 60);
+  }
+
+  /** After every status poll: a new actionable alert id (one not seen since the page loaded) beeps once per
+   *  poll when Sound is on, raises one desktop notification per id when they are on, and is said once. The
+   *  first poll after a load only records the ids: alerts that were already open never beep or notify. */
+  function onMovesStatus(st) {
+    const m = st && st.moves && typeof st.moves === 'object' ? obj(st.moves) : null;
+    const list = m ? objs(m.actionable_alerts).filter(function (a) { return hasId(a.alert_id); }) : [];
+    if (MV.seen == null) {
+      MV.seen = new Set(list.map(function (a) { return String(a.alert_id); }));
+      return;
+    }
+    const fresh = list.filter(function (a) { return !MV.seen.has(String(a.alert_id)); });
+    for (const a of fresh) MV.seen.add(String(a.alert_id));
+    if (!fresh.length) return;
+    if (MV.sound) beep();
+    showNotifications(fresh);
+    sayMoves(fresh.slice(0, 3).map(function (a) { return sentence(str(a.headline) || 'New outside move'); }).join(' '));
+  }
+
+  function toggleSound() {
+    if (!audioCtor()) return;
+    const on = !MV.sound;
+    if (on) ensureAudio(); // inside the click: the browser lets this context play
+    MV.sound = on;
+    saveFlag(MOVES_SOUND_KEY, on);
+    renderMovesControls();
+  }
+
+  function notifyClick() {
+    const st = notifyState();
+    if (st === 'granted') {
+      MV.notify = !MV.notify;
+      saveFlag(MOVES_NOTIFY_KEY, MV.notify);
+      renderMovesControls();
+      return;
+    }
+    if (st !== 'default' || MV.notifyAsking) return;
+    MV.notifyAsking = true;
+    let done = false;
+    const after = function (perm) {
+      if (done) return;
+      done = true;
+      MV.notifyAsking = false;
+      MV.notify = perm === 'granted';
+      saveFlag(MOVES_NOTIFY_KEY, MV.notify);
+      renderMovesControls();
+    };
+    try {
+      // the promise form, with the old callback form for older browsers (whichever answers first counts)
+      const r = window.Notification.requestPermission(after);
+      if (r && typeof r.then === 'function') r.then(after, function () { after(notifyState()); });
+    } catch (e) {
+      after(notifyState());
+    }
+  }
+
+  // ---- formatting
+
+  /** Probability points: 0.055 -> "+5.5 pts" (signed) or "5.5 pts"; "n/a" when unknown. */
+  function fmtPts(v, signed) {
+    v = num(v);
+    if (v == null) return 'n/a';
+    return (signed === false ? Math.abs(v * 100).toFixed(1) : fmtSigned(v * 100, 1)) + ' pts';
+  }
+
+  /** "40 s" under a minute, "3.5 min" under an hour, else "1.2 h" (the moves texts' durations). */
+  function fmtDur(seconds) {
+    const s = num(seconds);
+    if (s == null) return 'n/a';
+    const a = Math.abs(s);
+    if (a < 60) return a.toFixed(0) + ' s';
+    if (a < 3600) return (a / 60).toFixed(1) + ' min';
+    return (a / 3600).toFixed(1) + ' h';
+  }
+
+  function fmtShare(v) {
+    v = num(v);
+    return v == null ? 'n/a' : Math.round(v * 100) + '%';
+  }
+
+  function fmtPerShare(v) {
+    return num(v) == null ? 'n/a' : fmtSigned(v);
+  }
+
+  function fmtCentsWord(v) {
+    v = num(v);
+    if (v == null) return '1 cent';
+    const c = Number((v * 100).toFixed(1));
+    return nf(0, 1).format(c) + (c === 1 ? ' cent' : ' cents');
+  }
+
+  function windowText(w) {
+    w = num(w);
+    if (w == null) return '';
+    return MOVE_WINDOW_TEXT[Math.round(w)] || 'in ' + fmtSpan(w);
+  }
+
+  function venueName(v) {
+    return VENUE_NAMES[str(v)] || str(v) || 'Outside venue';
+  }
+
+  function moveStatusBadge(a) {
+    const s = str(a.status);
+    const m = MOVE_STATUS[s] || ['question', str(a.status_label) || 'Outside move', ''];
+    return h('span', { class: 'status-badge move-status ms-' + (MOVE_STATUS[s] ? s : 'unknown'), title: m[2] || null },
+      icon(m[0]), str(a.status_label) || m[1]);
+  }
+
+  function movesThresholds() {
+    const d = S.data.moves;
+    return d && d.thresholds && typeof d.thresholds === 'object' ? obj(d.thresholds) : {};
+  }
+
+  function movesEmptyText() {
+    const t = movesThresholds();
+    const min = num(obj(t.abs_min)['60']);
+    const pts = min != null ? nf(0, 1).format(min * 100) : '3';
+    return 'No outside move yet. Alerts appear here when Polymarket or Kalshi moves by at least ' + pts +
+      ' points in a minute (more over longer windows, and more for outcomes that are usually volatile).';
+  }
+
+  function movesPollS(d) {
+    return num(d && d.poll_s) || 15;
+  }
+
+  /** One venue move per venue (the alert's own window first), in the alert's venue order. */
+  function alertVenueMoves(a) {
+    const by = {};
+    const order = [];
+    for (const v of objs(a.venue_moves)) {
+      const k = str(v.venue);
+      if (!k) continue;
+      if (!by[k]) order.push(k);
+      if (!by[k] || (num(v.window_s) === num(a.window_s) && num(by[k].window_s) !== num(a.window_s))) by[k] = v;
+    }
+    const venues = texts(a.venues).filter(function (v) { return by[v]; });
+    for (const k of order) if (venues.indexOf(k) === -1) venues.push(k);
+    return venues.map(function (k) { return by[k]; });
+  }
+
+  function cupNowOf(a) {
+    const now = obj(a.cup_now);
+    if (num(now.mid) != null || num(now.bid) != null) return now;
+    return obj(obj(a.cup).now);
+  }
+
+  // ---- one alert card
+
+  function outsideLine(a) {
+    const d = num(a.direction) != null && a.direction < 0 ? -1 : 1;
+    const move = num(a.move);
+    const parts = [h('strong', null, 'Outside ' + fmtPrice(a.outside_before) + ' ' + ARROW + ' ' + fmtPrice(a.outside_after)),
+      move != null ? ' (' + fmtPts(d * move) + ')' : ''];
+    const nowV = num(a.outside_now);
+    if (nowV != null && num(a.outside_after) != null && Math.abs(nowV - a.outside_after) >= 0.0005) parts.push(', now ' + fmtPrice(nowV));
+    for (const vm of alertVenueMoves(a)) {
+      parts.push(h('span', { class: 'move-sep', 'aria-hidden': 'true' }, ' · '), h('span', { class: 'sr-only' }, '; '),
+        venueName(vm.venue) + ' ' + fmtPrice(vm.base_value) + ' ' + ARROW + ' ' + fmtPrice(vm.after_value));
+    }
+    return h('p', { class: 'move-outside' }, parts);
+  }
+
+  function moveFlags(a) {
+    const out = [];
+    if (str(a.confirmation) === 'one venue') {
+      out.push(h('span', { class: 'flag', title: 'Only one outside venue confirmed this move (the other is unmatched, filtered or not answering)' }, icon('info'), 'one venue only'));
+    }
+    for (const f of texts(a.flags)) {
+      if (f === 'one venue') continue;
+      const m = MOVE_FLAG_TEXT[f];
+      out.push(h('span', { class: 'flag', title: m ? m[1] : null }, icon('info'), m ? m[0] : f));
+    }
+    if (texts(a.linked).length) out.push(h('span', { class: 'flag', title: 'Another leg of the same race moved at the same time' }, icon('info'), 'linked to another leg of this race'));
+    return out.length ? h('p', { class: 'flags move-flags' }, out) : null;
+  }
+
+  function cupLine(a) {
+    const q = cupNowOf(a);
+    const base = obj(obj(a.cup).base);
+    const open = str(a.state) !== 'closed';
+    const parts = [h('strong', null, (open ? 'Cup now ' : 'Cup at the last check ') + fmtPrice(q.mid))];
+    if (num(q.bid) != null || num(q.ask) != null) parts.push(' (bid ' + fmtPrice(q.bid) + ' / ask ' + fmtPrice(q.ask) + ')');
+    if (num(q.mid) != null && num(base.mid) != null) parts.push(', moved ' + fmtPts(q.mid - base.mid) + ' since the outside move began');
+    // A move the Cup made first, or one where the outside price only moved to where the Cup already was, is not a
+    // lag: its "lag gap" (the outside move minus the Cup's move since the base) would read like an open gap, so it is
+    // not shown; the gap between the prices now is.
+    const lagInfo = obj(a.lag);
+    const firstMove = str(a.status) === 'moved_first' || str(lagInfo.outcome) === 'cup_first';
+    const converging = /^converging/.test(str(lagInfo.excluded_reason));
+    const notALag = firstMove || converging;
+    const gap = notALag ? null : num(a.lag_gap_now) != null ? a.lag_gap_now : num(a.lag_gap);
+    if (notALag) {
+      parts.push(h('span', { class: 'move-sep', 'aria-hidden': 'true' }, ' · '), h('span', { class: 'sr-only' }, '; '),
+        h('span', { class: 'lag-gap' }, firstMove ? 'no lag gap: the Cup moved first' : 'no lag gap: the outside price moved to the Cup’s price'));
+    } else if (gap != null) {
+      parts.push(h('span', { class: 'move-sep', 'aria-hidden': 'true' }, ' · '), h('span', { class: 'sr-only' }, '; '),
+        h('span', { class: 'lag-gap', title: 'The outside move so far (its peak) minus what the Cup has moved the same way since the move began' },
+          gap > 0.0005 ? 'lag gap ' + fmtPts(gap, false)
+            : 'lag gap closed' + (gap < -0.0005 ? ' (the Cup moved ' + fmtPts(-gap, false) + ' further than the outside price)' : '')));
+    }
+    // The lag gap is measured from the move's peak; when the outside price came back part of the way (or the two
+    // started at different levels) the gap between the prices right now is what a trade can still use: say it.
+    const level = num(a.level_gap_now);
+    if (open && level != null && (notALag || (gap != null && Math.abs(level - gap) >= 0.005 - 1e-9))) {
+      const d = num(a.direction) != null && a.direction < 0 ? -1 : 1;
+      const diff = d * level; // outside minus Cup, in YES terms
+      parts.push(h('span', { class: 'move-sep', 'aria-hidden': 'true' }, ' · '), h('span', { class: 'sr-only' }, '; '),
+        h('span', { class: 'level-gap', title: 'The outside price now minus the Cup’s mid now' },
+          Math.abs(diff) < 0.0005 ? 'the outside price is level with the Cup now'
+            : 'the outside price is now ' + fmtPts(Math.abs(diff), false) + (diff > 0 ? ' above' : ' below') + ' the Cup'));
+    }
+    return h('p', { class: 'move-cup' }, parts);
+  }
+
+  function tradeBox(a) {
+    const t = obj(a.trade);
+    const no = str(t.side) === 'no';
+    const side = no ? 'NO' : 'YES';
+    const action = str(t.text) || 'Buy ' + side + ' at ' + fmtPrice(t.limit);
+    const shares = num(t.shares_at_limit);
+    const toMax = num(t.shares_to_max);
+    const computed = num(t.computed_at);
+    const bookAge = num(t.book_age_s);
+    let depth;
+    if (shares == null) depth = ' — shares at that price unknown (no recent Cup order book)';
+    else {
+      const bookTs = computed != null && bookAge != null ? computed - bookAge : null;
+      const what = str(t.book_source) === 'stored' ? 'the tracker’s order book from ' : 'book read ';
+      depth = [' — ' + fmtInt(shares) + ' shares at that price', bookTs != null ? [' (' + what, timeEl(bookTs, 'ago'), ')'] : ''];
+    }
+    const lines = [h('p', { class: 'trade-head' }, h('strong', null, 'Suggested hand trade: '), h('span', { class: 'trade-action' }, action), depth,
+      num(t.max_limit) != null
+        ? '; up to ' + fmtPrice(t.max_limit) + ' still keeps ' + fmtCentsWord(movesThresholds().min_edge) + ' a share' +
+          (shares != null && toMax != null ? ': ' + fmtInt(toMax) + ' shares.' : '.')
+        : '.')];
+    const u = num(t.uncertainty);
+    const v = num(t.outside_value);
+    const target = v == null ? '' : no ? ' if the Cup’s NO price catches up to ' + fmtPrice(v) + ' (YES ' + fmtPrice(1 - v) + ')' : ' if the Cup catches up to ' + fmtPrice(v);
+    lines.push(h('p', { class: 'trade-edge' },
+      fmtPerShare(t.edge_per_share) + ' per share net of the spread (' + fmtPerShare(t.edge_after_uncertainty) + ' after the outside price’s ±' +
+      (u != null ? (u * 100).toFixed(1) : 'n/a') + '-cent uncertainty)' + target + '; ' + fmtPerShare(t.edge_at_resolution) +
+      ' at resolution if the outside price is right.'));
+    if (tradeStale(t)) {
+      lines.push(h('p', { class: 'trade-stale' }, icon('clock'), h('span', null, 'Worked out ', timeEl(computed, 'ago'),
+        ': the Cup and the outside price may have moved since. Check the Cup’s order book before acting.')));
+    }
+    lines.push(h('p', { class: 'trade-note' }, icon('warn'), h('span', null, str(t.note) || 'Suggestion only, not a sure thing. Nothing is traded by the bot.')));
+    return h('div', { class: 'trade-box', role: 'group', 'aria-label': 'Suggested hand trade' }, lines);
+  }
+
+  /** A suggestion the watcher has not recomputed for 2 minutes (it re-prices every poll while it runs). */
+  function tradeStale(t) {
+    const c = num(t && t.computed_at);
+    return c != null && nowS() - c > 120;
+  }
+
+  function noTradeNote(a) {
+    const note = str(a.trade_note) || 'No edge left after the Cup spread and the outside price’s uncertainty right now.';
+    return h('div', { class: 'trade-box no-trade-box' }, h('p', null, icon('info'), h('span', null, h('strong', null, 'No trade suggested: '), note)));
+  }
+
+  function openedTradeLine(a) {
+    const t = a.opened_trade && typeof a.opened_trade === 'object' ? obj(a.opened_trade) : null;
+    if (!t || !str(t.text)) return null;
+    return h('p', { class: 'muted-note move-opened-trade' }, 'When it opened, the suggestion was: ' + str(t.text) + ' (' +
+      fmtPerShare(t.edge_per_share) + ' per share net of the spread). It was a suggestion only.');
+  }
+
+  function lagLine(a) {
+    const lag = obj(a.lag);
+    const o = str(lag.outcome);
+    const reason = str(a.reason);
+    const lr = str(lag.reason);
+    const own = lr && lr !== reason ? lr : '';
+    let text = '';
+    if (o === 'pending') {
+      const track = num(movesThresholds().lag_track_s) || 3600;
+      const tm = num(lag.t_move) != null ? lag.t_move : num(a.t_move);
+      const elapsed = tm != null ? clamp(nowS() - tm, 0, track) : 0;
+      text = 'Waiting for the Cup: ' + Math.floor(elapsed / 60) + ' of ' + Math.round(track / 60) + ' min';
+    } else if (o === 'followed') {
+      const after = num(lag.lag_after_alert_s);
+      text = 'The Cup followed ' + fmtDur(lag.lag_s) + ' after the outside move' +
+        (after == null ? '' : after > 0 ? ' (' + fmtDur(after) + ' after this alert)' : ' (' + (after < 0 ? fmtDur(-after) + ' before' : 'as') + ' this alert opened)');
+    } else if (o === 'reverted') text = own || 'Never followed: the outside price came back first.';
+    else if (o === 'not_followed') text = own || 'Never followed within the hour this was measured.';
+    else if (o === 'cup_first') text = own || (num(lag.lag_s) != null ? 'The Cup moved first, about ' + fmtDur(-lag.lag_s) + ' earlier.' : 'The Cup moved first.');
+    else if (o === 'censored') text = 'Not counted in the lag study: ' + (lr ? lr.charAt(0).toLowerCase() + lr.slice(1) : 'the measurement was interrupted.');
+    else if (o === 'excluded') text = 'Not counted in the lag study' + (str(lag.excluded_reason) ? ' (' + str(lag.excluded_reason) + ').' : '.');
+    if (!text) return null;
+    return h('p', { class: 'move-lag' }, icon(o === 'pending' ? 'clock' : o === 'followed' ? 'checkCircle' : 'info'), h('span', null, sentence(text)));
+  }
+
+  function capturesLine(a) {
+    const lag = obj(a.lag);
+    if (num(lag.capture_at) == null && num(lag.exit_at) == null) return null;
+    const parts = [h('strong', null, 'Measured: ')];
+    const cap = num(lag.capture_4m);
+    parts.push(num(lag.capture_at) == null ? '' : cap != null ? '4 min after the alert: ' + fmtSigned(cap) + ' a share left'
+      : '4 min after the alert: not measurable (no Cup or outside price then)');
+    const ex = num(lag.exit_30m);
+    if (num(lag.exit_at) != null) parts.push('; bought then and sold 30 min later: ' + (ex != null ? fmtSigned(ex) + ' a share' : 'not measurable (no Cup price then)'));
+    else if (num(lag.capture_at) != null) parts.push('; the 30-minute result is due ', timeEl(lag.capture_at + (num(movesThresholds().exit_after_s) || 1800), 'clock'));
+    parts.push(' (per share, net of the spread, before any price impact of your own order).');
+    return h('p', { class: 'move-captures' }, parts);
+  }
+
+  function moveCard(a) {
+    const id = str(a.alert_id);
+    const closed = str(a.state) === 'closed';
+    const lagging = str(a.status) === 'lagging';
+    const title = outcomeLabel(str(a.title) || 'Untitled market', str(a.option) && str(a.option).toUpperCase() !== 'YES' ? str(a.option) : '');
+    const link = hasId(a.exchange_id)
+      ? h('a', { href: exchangeHref(a.exchange_id), 'data-eid': String(a.exchange_id), 'data-focus-key': 'mv:' + id + ':link' }, title)
+      : document.createTextNode(title);
+    const badges = h('div', { class: 'card-badges' }, moveStatusBadge(a),
+      closed ? h('span', { class: 'status-badge status-closed', title: 'This alert is closed: kept for the record and the lag study' }, icon('closed'), 'closed') : null);
+    const meta = h('p', { class: 'move-meta' }, 'Detected ', timeEl(a.detected_at, 'ago'),
+      windowText(a.window_s) ? ' · moved ' + windowText(a.window_s) : '',
+      closed && num(a.closed_at) != null ? [' · closed ', timeEl(a.closed_at, 'ago')] : '');
+    const kids = [
+      h('div', { class: 'card-head' },
+        h('div', { class: 'card-titles' }, h('h4', { class: 'card-title move-race' }, str(a.race_label) || title), h('p', { class: 'card-sub move-title' }, link)),
+        badges),
+      meta, outsideLine(a), moveFlags(a), cupLine(a),
+      // a follow rewrites the reason to the lag sentence: the lag line below says it once
+      str(a.reason) && !(str(obj(a.lag).outcome) === 'followed' && str(obj(a.lag).reason) === str(a.reason))
+        ? h('p', { class: 'move-reason' }, str(a.reason)) : null,
+    ];
+    if (!closed && lagging) kids.push(a.trade && typeof a.trade === 'object' ? tradeBox(a) : noTradeNote(a));
+    else if (closed) kids.push(openedTradeLine(a));
+    kids.push(lagLine(a), capturesLine(a));
+    const cls = 'card move-card ms-card-' + (MOVE_STATUS[str(a.status)] ? str(a.status) : 'unknown') + (closed ? ' is-closed' : ' is-open') +
+      (a.actionable === true ? ' is-actionable' : '');
+    return h('article', { class: cls, 'data-alert-id': id, 'aria-label': (str(a.status_label) || 'Outside move') + ': ' + (str(a.race_label) || title) }, kids);
+  }
+
+  function moveCardKey(a) {
+    const lag = obj(a.lag);
+    const copy = Object.assign({}, a, { updated_at: null, trade: a.trade && typeof a.trade === 'object' ? Object.assign({}, a.trade, { computed_at: null, book_age_s: null }) : a.trade });
+    let minute = null;
+    if (str(lag.outcome) === 'pending') {
+      const tm = num(lag.t_move) != null ? lag.t_move : num(a.t_move);
+      minute = tm != null ? Math.floor((nowS() - tm) / 60) : null;
+    }
+    const t = obj(a.trade);
+    const bookTs = num(t.computed_at) != null && num(t.book_age_s) != null ? Math.round(t.computed_at - t.book_age_s) : null;
+    return sig([copy, minute, bookTs, movesThresholds().min_edge, tradeStale(t)]);
+  }
+
+  // ---- panels
+
+  function movesPart(name, title, cls) {
+    const hid = 'h-moves-' + name;
+    const body = h('div', { class: 'moves-panel-body' });
+    const el = h('section', { class: 'panel moves-panel moves-' + name + (cls ? ' ' + cls : ''), 'aria-labelledby': hid, 'data-panel': name },
+      h('h3', { class: 'panel-title', id: hid }, title), body);
+    return { el: el, body: body, key: null };
+  }
+
+  function buildMoves(root) {
+    if (MV.parts) return MV.parts;
+    const P = {};
+    P.note = h('div', { class: 'moves-note' });
+    P.venues = movesPart('venues', 'Outside venues');
+    P.alerts = movesPart('alerts', 'Alerts');
+    P.controls = h('div', { class: 'moves-controls' });
+    P.alerts.body.appendChild(P.controls);
+    P.cards = h('div', { class: 'cards move-cards' });
+    P.empty = h('p', { class: 'empty move-empty' });
+    P.empty.hidden = true;
+    P.alerts.body.append(P.cards, P.empty);
+    P.summary = movesPart('summary', 'Is the Cup delayed?');
+    P.filtered = movesPart('filtered', 'Filtered out');
+    P.caveats = movesPart('caveats', 'How to read this');
+
+    // controls: built once, so keyboard focus survives every poll
+    P.soundBtn = h('button', { type: 'button', class: 'btn btn-toggle', id: 'moves-sound', 'aria-pressed': 'false', 'data-focus-key': 'mv:sound', onclick: toggleSound });
+    P.notifyBtn = h('button', { type: 'button', class: 'btn btn-toggle', id: 'moves-notify', 'data-focus-key': 'mv:notify', onclick: notifyClick });
+    P.alertNote = h('p', { class: 'muted-note moves-alert-note', id: 'moves-alert-note' });
+    P.filterBtns = MOVE_FILTERS.map(function (f) {
+      return h('button', { type: 'button', class: 'seg', 'data-moves-filter': f[0], 'aria-pressed': f[0] === MV.filter ? 'true' : 'false',
+        onclick: function () { setMovesFilter(f[0]); } }, f[1]);
+    });
+    P.count = h('p', { class: 'result-count', id: 'moves-count' });
+    P.controls.append(
+      h('div', { class: 'moves-alerting', role: 'group', 'aria-label': 'Alert me', 'aria-describedby': 'moves-alert-note' }, P.soundBtn, P.notifyBtn),
+      h('div', { class: 'seg-group moves-filter', role: 'group', 'aria-label': 'Show alerts' }, P.filterBtns),
+      P.count, P.alertNote);
+    MV.parts = P;
+    return P;
+  }
+
+  /** At page load, whatever view is shown: the saved Sound and notification choices apply (the badge, beep and
+   *  notifications follow /api/status on every view). A saved Sound "on" can only play after a click or key press
+   *  on the page (browsers require a gesture), so the AudioContext is created on the first one. */
+  function initMovesAlerts() {
+    MV.sound = readFlag(MOVES_SOUND_KEY);
+    MV.notify = readFlag(MOVES_NOTIFY_KEY);
+    if (!MV.sound || !audioCtor()) return;
+    const wake = function () {
+      if (MV.sound) ensureAudio();
+      if (MV.audio || !MV.sound) {
+        for (const t of ['pointerdown', 'keydown', 'touchend']) document.removeEventListener(t, wake, true);
+        safe('moves-controls', renderMovesControls);
+      }
+    };
+    for (const t of ['pointerdown', 'keydown', 'touchend']) document.addEventListener(t, wake, true);
+  }
+
+  function setMovesFilter(f) {
+    MV.filter = f;
+    safe('moves', renderMoves);
+    const p = MV.parts;
+    if (p) announce(p.count.textContent || '');
+  }
+
+  function renderMovesControls() {
+    const P = MV.parts;
+    if (!P) return;
+    const soundOk = !!audioCtor();
+    P.soundBtn.disabled = !soundOk;
+    setAttr(P.soundBtn, 'aria-pressed', soundOk && MV.sound ? 'true' : 'false');
+    const sk = sig([soundOk, MV.sound]);
+    if (P.soundBtn.dataset.sig !== sk) {
+      P.soundBtn.dataset.sig = sk;
+      P.soundBtn.replaceChildren(icon(soundOk && MV.sound ? 'sound' : 'mute'), 'Sound',
+        h('span', { 'aria-hidden': 'true', class: 'state-word' }, soundOk ? (MV.sound ? ' on' : ' off') : ''));
+    }
+    const ns = notifyState();
+    let label;
+    let pressed = null;
+    let ico = 'bell';
+    let disabled = false;
+    if (ns === 'unsupported') {
+      label = 'Desktop notifications: not supported in this browser';
+      ico = 'bellOff';
+      disabled = true;
+    } else if (ns === 'denied') {
+      label = 'Notifications are blocked in this browser’s settings';
+      ico = 'bellOff';
+      disabled = true;
+    } else if (ns === 'default') {
+      label = MV.notifyAsking ? 'Waiting for your answer…' : 'Turn on desktop notifications';
+    } else {
+      pressed = MV.notify ? 'true' : 'false';
+      label = null;
+      ico = MV.notify ? 'bell' : 'bellOff';
+    }
+    P.notifyBtn.disabled = disabled;
+    setAttr(P.notifyBtn, 'aria-pressed', pressed);
+    setAttr(P.notifyBtn, 'data-state', ns);
+    const nk = sig([ns, label, pressed]);
+    if (P.notifyBtn.dataset.sig !== nk) {
+      P.notifyBtn.dataset.sig = nk;
+      if (label != null) P.notifyBtn.replaceChildren(icon(ico), label);
+      else P.notifyBtn.replaceChildren(icon(ico), 'Desktop notifications', h('span', { 'aria-hidden': 'true', class: 'state-word' }, MV.notify ? ' on' : ' off'));
+    }
+    const notes = [];
+    if (!soundOk) notes.push('Sound is not supported in this browser.');
+    else if (MV.sound && !MV.audio) notes.push('Sound is on: it starts after your first click or key press on this page (browsers require one).');
+    if (ns === 'granted' && MV.notify) notes.push('A desktop notification appears for each new lagging alert with a suggestion, also while this tab is in the background (keep it open).');
+    if (!notes.length) notes.push('Sound and desktop notifications are off unless you turn them on. They only fire for new lagging alerts with a suggestion, never for ones already open when the page loaded.');
+    setText(P.alertNote, notes.join(' '));
+    for (const b of P.filterBtns) setAttr(b, 'aria-pressed', b.dataset.movesFilter === MV.filter ? 'true' : 'false');
+  }
+
+  function venueLine(v) {
+    const st = str(v.status);
+    const m = VENUE_STATES[st] || ['question', st || 'unknown', 'unknown'];
+    const name = str(v.label) || venueName(v.venue);
+    const err = str(v.last_error);
+    const parts = [h('strong', null, name + ': '), m[1]];
+    if (st === 'backoff') {
+      if (/\b429\b/.test(err)) parts.push(' (HTTP 429)');
+      if (num(v.next_try_at) != null) parts.push(' until ', timeEl(v.next_try_at, 'clock'));
+    }
+    if (st === 'ok' || st === 'partial') {
+      parts.push(' · ' + fmtInt(num(v.matched) || 0) + ' matched');
+      const last = num(v.last_ok_at) != null ? v.last_ok_at : v.last_poll_at;
+      if (num(last) != null) parts.push(' · last read ', timeEl(last, 'ago'));
+      if (num(v.budget_limit) > 0) parts.push(' · ' + fmtInt(num(v.budget_used) || 0) + ' of ' + fmtInt(v.budget_limit) + ' reads a minute');
+      if (num(v.stale) > 0) parts.push(' · ' + fmtInt(v.stale) + ' stale');
+    }
+    if (err && st !== 'ok' && st !== 'busy' && st !== 'pending') parts.push(' — ' + sentence(err));
+    return h('li', { class: 'venue-line venue-' + m[2], 'data-venue': str(v.venue) }, icon(m[0]), h('span', null, parts));
+  }
+
+  function renderMovesVenues(P, d) {
+    const venues = objs(d.venues);
+    const w = obj(d.watching);
+    const br = d.book_reads && typeof d.book_reads === 'object' ? obj(d.book_reads) : null;
+    const poll = movesPollS(d);
+    const last = num(d.last_step_at);
+    const late = last != null && nowS() - last > Math.max(4 * poll, 120);
+    // the read times are in the key: their "6 s ago" must follow the newest read, not tick on from an old one
+    const key = sig([venues, w, br, late, last]);
+    if (P.venues.key === key) return;
+    if (P.venues.key != null && selectionInside(P.venues.body)) return;
+    P.venues.key = key;
+    const out = [];
+    if (venues.length) out.push(h('ul', { class: 'venue-list' }, venues.map(venueLine)));
+    else out.push(h('p', { class: 'muted-note' }, 'No outside venue has been polled yet.'));
+    const facts = [];
+    facts.push(h('li', null, icon('eye'), h('span', null, 'Watching ' + plural(num(w.outcomes) || 0, 'outcome') + ' (' + fmtInt(num(w.matched) || 0) + ' matched to an outside market)',
+      last != null ? [' · last check ', timeEl(last, 'ago')] : ' · no check yet')));
+    if (br) {
+      facts.push(h('li', null, icon('table'), h('span', null, num(br.limit) > 0
+        ? 'Cup order books: ' + fmtInt(num(br.used) || 0) + ' of ' + fmtInt(br.limit) + ' reads a minute (only for lagging alerts, never from the Cup’s main read budget)'
+        : 'Cup order books: off (shares available at a price stay unknown)')));
+    }
+    out.push(h('ul', { class: 'venue-facts' }, facts));
+    if (late) out.push(h('p', { class: 'inline-error' }, icon('warn'), h('span', null, 'The outside watcher has not run since ', timeEl(last, 'clock'), ' (', timeEl(last, 'ago'), '): these alerts may be out of date.')));
+    rebuild(P.venues.body, out);
+  }
+
+  function shareCell(share, n, of) {
+    return [fmtShare(share), h('span', { class: 'cell-sub' }, '(n = ' + fmtInt(num(n) || 0) + (of != null ? ' of ' + fmtInt(of) : '') + ')')];
+  }
+
+  function statsCell(st) {
+    st = obj(st);
+    const n = num(st.n) || 0;
+    if (!n || num(st.mean) == null) return ['n/a', h('span', { class: 'cell-sub' }, '(n = ' + fmtInt(n) + ')')];
+    const ci = arr(st.ci90).length === 2 && num(st.ci90[0]) != null && num(st.ci90[1]) != null
+      ? '90% interval ' + fmtSigned(st.ci90[0]) + ' to ' + fmtSigned(st.ci90[1]) + ' (over per-race means)'
+      : 'no interval yet (needs 5 races)';
+    return [fmtSigned(st.mean) + ' on average', h('span', { class: 'cell-sub' },
+      'median ' + fmtPerShare(st.median) + ', positive ' + fmtShare(st.positive_share) + ' of the time · ' + ci + ' (n = ' + fmtInt(n) + ')')];
+  }
+
+  function renderMovesSummary(P, d) {
+    const s = d.summary && typeof d.summary === 'object' ? obj(d.summary) : null;
+    const key = sig([s, d.available]);
+    if (P.summary.key === key) return;
+    if (P.summary.key != null && selectionInside(P.summary.body)) return;
+    P.summary.key = key;
+    if (!s) {
+      rebuild(P.summary.body, [h('p', { class: 'muted-note' }, 'The lag study starts with the first outside move.')]);
+      return;
+    }
+    const fw = obj(s.followed_within);
+    const fwn = obj(s.followed_within_n);
+    const led = num(s.outside_led) || 0;
+    const rows = [];
+    const row = function (label, cell, cls) {
+      rows.push(h('tr', { class: cls || null }, h('th', { scope: 'row' }, label), h('td', null, cell)));
+    };
+    [['60', '1 min'], ['300', '5 min'], ['900', '15 min'], ['3600', '60 min']].forEach(function (b) {
+      row('Followed within ' + b[1], shareCell(fw[b[0]], fwn[b[0]], led));
+    });
+    row('Never followed (came back / did not follow)', [fmtShare(s.never_followed_share), h('span', { class: 'cell-sub' },
+      '(n = ' + fmtInt(num(s.never_followed) || 0) + ' of ' + fmtInt(led) + '): came back ' + fmtShare(s.reverted_share) + ' (n = ' + fmtInt(num(s.reverted) || 0) +
+      ') / did not follow ' + fmtShare(s.not_followed_share) + ' (n = ' + fmtInt(num(s.not_followed) || 0) + ')')]);
+    row('Cup moved first', shareCell(s.cup_first_share, s.cup_first, num(s.resolved) || 0));
+    const q = arr(s.lag_quartiles_s);
+    row('Median lag (after the outside move / after the alert)', [fmtDur(s.median_lag_s) + ' / ' + fmtDur(s.median_lag_after_alert_s),
+      h('span', { class: 'cell-sub' }, (q.length === 2 && num(q[0]) != null && num(q[1]) != null ? 'middle half ' + fmtDur(q[0]) + ' to ' + fmtDur(q[1]) + ' ' : '') +
+        '(n = ' + fmtInt(num(s.followed) || 0) + ' followed)')]);
+    row('Left 4 min after the alert (per share, net of spread)', statsCell(s.capture_4m));
+    row('Bought then, sold 30 min later (per share)', statsCell(s.exit_30m));
+    const head = h('p', { class: 'lag-sentence' }, str(s.sentence) || 'No outside move has been measured yet.');
+    const badge = s.small_sample !== false
+      ? h('p', { class: 'lag-badges' }, h('span', { class: 'badge small-sample', title: 'Fewer than 20 resolved outside moves or 10 races: far too few to judge' }, icon('warn'), 'Small sample'))
+      : null;
+    const scope = h('p', { class: 'muted-note' }, 'Counted over ' + (str(s.window) || 'every stored alert') + (num(s.since) != null ? ', since ' : '.'),
+      num(s.since) != null ? [timeEl(s.since, 'short'), '.'] : '');
+    const table = tableWrap('Lag study table', h('table', { class: 'data-table sim-table lag-table' },
+      h('caption', { class: 'sr-only' }, 'How often and how fast the Cup followed outside moves'),
+      h('thead', null, h('tr', null, h('th', { scope: 'col' }, 'Measure'), h('th', { scope: 'col' }, 'Value'))),
+      h('tbody', null, rows)));
+    const excluded = h('p', { class: 'muted-note lag-excluded' }, 'Excluded: ' + fmtInt(num(s.excluded) || 0) + ' converging (or without a Cup price), ' +
+      fmtInt(num(s.censored) || 0) + ' censored (the bot was not running, the market closed, or no Cup price) · ' + fmtInt(num(s.pending) || 0) + ' still being measured.');
+    rebuild(P.summary.body, [badge, head, table, excluded, scope]);
+  }
+
+  function renderMovesFiltered(P, d) {
+    const counts = obj(obj(d.counts).suppressed_today);
+    const items = objs(d.suppressed);
+    const key = sig([counts, items]);
+    if (P.filtered.key === key) return;
+    if (P.filtered.key != null && selectionInside(P.filtered.body)) return;
+    P.filtered.key = key;
+    let total = 0;
+    const lines = [];
+    const reasons = SUPPRESS_ORDER.concat(Object.keys(counts).filter(function (k) { return SUPPRESS_ORDER.indexOf(k) === -1; }));
+    for (const r of reasons) {
+      const n = num(counts[r]) || 0;
+      if (n <= 0) continue;
+      total += n;
+      lines.push(h('li', null, h('strong', null, fmtInt(n)), ' ' + (SUPPRESS_LABELS[r] || r.replace(/_/g, ' '))));
+    }
+    const summary = total > 0 ? plural(total, 'move was', 'moves were') + ' filtered out today' : 'Nothing was filtered out today';
+    const latest = items.map(function (x) {
+      return h('li', { class: 'suppressed-item' }, h('strong', null, str(x.race_label) || str(x.title) || 'Outcome ' + str(x.exchange_id)), ' — ',
+        str(x.reason_label) || SUPPRESS_LABELS[str(x.reason)] || str(x.reason), str(x.detail) ? ': ' + str(x.detail) : '',
+        num(x.at) != null ? [' ', h('span', { class: 'muted-note' }, '(', timeEl(x.at, 'ago'), ')')] : '');
+    });
+    const det = h('details', { class: 'sim-details moves-filtered-details', id: 'moves-filtered-details' },
+      h('summary', { 'data-focus-key': 'mv:filtered' }, icon('chevron', 'chev'), summary),
+      h('div', { class: 'sim-details-body' },
+        h('p', { class: 'muted-note' }, 'Would-be alerts a noise filter dropped (thin or wide outside books, single prints, a venue disagreeing with the other, uncertain or near matches, stale quotes, no Cup price), so you can see what was not alerted and why.'),
+        lines.length ? h('ul', { class: 'filtered-counts' }, lines) : null,
+        latest.length ? [h('h4', { class: 'card-section-title' }, 'Latest'), h('ul', { class: 'suppressed-list' }, latest)] : null));
+    if (MV.filteredOpen) det.open = true;
+    det.addEventListener('toggle', function () { MV.filteredOpen = det.open; });
+    rebuild(P.filtered.body, [det]);
+  }
+
+  function renderMovesCaveats(P, d) {
+    const c = texts(d.caveats);
+    const key = sig(c);
+    if (P.caveats.key === key) return;
+    P.caveats.key = key;
+    rebuild(P.caveats.body, [c.length ? h('ul', { class: 'reasons caveat-list' }, c.map(function (x) { return h('li', null, x); }))
+      : h('p', { class: 'muted-note' }, 'Outside prices can be wrong or thin, and a move the Cup has not followed is not a guaranteed profit. Nothing is traded by the bot.')]);
+  }
+
+  function filteredAlerts(alerts) {
+    if (MV.filter === 'all') return alerts;
+    return alerts.filter(function (a) {
+      if (str(a.state) === 'closed') return false;
+      return MV.filter === 'open' || str(a.status) === 'lagging';
+    });
+  }
+
+  function renderMovesCards(P, d) {
+    const all = objs(d.alerts).filter(function (a) { return hasId(a.alert_id); });
+    const shown = filteredAlerts(all);
+    const seen = new Set();
+    const wanted = [];
+    for (const a of shown) {
+      const id = String(a.alert_id);
+      if (seen.has(id)) continue;
+      seen.add(id);
+      const key = moveCardKey(a);
+      let el = MV.cards.get(id);
+      if (!el || (el.dataset.sig !== key && !selectionInside(el))) {
+        const fresh = moveCard(a);
+        fresh.dataset.sig = key;
+        if (el && el.isConnected) swapCard(el, fresh);
+        el = fresh;
+        MV.cards.set(id, el);
+      }
+      wanted.push(el);
+    }
+    for (const id of Array.from(MV.cards.keys())) if (!seen.has(id)) MV.cards.delete(id);
+    placeChildren(P.cards, wanted);
+    show(P.cards, wanted.length > 0);
+    let empty = '';
+    if (!wanted.length) {
+      if (!all.length) empty = d.available === false ? 'Waiting for the first outside check (every ' + fmtSpan(movesPollS(d)) + ').' : movesEmptyText();
+      else if (MV.filter === 'lagging') empty = 'No open lagging alert right now: the Cup is not behind any outside move the bot is watching.';
+      else empty = 'No open alerts right now.';
+      const closed = all.filter(function (a) { return str(a.state) === 'closed'; }).length;
+      if (all.length && MV.filter !== 'all' && closed) empty += ' ' + plural(closed, 'closed alert is', 'closed alerts are') + ' under All.';
+    }
+    setText(P.empty, empty);
+    show(P.empty, !!empty);
+    const c = obj(d.counts);
+    setText(P.count, fmtInt(num(c.open) || 0) + ' open, ' + fmtInt(num(c.lagging) || 0) + ' lagging' +
+      (MV.filter === 'all' && all.length ? ' · ' + plural(all.length, 'alert') + ' shown' : ''));
+  }
+
+  function renderMoves() {
+    const root = $('moves-body');
+    if (!root) return;
+    const P = buildMoves(root);
+    const d = S.data.moves;
+    show($('moves-demo-badge'), !!(d && d.demo === true));
+    const demoVenues = d && objs(d.venues).length > 0 && objs(d.venues).every(function (v) { return /^demo-/.test(str(v.venue)); });
+    setText($('moves-sub'), (demoVenues
+      ? 'The demo’s scripted outside venues (Demo venue A and Demo venue B, standing in for Polymarket and Kalshi), read every '
+      : 'Polymarket and Kalshi prices for the Cup’s races, read every ') + fmtSpan(movesPollS(d)) +
+      '. An alert means an outside price moved and the Cup may not have caught up yet. Nothing is traded: every suggestion is for you to judge and place by hand.');
+    let mode;
+    if (!d) mode = 'loading';
+    else if (d.enabled === false) mode = 'off';
+    else mode = 'on';
+    const noteKey = sig([mode, mode === 'loading' ? loadingMsg('moves', '') : '', d && d.error, d && d.available]);
+    if (P.note.dataset.sig !== noteKey) {
+      P.note.dataset.sig = noteKey;
+      let note = null;
+      if (mode === 'loading') note = emptyNote(loadingMsg('moves', 'Loading the outside moves…'));
+      else if (mode === 'off') note = emptyNote(sentence(str(d.error), 'Outside-move alerts are off.'));
+      else if (str(d.error)) {
+        note = h('p', { class: 'inline-error' }, icon('warn'), h('span', null, h('strong', null, d.available === false ? 'The outside watcher is not running: ' : 'Outside watcher: '), sentence(str(d.error))));
+      }
+      rebuild(P.note, [note]);
+    }
+    const wanted = [P.note];
+    if (mode === 'on') {
+      safe('moves-venues', function () { renderMovesVenues(P, d); });
+      safe('moves-controls', renderMovesControls);
+      safe('moves-cards', function () { renderMovesCards(P, d); });
+      safe('moves-summary', function () { renderMovesSummary(P, d); });
+      safe('moves-filtered', function () { renderMovesFiltered(P, d); });
+      safe('moves-caveats', function () { renderMovesCaveats(P, d); });
+      wanted.push(P.venues.el, P.alerts.el, P.summary.el, P.filtered.el, P.caveats.el);
+    }
+    placeChildren(root, wanted);
+  }
+
+  /** The Strategy idea fact of an open outside-move alert (§19.5): "Cup lagging, +5.5 pts (2 min ago)" -> #moves. */
+  function outsideMoveFact(o, key) {
+    const m = o.outside_move && typeof o.outside_move === 'object' ? obj(o.outside_move) : null;
+    if (!m) return null;
+    const d = num(m.direction) != null && m.direction < 0 ? -1 : 1;
+    const label = str(m.status_label) || (MOVE_STATUS[str(m.status)] || [0, 'Outside move'])[1];
+    const link = h('a', { href: '#moves', class: 'move-fact-link', 'data-focus-key': 'st:' + key + ':move' }, icon((MOVE_STATUS[str(m.status)] || ['info'])[0]),
+      label + (num(m.move) != null ? ', ' + fmtPts(d * m.move) : ''), num(m.detected_at) != null ? [' (', timeEl(m.detected_at, 'ago'), ')'] : '');
+    return ['Outside move', link, 'An outside price moved on this outcome: the Outside moves view has the detail and the lag study', 'wide'];
+  }
+
+  /** The Simulation fair-value table's "moved" badge (§19.5). */
+  function fvMoveBadge(r) {
+    const m = r.move && typeof r.move === 'object' ? obj(r.move) : null;
+    if (!m) return null;
+    const label = str(m.status_label) || (MOVE_STATUS[str(m.status)] || [0, 'Outside move'])[1];
+    return h('span', { class: 'flags fv-move' }, h('a', { class: 'flag flag-move', href: '#moves', title: 'An open outside-move alert on this outcome: see Outside moves' },
+      icon((MOVE_STATUS[str(m.status)] || ['pulse'])[0]), 'moved: ' + label));
+  }
+
   // ---------------------------------------------------------------- render: high 90s
 
   /** Why the High 90s list is empty, or a note above a short list: the check needs 6 h of prices,
@@ -2512,14 +3426,40 @@
     return t.length ? h('ul', { class: 'fact-lines' }, t.map(function (x) { return h('li', null, x); })) : null;
   }
 
+  /** An idea's edge and expected return for its suggested size, at the expected average fill (fill_price) that size
+   *  is priced at, instead of at the touch (entry_price, the best price alone): { fill, edge, ret }, or null when the
+   *  fill is no worse than the touch, nothing is sized, or the idea is a resting order (a hole's edge is weighted by
+   *  the chance it fills). A taker's expected profit per share falls one for one with the price paid. */
+  function fillEdge(o) {
+    const fill = num(o.fill_price), entry = num(o.entry_price), edge = num(o.edge);
+    if (fill == null || entry == null || edge == null || !(fill > 0) || !(num(o.suggested_shares) > 0)) return null;
+    if (str(o.order_type) === 'maker' || str(o.kind) === 'hole' || fill - entry < 0.0005) return null;
+    const e = edge - (fill - entry);
+    return { fill: fill, edge: e, ret: e / fill };
+  }
+
+  /** The probability fact of an idea card: a hole's prob_win is the chance its resting order fills (§5.4), not the
+   *  chance the outcome wins, so it is labelled as such. */
+  function winFact(o) {
+    if (str(o.kind) === 'hole') {
+      return ['Chance it fills', fmtPct0(o.prob_win),
+        'The chance this resting order fills at all: most resting orders this far under the bid never fill. It is not the chance the outcome wins.'];
+    }
+    return ['Win probability', fmtPct0(o.prob_win), num(o.prob_win) == null ? 'Not estimated for this kind of idea' : null];
+  }
+
   /** The paper-trading facts of an idea (docs/PAPER_TRADING.md §8.3), each only when the server sent it. */
   function ideaPaperFacts(o) {
     const per = sizeUnit(o, 1);
     const out = [];
     const fv = num(o.fair_value);
     if (fv != null) {
-      out.push(['Fair value', fmtPrice(fv) + ' (' + fvSourceLabel(o.fair_source) + (num(o.fv_uncertainty) != null ? ', ' + fmtCents(o.fv_uncertainty) : '') + ')',
-        'The outside fair value of the contract bought, and its own uncertainty', 'wide']);
+      // strategy-9: a longshot value idea is priced (edge, limit, exit target) on the shrunk value, not the outside one
+      const shrunk = str(o.kind) === 'value' && fv < 0.15 && num(o.prob_win) != null && o.prob_win < fv - 0.0005 ? num(o.prob_win) : null;
+      out.push(['Fair value', fmtPrice(fv) + ' (' + fvSourceLabel(o.fair_source) + (num(o.fv_uncertainty) != null ? ', ' + fmtCents(o.fv_uncertainty) : '') + ')' +
+        (shrunk != null ? '; valued at ' + fmtPrice(shrunk) + ' as a longshot' : ''),
+        shrunk != null ? 'The outside fair value of the contract bought; longshots tend to be overpriced, so the edge, the limit and the exit target use it shrunk to ' + fmtPrice(shrunk)
+          : 'The outside fair value of the contract bought, and its own uncertainty', 'wide']);
     }
     const limit = num(o.limit_price);
     if (limit != null) {
@@ -2574,8 +3514,27 @@
       str(sz.mode) ? ['Mode', str(sz.mode).replace(/_/g, ' ') + (sz.kept_by_hysteresis ? ' (kept by hysteresis)' : ''), null, 'wide'] : null,
       ['Top-3 bar', bar && num(bar.value) != null ? fmtInt(bar.value) + ' ' + currency() + range : 'unknown', 'Sized from the lower end of the range', 'wide'],
       ['M', m == null ? DASH : m.toFixed(1), m == null ? null : 'The bar divided by the portfolio value (' + m.toFixed(3) + ')'],
-      ['Chance ceiling', num(sz.markov_ceiling) == null ? DASH : fmtPct0(sz.markov_ceiling), 'Markov bound: the most likely a strategy with this expected multiple reaches the bar'],
+      // a bound, not an estimate (D32): "at most", and the Markov sentence in the lines under the tiles
+      ['Chance of reaching the bar', num(sz.markov_ceiling) == null ? DASH : 'at most ' + fmtPct0(sz.markov_ceiling),
+        'An upper bound (Markov), not an estimate: the real chance is usually far lower, especially at quarter-Kelly', 'wide'],
     ]);
+  }
+
+  /** The Markov sentence of docs/PAPER_TRADING.md §5.6.3 (D32), built from markov_ceiling, ev_multiple and M when the
+   *  policy's own lines do not carry it (the conservative policy's do not); null when it cannot be stated. */
+  function markovSentence(sz) {
+    if (texts(sz.lines).some(function (t) { return /with probability at most/i.test(t); })) return null;
+    const m = num(sz.M), ev = num(sz.ev_multiple), p = num(sz.markov_ceiling);
+    if (m == null || !(m > 0) || p == null) return null;
+    return (ev != null ? 'A strategy whose expected multiple is ' + ev.toFixed(2) + 'x reaches ' : 'A strategy reaches ') + m.toFixed(1) +
+      'x with probability at most ' + fmtPct0(p) + '; with no edge (fair prices) the bound is 1/M = ' + fmtPct0(Math.min(1, 1 / m)) + '.';
+  }
+
+  /** A sizing explain()'s lines, with the Markov sentence first when the policy left it out. */
+  function sizingLines(sz) {
+    const markov = markovSentence(sz);
+    const lines = (markov ? [markov] : []).concat(texts(sz.lines));
+    return lines.length ? h('ul', { class: 'notes sizing-lines' }, lines.map(function (t) { return h('li', null, t); })) : null;
   }
 
   function sizingPanel(d) {
@@ -2584,13 +3543,13 @@
     const panel = h('section', { class: 'panel', 'aria-labelledby': 'h-sizing' },
       h('h3', { class: 'panel-title', id: 'h-sizing' }, 'Sizing: ' + (str(sz.label) || str(sz.policy) || 'conservative')),
       sizingFacts(sz),
-      texts(sz.lines).length ? h('ul', { class: 'notes sizing-lines' }, texts(sz.lines).map(function (t) { return h('li', null, t); })) : null,
+      sizingLines(sz),
       h('p', { class: 'muted-note regime-note' }, icon('info'), sentence(regimeText(d.settlement_regime))));
     if (alt) {
       panel.appendChild(h('details', { class: 'alt-sizing' },
         h('summary', null, icon('chevron', 'chev'), 'The other policy: ' + (str(alt.label) || str(alt.policy))),
         sizingFacts(alt),
-        texts(alt.lines).length ? h('ul', { class: 'notes sizing-lines' }, texts(alt.lines).map(function (t) { return h('li', null, t); })) : null));
+        sizingLines(alt)));
     }
     return panel;
   }
@@ -2613,10 +3572,23 @@
       ? fmtInt(shares) + ' ' + sizeUnit(o, shares) + ' · ' + fmtMoney(o.suggested_cost) + ' ' + currency()
       : 'none yet: wait for confirmation';
     const per = sizeUnit(o, 1);
+    // The suggested size walks the book: its edge and return are stated at the expected average fill it is priced at
+    // (suggested_cost, and how the simulator fills), with the best-price (touch) figures beside them, never those alone.
+    const fe = fillEdge(o);
+    const atTouch = function (main, touch) {
+      return fe ? [main, h('span', { class: 'fact-sub' }, ' (' + touch + ' at the best price)')] : main;
+    };
     const facts = factList([
-      ['Win probability', fmtPct0(o.prob_win), num(o.prob_win) == null ? 'Not estimated for this kind of idea' : null],
-      ['Edge per ' + per, num(o.edge) == null ? DASH : fmtSigned(o.edge), 'Expected profit per ' + per + ' after the stop'],
-      ['Expected return', fmtPctOf(o.expected_return), 'Edge as a share of the entry price'],
+      outsideMoveFact(o, key),
+      winFact(o),
+      ['Edge per ' + per, num(o.edge) == null ? DASH : atTouch(fmtSigned(fe ? fe.edge : o.edge), fmtSigned(o.edge)),
+        fe ? 'Expected profit per ' + per + ' after the stop, at the expected average fill ' + fmtPrice(fe.fill) + ' of the suggested size; at the best price ' +
+          fmtPrice(o.entry_price) + ' alone it would be ' + fmtSigned(o.edge)
+          : 'Expected profit per ' + per + ' after the stop'],
+      ['Expected return', atTouch(fmtPctOf(fe ? fe.ret : o.expected_return), fmtPctOf(o.expected_return)),
+        fe ? 'Edge as a share of the expected average fill of the suggested size' : 'Edge as a share of the entry price'],
+      fe ? ['Expected average fill', fmtPrice(fe.fill) + ' per ' + per + ' for ' + fmtInt(shares) + ' ' + sizeUnit(o, shares) + ' (best price ' + fmtPrice(o.entry_price) + ')',
+        'The suggested size takes more than the best price offers: this is the expected average price it fills at, and what its cost is priced at', 'wide'] : null,
       ['Suggested size', sizeText, null, 'wide'],
       ['Score', fmtScore(o.score), 'Expected growth: the profit in % of equity at the conservative size × confidence, adjusted for the risk mode'],
       ['Confidence', fmtPct0(o.confidence)],
@@ -2654,7 +3626,7 @@
     const status = str(d.backtest_status);
     const bt = d.backtest ? obj(d.backtest) : null;
     if (!bt) {
-      if (status === 'error') panel.appendChild(h('p', null, 'The backtest failed: ' + (str(d.backtest_error) || 'unknown error') + '. It retries in a minute.'));
+      if (status === 'error') panel.appendChild(h('p', null, sentence('The backtest failed: ' + (str(d.backtest_error) || 'unknown error')) + ' It retries in a minute.'));
       else panel.appendChild(h('p', { class: 'pending-note' }, h('span', { class: 'spinner', 'aria-hidden': 'true' }),
         'Replaying the last 7 days of prices to measure how often surges reverted. This takes a few seconds.'));
       return panel;
@@ -2928,6 +3900,13 @@
   // The equity chart also starts minutes into a run: allow minute steps before the shared 15-minute ones.
   const SIM_TICK_STEPS = [60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 14400, 21600, 43200, 86400, 172800];
 
+  // The equity chart's y axis spans at least this share of the start capital on each side of the start line (±0.5%).
+  const SIM_MIN_HALF_SPAN = 0.005;
+
+  // docs/PAPER_TRADING.md TABLE_WARNING ("{n}" = the number of portfolios), for payloads without their own
+  // table_warning (the backtest report).
+  const TABLE_WARNING_TEXT = 'The best of {n} portfolios looks better than it is by chance: judge the headline, and confirm any single kind on data recorded later.';
+
   const EXIT_REASONS = {
     target: 'Reached its target', stop: 'Stopped out', time: 'Time limit reached', settled: 'Settled', refund: 'Refunded',
     converged: 'Converged: the gap closed', fair_value: 'The fair value moved', regime: 'Closed before the Cup end (settlement rule)',
@@ -2943,7 +3922,7 @@
 
   const PROVIDER_STATUS = {
     ok: 'answering', partial: 'partly answering', offline: 'offline from this machine', backoff: 'backing off after errors',
-    disabled: 'off', error: 'failing',
+    disabled: 'off', error: 'failing', pending: 'not asked yet',
   };
 
   const PROVIDER_NAMES = { polymarket: 'Polymarket', kalshi: 'Kalshi', manual: 'Your fair-value file', demo: 'Demo feed' };
@@ -2998,14 +3977,30 @@
     return fmtInt(n) + ' ' + (Math.round(num(n) || 0) === 1 ? one : many || one + 's');
   }
 
+  /** The direction of a P&L amount from its sign at cent precision (not from the whole-SUSQie rounding, so a
+   *  −0.42 loss reads as a loss): "up", "down" or "flat" (under half a cent either way). */
+  function pnlDir(v) {
+    v = num(v);
+    if (v == null) return 'flat';
+    const r = Number(v.toFixed(2));
+    return r > 0 ? 'up' : r < 0 ? 'down' : 'flat';
+  }
+
+  /** A signed P&L amount: whole SUSQies, or cents when it is under one SUSQie ("−0.42"), so a non-zero amount
+   *  never reads as "0". */
+  function fmtPnl(v) {
+    v = num(v);
+    if (v == null) return DASH;
+    return fmtSignedMoney(v, pnlDir(v) !== 'flat' && Math.abs(v) < 0.5 ? 2 : 0);
+  }
+
   /** A P&L amount with an up/down marker (the marker is decoration; the sign says it in text). */
   function pnlEl(v) {
     v = num(v);
     if (v == null) return h('span', { class: 'nil' }, DASH);
-    const r = Math.round(v);
-    const dir = r > 0 ? 'up' : r < 0 ? 'down' : 'flat';
+    const dir = pnlDir(v);
     return h('span', { class: 'pnl delta ' + dir, title: fmtSignedMoney(v, 2) + ' ' + currency() },
-      h('span', { class: 'arrow', 'aria-hidden': 'true' }, dir === 'up' ? '▲' : dir === 'down' ? '▼' : '●'), fmtSignedMoney(v));
+      h('span', { class: 'arrow', 'aria-hidden': 'true' }, dir === 'up' ? '▲' : dir === 'down' ? '▼' : '●'), fmtPnl(v));
   }
 
   function levelBadge(v) {
@@ -3015,6 +4010,20 @@
     const label = v.exploratory === true ? 'Exploratory: ' + lv[1].charAt(0).toLowerCase() + lv[1].slice(1) : lv[1];
     return h('span', { class: 'verdict-level level-' + key + (v.exploratory === true ? ' is-exploratory' : ''), title: lv[2] || null },
       icon(lv[0]), label);
+  }
+
+  /** The verdict caveats (VERDICT_CAVEATS, D54) as the block that sits directly under a verdict; null when none. */
+  function verdictCaveats(list) {
+    const t = texts(list);
+    if (!t.length) return null;
+    return h('div', { class: 'verdict-caveats' },
+      h('h4', { class: 'card-section-title' }, icon('info'), 'What this result cannot tell you yet'),
+      h('ul', null, t.map(function (x) { return h('li', null, x); })));
+  }
+
+  /** TABLE_WARNING (D4) for a table of n portfolios, when the payload carries none of its own. */
+  function tableWarning(n) {
+    return TABLE_WARNING_TEXT.replace('{n}', fmtInt(n));
   }
 
   function shortPortfolio(pid, label) {
@@ -3123,7 +4132,11 @@
     }
     const wanted = [];
     if (mode === 'loading' || mode === 'off' || mode === 'failed' || (mode === 'waiting' && !(d.run && typeof d.run === 'object'))) wanted.push(SIM.note);
-    if (mode === 'waiting' && d.run && typeof d.run === 'object') wanted.push(safeSim('clock', function () { return renderSimClock(d); }));
+    if (mode === 'waiting' && d.run && typeof d.run === 'object') {
+      wanted.push(safeSim('clock', function () { return renderSimClock(d); }));
+      // right after a reset the new run has no step yet: the run that just ended is exactly what the user looks for
+      if (SIM.previousOpen) wanted.push(safeSim('previous', renderSimPrevious));
+    }
     if (mode === 'run') {
       wanted.push(safeSim('clock', function () { return renderSimClock(d); }));
       if (SIM.previousOpen) wanted.push(safeSim('previous', renderSimPrevious));
@@ -3229,10 +4242,15 @@
       ['Code version', str(run.code_version) || DASH, null, 'wide'],
       ['Changed settings', pnames.length ? pnames.map(function (n) { return n + ' = ' + str(params[n]); }).join(', ') : 'none (defaults)', null, 'full'],
     ]);
+    // ui-4: the account was unknown when this run started (and something filled before it became known)
+    const defaultCap = /^default\b/i.test(str(run.capital_source));
     rebuild(p.facts, [
       waiting ? h('p', { class: 'pending-note' }, h('span', { class: 'spinner', 'aria-hidden': 'true' }),
         'Waiting for the first simulated step (every ' + fmtSpan(simInterval(d)) + ').') : null,
       factList(items, 'sim-facts'),
+      defaultCap ? h('p', { class: 'muted-note sim-flag-line default-capital' }, icon('warn'),
+        'Your account value was not known when this run started, so every portfolio started with the default ' + (cap == null ? '100,000' : fmtInt(cap)) + ' ' + currency() +
+        ', not your own value: the sizes and percentages are relative to that. Reset the run to start it on your account value.') : null,
       h('p', { class: 'muted-note regime-note' }, icon('info'), sentence(regimeText(run.regime))),
       simDetails('settings', 'This run’s settings', h('div', { class: 'sim-details-body' }, settingsList,
         h('p', { class: 'muted-note' }, 'A run continues after a restart only with the same settings and code; otherwise it ends ("settings changed") and a new one starts.'))),
@@ -3291,15 +4309,23 @@
       const hv = obj(prev.headline).verdict ? obj(obj(prev.headline).verdict) : obj(verdicts[hid] || (ports.filter(function (x) { return str(x.portfolio_id) === hid; })[0] || {}).verdict);
       const rows = ports.map(function (pt) {
         const v = obj(verdicts[str(pt.portfolio_id)] || pt.verdict);
-        return h('tr', null,
+        return h('tr', { 'data-pid': str(pt.portfolio_id) || null },
           h('th', { scope: 'row' }, shortPortfolio(pt.portfolio_id, pt.label)),
           h('td', { class: 'num' }, pnlEl(pt.pnl_liq)),
           h('td', null, str(v.level) ? levelBadge(v) : DASH));
       });
+      // The ended run's verdict is the one a reset, a "settings changed" end or a finished 24-hour test leaves the
+      // student with (D60): it carries the same caveats (D54), table warning (D4) and demo caveat as the live panels.
+      const demo = prev.demo === true ? texts(prev.caveats).filter(function (t) { return /^Demo data\b/.test(t); })[0] || '' : '';
+      const warning = str(prev.table_warning) || (rows.length > 1 ? tableWarning(rows.length) : '');
       return [
         h('p', null, 'Ended ', num(ended) == null ? DASH : timeEl(ended, 'short'), reason ? ' (' + (EXIT_REASONS[reason] || reason) + ')' : '',
           str(run.run_id) ? h('span', { class: 'muted-note' }, ' · ' + str(run.run_id)) : null),
         str(hv.level) ? h('div', { class: 'sim-verdict' }, levelBadge(hv), h('p', { class: 'verdict-sentence' }, str(hv.sentence))) : null,
+        // headline.verdict_caveats; an older final snapshot without it: the verdict's own first caveats (VERDICT_CAVEATS 0-3)
+        str(hv.level) ? verdictCaveats(texts(obj(prev.headline).verdict_caveats).length ? obj(prev.headline).verdict_caveats : texts(hv.caveats).slice(0, 4)) : null,
+        demo ? h('p', { class: 'muted-note sim-flag-line demo-caveat' }, icon('warn'), demo) : null,
+        rows.length && warning ? h('p', { class: 'table-warning' }, icon('warn'), warning) : null,
         rows.length ? tableWrap('Previous run portfolios', h('table', { class: 'data-table sim-table' },
           h('caption', { class: 'sr-only' }, 'Each portfolio of the previous run at its end'),
           h('thead', null, h('tr', null, h('th', { scope: 'col' }, 'Portfolio'), h('th', { scope: 'col', class: 'num' }, 'P&L at liquidation'), h('th', { scope: 'col' }, 'Verdict'))),
@@ -3327,22 +4353,25 @@
     fillPanel(p, sig([hl, currency()]), function () {
       if (!str(hl.portfolio_id) && !str(v.level)) return [h('p', { class: 'muted-note' }, 'No headline portfolio yet.')];
       const pnl = num(hl.pnl_liq);
-      const r = pnl == null ? 0 : Math.round(pnl);
-      const word = pnl == null ? '' : r > 0 ? 'profit' : r < 0 ? 'loss' : '(no profit or loss yet)';
+      const dir = pnlDir(pnl);
+      const word = pnl == null ? '' : dir === 'up' ? 'profit' : dir === 'down' ? 'loss' : '(no profit or loss yet)';
       const unvalued = num(hl.unvalued) || 0;
       const nUnvalued = num(v.unvalued_positions) || 0;
       const depth = num(hl.depth_unknown_share);
+      // ui-3: "all ideas" did not include value ideas when the outside prices were off or offline: say so at the label
+      const untested = texts(hl.untested).length ? texts(hl.untested) : texts(v.untested);
       return [
         h('p', { class: 'sim-label' }, str(hl.label) || shortPortfolio(hl.portfolio_id)),
+        // short here (the verdict sentence below carries the full reason): "Value ideas were not tested (see the verdict)."
+        untested.length ? h('p', { class: 'muted-note sim-flag-line sim-untested', title: untested.join(' ') }, icon('warn'),
+          untested.map(function (t) { return t.split(':')[0].trim(); }).join('; ') + ' (see the verdict below), so this is not all ideas.') : null,
         h('p', { class: 'sim-pnl' }, pnlEl(pnl), ' ', h('span', { class: 'sim-pnl-unit' }, currency() + ' ' + word)),
         h('p', { class: 'sim-pnl-sub' }, fmtSignedPct(hl.pnl_liq_pct) + ' at liquidation value ',
-          h('span', { class: 'muted-note' }, '(at mid marks: ' + fmtSignedMoney(hl.pnl_mark) + ')')),
+          h('span', { class: 'muted-note' }, '(at mid marks: ' + fmtPnl(hl.pnl_mark) + ')')),
         h('div', { class: 'sim-verdict' }, str(v.level) ? levelBadge(v) : null,
           h('p', { class: 'verdict-sentence' }, str(v.sentence) || 'No verdict yet.')),
         texts(v.reasons).length ? h('ul', { class: 'reasons verdict-reasons' }, texts(v.reasons).map(function (t) { return h('li', null, t); })) : null,
-        texts(hl.verdict_caveats).length ? h('div', { class: 'verdict-caveats' },
-          h('h4', { class: 'card-section-title' }, icon('info'), 'What this result cannot tell you yet'),
-          h('ul', null, texts(hl.verdict_caveats).map(function (t) { return h('li', null, t); }))) : null,
+        verdictCaveats(hl.verdict_caveats),
         unvalued > 0 || nUnvalued > 0 ? h('p', { class: 'muted-note sim-flag-line' }, icon('warn'),
           (nUnvalued > 0 ? plural(nUnvalued, 'position') : 'Positions') + ' whose market closed without a ruling ' + (nUnvalued === 1 ? 'is' : 'are') +
           ' left out of the result (last value ' + fmtMoney(unvalued, 0) + ' ' + currency() + ').') : null,
@@ -3462,7 +4491,7 @@
   function eqSummary(d) {
     const n = simPortfolios(d).length;
     const hl = obj(d.headline);
-    return plural(n, 'portfolio') + '; headline (you, by hand): ' + fmtSignedMoney(hl.pnl_liq) + ' at liquidation';
+    return plural(n, 'portfolio') + '; headline (you, by hand): ' + fmtPnl(hl.pnl_liq) + ' at liquidation';
   }
 
   function renderSimEquity(d) {
@@ -3502,7 +4531,9 @@
     const series = eqSeries(d);
     const summary = eqSummary(d);
     setAttr(p.host, 'aria-label', 'Equity curves: ' + summary);
-    setText(p.summary, summary + '. Profit is the liquidation value: what selling every position into the visible bids would fetch.');
+    const pct = num(obj(d.headline).pnl_liq_pct);
+    setText(p.summary, summary + (pct != null ? ' (' + fmtSignedPct(pct) + ' of the start capital)' : '') +
+      '. Profit is the liquidation value: what selling every position into the visible bids would fetch.');
     // legend: one toggle button per portfolio (the headline listed first, as in the table)
     const lkey = sig([series.map(function (s) { return [s.pid, s.label, s.style]; }), Array.from(SIM.hidden).sort()]);
     if (p.legend.dataset.sig !== lkey) {
@@ -3562,7 +4593,13 @@
     if (t1 - t0 < 60) t1 = t0 + 60;
     let lo = Infinity, hi = -Infinity;
     for (const s of vis) for (const q of s.pts) { lo = Math.min(lo, q[1]); hi = Math.max(hi, q[1]); }
-    if (start != null) { lo = Math.min(lo, start); hi = Math.max(hi, start); }
+    // The y axis always spans at least ±0.5% of the start capital around the start line, so the slope shows the
+    // economic size of a move: +30 on 100,000 (+0.03%) stays a near-flat line instead of filling the plot.
+    if (start != null) {
+      const half = Math.max(10, Math.abs(start) * SIM_MIN_HALF_SPAN);
+      lo = Math.min(lo, start - half);
+      hi = Math.max(hi, start + half);
+    }
     if (hi - lo < 20) { const m = (hi + lo) / 2; lo = m - 10; hi = m + 10; }
     const pad = (hi - lo) * 0.08;
     lo -= pad; hi += pad;
@@ -3605,7 +4642,7 @@
       const ex = X(last[0]), ey = Y(last[1]);
       svg.appendChild(svgEl('circle', { class: 'end-dot eq-headline-dot', cx: ex.toFixed(1), cy: ey.toFixed(1), r: 4 }));
       const pnl = start != null ? last[1] - start : null;
-      const text = 'You, by hand' + (pnl != null ? ' ' + fmtSignedMoney(pnl) : '');
+      const text = 'You, by hand' + (pnl != null ? ' ' + fmtPnl(pnl) : '');
       if (narrow) svg.appendChild(svgEl('text', { class: 'end-label', x: (ex - 8).toFixed(1), y: (ey - 9).toFixed(1), 'text-anchor': 'end' }, text));
       else svg.appendChild(svgEl('text', { class: 'end-label', x: (ex + 8).toFixed(1), y: (ey + 4).toFixed(1) }, text));
     }
@@ -3760,7 +4797,12 @@
       const kk = KINDS[k];
       const bits = [plural(e.entries, 'entry', 'entries') + ', ' + fmtInt(e.filled) + ' filled' + (num(e.fill_rate) != null ? ' (' + fmtPct0(e.fill_rate) + ')' : '')];
       if (num(e.avg_slippage) != null) bits.push('average slippage ' + fmtSigned(e.avg_slippage) + ' per share');
-      if (num(e.unfilled) > 0) bits.push(plural(e.unfilled, 'signal') + ' that did not fill would show ' + fmtSignedMoney(e.unfilled_pnl_now) + ' now');
+      if (num(e.unfilled) > 0) {
+        // the "would show X now" clause only when the server could value the missed signals (not for holes)
+        bits.push(num(e.unfilled_pnl_now) != null
+          ? plural(e.unfilled, 'signal') + ' that did not fill would show ' + fmtPnl(e.unfilled_pnl_now) + ' now'
+          : plural(e.unfilled, 'signal') + ' did not fill');
+      }
       if (num(e.exits) > 0) bits.push(plural(e.exits, 'exit') + (num(e.avg_exit_slippage) != null ? ', exit slippage ' + fmtSigned(e.avg_exit_slippage) : ''));
       return h('li', null, h('strong', null, (kk ? kk[1] : k) + ': '), bits.join('; '));
     }));
@@ -3786,12 +4828,15 @@
       h('td', { class: 'num' }, pnlEl(pt.pnl_liq)),
       h('td', { class: 'num' }, fmtSignedPct(pt.pnl_liq_pct)),
       h('td', { class: 'num' }, fmtInt(closed) + ' / ' + fmtInt(open)),
-      h('td', { class: 'num' }, wr == null ? DASH : fmtPct0(wr), h('span', { class: 'cell-sub' }, fmtInt(pt.wins) + ' of ' + fmtInt(pt.trades_closed))),
+      h('td', { class: 'num' }, wr == null ? DASH : fmtPct0(wr), h('span', { class: 'cell-sub' }, fmtInt(pt.wins) + ' of ' + fmtInt(pt.trades_closed)),
+        // ui-7: legging exits are fragments of sets still held, not closed ideas: listed apart from the win rate
+        num(pt.legging_trades) > 0 ? h('span', { class: 'cell-sub legging-sub', title: 'Part of a basket sold because its other legs did not fill; the set is still an open idea' },
+          plural(pt.legging_trades, 'legging exit') + ' ' + fmtPnl(pt.legging_pnl) + ', not counted') : null),
       h('td', { class: 'num' }, fmtPctOf(pt.max_drawdown), h('span', { class: 'cell-sub' }, fmtMoney(pt.max_drawdown_abs, 0))),
       h('td', { class: 'num' }, fmtInt(pt.positions_open)),
       h('td', { class: 'num' }, num(pt.latency_s) == null ? DASH : fmtSpan(pt.latency_s)),
       h('td', { class: 'cell-verdict' }, str(v.level) ? levelBadge(v) : DASH),
-      h('td', { class: 'num' }, fv == null || start == null ? DASH : fmtSignedMoney(fv - start)));
+      h('td', { class: 'num' }, fv == null || start == null ? DASH : fmtPnl(fv - start)));
   }
 
   function renderSimPortfolios(d) {
@@ -3844,7 +4889,7 @@
         return h('div', { class: 'chaser-block' },
           ports.length > 1 ? h('h4', { class: 'card-section-title' }, shortPortfolio(pt.portfolio_id, pt.label)) : null,
           sizingFacts(sz),
-          texts(sz.lines).length ? h('ul', { class: 'notes sizing-lines' }, texts(sz.lines).map(function (t) { return h('li', null, t); })) : null);
+          sizingLines(sz));
       }).concat([h('p', { class: 'muted-note sim-flag-line' }, icon('warn'),
         'The chaser accepts large, correlated swings to try to reach the top 3; it can also lose most of its capital.')]);
     });
@@ -3920,7 +4965,10 @@
               h('td', null, sidePill(x.side)),
               h('td', { class: 'num' }, fmtInt(x.qty)),
               h('td', { class: 'num' }, fmtPrice(x.avg_cost)),
-              h('td', { class: 'num' }, fmtMoney(x.liq_value, 2)),
+              h('td', { class: 'num' }, x.unvalued === true
+                ? h('span', { class: 'unvalued', title: 'The market closed without a ruling: counted as 0 in the result until it is ruled on' },
+                  'unvalued', h('span', { class: 'cell-sub' }, num(x.last_liq_value) != null ? '(last ' + fmtMoney(x.last_liq_value, 2) + ')' : ''))
+                : fmtMoney(x.liq_value, 2)),
               h('td', { class: 'num' }, pnlEl(x.unrealized_liq)),
               h('td', { class: 'cell-wrap' }, str(x.exit_note) || str(obj(x.exit_plan).note) || DASH),
               h('td', null, positionFlags(x)));
@@ -3943,11 +4991,13 @@
                   const ps = byPos[pid + ':' + str(l.exchange_id)] || {};
                   return h('li', null, h('span', { class: 'leg-action' }, str(l.side).toUpperCase() + ' ' + fmtInt(l.qty)), ' ',
                     outcomeLink(l.exchange_id, ps.title || ('Outcome ' + str(l.exchange_id)), ps.option, 'leg:' + pid),
-                    h('span', { class: 'leg-market' }, ' · ' + fmtMoney(l.liq_value, 2) + ' now'));
+                    h('span', { class: 'leg-market' }, ' · ' + fmtMoney(l.liq_value, 2) + ' now'),
+                    num(l.naked_qty) > 0.0005 ? h('span', { class: 'leg-naked' }, ' · ' + fmtInt(l.naked_qty) + ' naked, no floor') : null);
                 }))),
                 h('td', { class: 'num' }, fmtInt(b.sets)),
                 h('td', { class: 'num' }, fmtMoney(b.cost, 2)),
-                h('td', { class: 'num' }, fmtMoney(b.floor_value, 2)),
+                h('td', { class: 'num' }, fmtMoney(b.floor_value, 2),
+                  num(b.naked_qty) > 0.0005 ? h('span', { class: 'cell-sub basket-naked' }, plural(Math.round(b.naked_qty), 'naked share') + ' beyond the sets: no floor') : null),
                 h('td', { class: 'num' }, fmtMoney(b.liq_value, 2)));
             }))), 'pin-first'));
       }
@@ -4086,7 +5136,7 @@
     }
     if (overlap.length || num(r.overlap_hours) > 0) {
       out.push(h('div', { class: 'banner banner-warning bt-overlap' }, icon('warn', 'icon-lg'), h('div', { class: 'banner-body' },
-        h('p', null, overlap[0] || fmtHours(r.overlap_hours) + ' of this window were also seen by the live paper run: a backtest over the same data is not an independent check, so agreement between the two is not evidence.'))));
+        h('p', null, overlap[0] || fmtHours(r.overlap_hours) + ' of this window were also seen by a paper run (the current one, or one that ended or was reset): a backtest over the same data is not an independent check, so agreement between the two is not evidence.'))));
     }
     const cov = coverageSentences(r.coverage);
     if (cov.length) out.push(h('h4', { class: 'card-section-title' }, 'Coverage'), h('ul', { class: 'notes' }, cov.map(function (x) { return h('li', null, x); })));
@@ -4094,15 +5144,20 @@
     const ports = objs(r.portfolios);
     const verdicts = obj(r.verdicts);
     if (ports.length) {
+      const warning = str(r.table_warning) || (ports.length > 1 ? tableWarning(ports.length) : '');
       out.push(h('h4', { class: 'card-section-title' }, 'Portfolios in the replay'),
+        warning ? h('p', { class: 'table-warning' }, icon('warn'), warning) : null,
         tableWrap('Backtest portfolios', h('table', { class: 'data-table sim-table bt-table' },
           h('caption', { class: 'sr-only' }, 'Each portfolio over the replayed window, at liquidation value'),
           h('thead', null, h('tr', null, h('th', { scope: 'col' }, 'Portfolio'), h('th', { scope: 'col', class: 'num' }, 'P&L at liquidation'),
             h('th', { scope: 'col', class: 'num' }, 'Ideas (closed / open)'), h('th', { scope: 'col' }, 'Verdict'))),
           h('tbody', null, ports.map(function (pt) {
             const v = obj(verdicts[str(pt.portfolio_id)] || pt.verdict);
+            // accounting-4: this column includes assumed (candle / synthetic-book) fills; the verdict leaves them out
+            const assumed = num(v.synthetic_pnl);
             return h('tr', null, h('th', { scope: 'row' }, labels[str(pt.portfolio_id)] || shortPortfolio(pt.portfolio_id, pt.label)),
-              h('td', { class: 'num' }, pnlEl(pt.pnl_liq)),
+              h('td', { class: 'num' }, pnlEl(pt.pnl_liq), assumed != null && Math.abs(assumed) >= 0.005 && num(v.pnl_liq) != null
+                ? h('span', { class: 'cell-sub assumed-sub' }, fmtPnl(v.pnl_liq) + ' without assumed fills') : null),
               h('td', { class: 'num' }, fmtInt(num(v.closed_trades) != null ? v.closed_trades : pt.trades_closed) + ' / ' + fmtInt(num(v.open_ideas) != null ? v.open_ideas : pt.positions_open)),
               h('td', null, str(v.level) ? levelBadge(v) : DASH));
           }))), 'pin-first'));
@@ -4119,7 +5174,10 @@
         h('thead', null, h('tr', null, h('th', { scope: 'col' }, 'Settings'), h('th', { scope: 'col', class: 'num' }, 'P&L at liquidation'),
           h('th', { scope: 'col', class: 'num' }, 'Closed trades'), h('th', { scope: 'col' }, 'Verdict'), h('th', { scope: 'col', class: 'num' }, 'Max drawdown'))),
         h('tbody', null, sweep.map(function (s) {
-          return h('tr', null, h('th', { scope: 'row', class: 'cell-wrap' }, str(s.label) || sig(s.params)), h('td', { class: 'num' }, pnlEl(s.pnl_liq)),
+          const assumed = num(s.synthetic_pnl);
+          return h('tr', null, h('th', { scope: 'row', class: 'cell-wrap' }, str(s.label) || sig(s.params)),
+            h('td', { class: 'num' }, pnlEl(s.pnl_liq), assumed != null && Math.abs(assumed) >= 0.005 && num(s.verdict_pnl) != null
+              ? h('span', { class: 'cell-sub assumed-sub' }, fmtPnl(s.verdict_pnl) + ' without assumed fills') : null),
             h('td', { class: 'num' }, fmtInt(s.trades_closed)), h('td', null, str(s.verdict_level) ? levelBadge({ level: s.verdict_level }) : DASH),
             h('td', { class: 'num' }, fmtPctOf(s.max_drawdown)));
         })))));
@@ -4147,7 +5205,8 @@
       } else if (status === 'unavailable') {
         out.push(h('p', { class: 'bt-status' }, icon('info'), h('span', null, str(b.error) || 'The backtest is not available.')));
       } else {
-        out.push(h('p', { class: 'bt-status' }, icon('warn'), h('span', null, (str(b.error) || 'The backtest failed.') + ' It retries in a minute.')));
+        // the server's error ("The backtest failed: database is locked") has no final period of its own
+        out.push(h('p', { class: 'bt-status' }, icon('warn'), h('span', null, sentence(b.error, 'The backtest failed.') + ' It retries in a minute.')));
       }
       if (b.report && typeof b.report === 'object') {
         if (status !== 'ready') out.push(h('p', { class: 'muted-note' }, 'The previous result:'));
@@ -4218,7 +5277,7 @@
     const fix = SNIPPETS.filter(function (s) { return str(snippets[s[0]]); });
     const usable = fair ? fair.usable === true : false;
     return h('tr', { 'data-eid': eid, class: r.suspect === true ? 'is-suspect' : null },
-      h('th', { scope: 'row', class: 'cell-title' }, outcomeLink(eid, r.title, r.option, 'fv')),
+      h('th', { scope: 'row', class: 'cell-title' }, outcomeLink(eid, r.title, r.option, 'fv'), fvMoveBadge(r)),
       h('td', null, r.race_key ? raceText(r.race_key, r.party) : DASH),
       h('td', { class: 'num' }, fair && num(fair.value) != null ? fmtPrice(fair.value) : DASH,
         fair && num(fair.value) != null ? h('span', { class: 'cell-sub wrap' }, [fvSourceLabel(fair.source), str(fair.confidence) ? str(fair.confidence) + ' confidence' : '',
@@ -4262,10 +5321,11 @@
     const bits = [name + ': ' + (PROVIDER_STATUS[st] || st || 'unknown')];
     const extra = [];
     if (num(pv.matched) != null) extra.push(fmtInt(pv.matched) + ' matched, ' + fmtInt(pv.quoted) + ' quoted');
+    // live-4: a venue that has never answered says so (never a "last answer" it did not give); "pending" = not asked yet
     return h('li', { class: 'provider provider-' + (PROVIDER_STATUS[st] ? st : 'unknown') },
-      icon(st === 'ok' ? 'checkCircle' : st === 'partial' || st === 'backoff' ? 'pulse' : st === 'disabled' ? 'closed' : 'warn'),
+      icon(st === 'ok' ? 'checkCircle' : st === 'partial' || st === 'backoff' ? 'pulse' : st === 'disabled' ? 'closed' : st === 'pending' ? 'info' : 'warn'),
       h('span', null, h('strong', null, bits[0]), extra.length ? ' · ' + extra.join(', ') : '',
-        num(pv.last_ok_at) != null ? [' · last answer ', timeEl(pv.last_ok_at, 'ago')] : '',
+        num(pv.last_ok_at) != null ? [' · last answer ', timeEl(pv.last_ok_at, 'ago')] : st === 'offline' || st === 'error' || st === 'backoff' ? ' · never answered' : '',
         num(pv.next_try_at) != null ? [' · next try ', timeEl(pv.next_try_at, 'ago')] : '',
         str(pv.last_error) ? h('span', { class: 'cell-sub wrap' }, shortProblem(pv.last_error)) : null));
   }
@@ -4452,6 +5512,7 @@
       if (String(x.exchange_id) === sid) return pick(x.title, x.option);
     }
     for (const r of objs(S.data.fairvalue && S.data.fairvalue.rows)) if (String(r.exchange_id) === sid) return pick(r.title, r.option);
+    for (const a of objs(S.data.moves && S.data.moves.alerts)) if (String(a.exchange_id) === sid) return pick(a.title, a.option);
     return null;
   }
 
@@ -5518,6 +6579,7 @@
   }
 
   function init() {
+    initMovesAlerts();
     for (const b of document.querySelectorAll('[data-theme-choice]')) {
       b.addEventListener('click', function () { setTheme(b.dataset.themeChoice); });
     }
@@ -5646,10 +6708,13 @@
     window.addEventListener('hashchange', function () { route(true); });
     document.addEventListener('visibilitychange', function () {
       if (document.hidden) {
-        clearTimeout(S.pollTimer);
-        S.pollTimer = null;
         clearTimeout(S.drawer.timer);
         S.drawer.timer = null;
+        // outside-move sound or notifications on: the status poll goes on in the background
+        if (!alertsInBackground()) {
+          clearTimeout(S.pollTimer);
+          S.pollTimer = null;
+        }
       } else {
         poll();
         if (S.drawer.id) pollDrawer();

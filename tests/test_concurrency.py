@@ -1,4 +1,5 @@
-"""Thread safety of the paper trader inside the tracker (docs/PAPER_TRADING.md §6.15, §7.2, D43).
+"""Thread safety of the paper trader and the outside-move watcher inside the tracker (docs/PAPER_TRADING.md §6.15,
+§7.2, D43; docs/OUTSIDE_MOVES.md §12.3).
 
 Four threads poll ``paper_view()`` / ``status()`` (and the dashboard's ``paper()`` / ``status()``) while the main
 worker runs 200 fast demo steps and one reset: no exception, no deadlock (every call returns within 5 s, and the
@@ -19,6 +20,8 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, List, Tuple
+
+import pytest
 
 from supermarket_bot import pipeline, web
 from supermarket_bot.demo import SIM_T0, SimClock
@@ -123,5 +126,63 @@ def test_readers_never_block_or_break_the_paper_steps(tmp_path: Path) -> None:
         assert sum(p["fills"] for p in body["portfolios"]) == len(store.paper_fills(reset_ids[0], limit=None))
         final = previous["run"]["final"]["portfolios"]
         assert sum(p["fills"] for p in final) == len(store.paper_fills(previous["run"]["run_id"], limit=None))
+    finally:
+        runtime.close()
+
+
+def test_readers_never_block_or_break_the_outside_move_steps(tmp_path: Path) -> None:
+    """docs/OUTSIDE_MOVES.md §12.3 / §22: four threads read ``status()`` / ``moves_view()`` (and the dashboard's
+    ``outside_moves()`` / ``status()``) while the main thread runs 200 fast steps with the watcher sub-stepped every
+    15 s: no exception, no deadlock, every call returns within 5 s."""
+    clock = SimClock(SIM_T0)
+    runtime = web.build_demo(tmp_path, 30.0, out=io.StringIO(), clock=clock, news=False, paper=False, moves=True)
+    tracker, app = runtime.tracker, runtime.app
+    stop = threading.Event()
+    errors: List[BaseException] = []
+    slowest: List[Tuple[float, str]] = []
+    calls = [0]
+
+    def reader(name: str, fns: List[Callable[[], Any]]) -> None:
+        worst = (0.0, name)
+        try:
+            while not stop.is_set():
+                for fn in fns:
+                    started = time.monotonic()
+                    result = fn()
+                    worst = max(worst, (time.monotonic() - started, f"{name}:{getattr(fn, '__name__', fn)}"))
+                    assert result is not None
+                    calls[0] += 1
+                time.sleep(POLL_PAUSE_S)
+        except BaseException as exc:  # noqa: BLE001 - reported below
+            errors.append(exc)
+        finally:
+            slowest.append(worst)
+
+    readers = [
+        threading.Thread(target=reader, args=("m1", [tracker.status, tracker.moves_view]), daemon=True),
+        threading.Thread(target=reader, args=("m2", [tracker.moves_view, tracker.status]), daemon=True),
+        threading.Thread(target=reader, args=("m3", [app.outside_moves, app.status]), daemon=True),
+        threading.Thread(target=reader, args=("m4", [lambda: runtime.moves.status(), lambda: runtime.moves.summary()]),
+                         daemon=True),
+    ]
+    try:
+        for t in readers:
+            t.start()
+        started = time.monotonic()
+        pipeline.run_simulation(runtime, clock, hours=199 * 30 / 3600, step_s=30.0, moves_every_s=15.0, end_run=False)
+        assert time.monotonic() - started < TOTAL_LIMIT_S
+    finally:
+        stop.set()
+        for t in readers:
+            t.join(10)
+    try:
+        assert not errors, errors[0]
+        assert all(not t.is_alive() for t in readers)
+        assert calls[0] > 50
+        worst = max(slowest)
+        assert worst[0] < CALL_LIMIT_S, worst
+        status = tracker.status()["moves"]
+        assert status["steps"] == 399  # 200 steps + 199 sub-steps
+        assert tracker.moves_view()["alerts"]  # the demo's scripted moves alerted meanwhile
     finally:
         runtime.close()

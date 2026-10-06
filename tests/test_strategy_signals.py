@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import pytest
 
 from supermarket_bot import depth as D
+from supermarket_bot import sizing as Z
 from supermarket_bot import strategy as S
 from supermarket_bot.models import (
     SURGE_OPEN,
@@ -22,6 +23,7 @@ from supermarket_bot.models import (
     Opportunity,
     PricePoint,
     RaceRef,
+    SizingContext,
     StrategyInputs,
     StrategyParams,
     Surge,
@@ -687,8 +689,9 @@ class TestGenerateSignals:
                 assert o.limit_price == pytest.approx(sum(leg["limit"] for leg in o.legs))
             else:
                 assert o.limit_price == D.floor_tick(o.limit_price) or o.limit_price == o.entry_price
-        # both TX ideas bet on the Democrat winning (YES-D and NO-R): both kept
-        assert sorted(o.idea_id for o in signals if o.kind == "value") == ["value:x9026:yes", "value:x9027:no"]
+        # [updated, strategy-2] both TX ideas bet on the Democrat winning (YES-D and NO-R): one bet on one result, so
+        # only the better-scored one is kept (a tie here: the first idea id)
+        assert sorted(o.idea_id for o in signals if o.kind == "value") == ["value:x9026:yes"]
         json.dumps([o.to_dict() for o in signals], allow_nan=False)
 
     def test_deterministic_and_stable_ids(self) -> None:
@@ -770,3 +773,73 @@ class TestBasketWording:
         assert S._race_words(RaceRef("2026:SENATE_CONTROL:US", "SENATE_CONTROL", "US"), "k") == "control of the U.S. Senate"
         assert S._race_words(RaceRef("2026:HOUSE:AZ-01", "HOUSE", "AZ", district="AZ-01"), "k") == "the AZ-01 House race"
         assert S._race_words(None, "2026:SENATE:XX") == "2026:SENATE:XX"
+
+
+# --------------------------------------------------------------------------- strategy fixer regressions
+
+
+def tx_pair(*, r_bid: float = 0.495, books: bool = True) -> StrategyInputs:
+    """YES on the Texas Democrat and NO on the Texas Republican: both pay only if the Democrat wins."""
+    d_eid, r_eid = "9026", "9027"
+    infos = {d_eid: info(d_eid, "318"), r_eid: info(r_eid, "319", "Will the Republican Party win the Texas Senate?")}
+    db = book([(0.495, 50000)], [(0.505, 50000), (0.51, 50000)]) if books else None
+    rb = book([(r_bid, 50000), (r_bid - 0.005, 50000)], [(r_bid + 0.01, 50000)]) if books else None
+    latest = {d_eid: tick(0.495, 0.505, book=db), r_eid: tick(r_bid, r_bid + 0.01, book=rb)}
+    fvs = {d_eid: fv(0.58, eid=d_eid, unc=0.005), r_eid: fv(0.42, eid=r_eid, unc=0.005)}
+    races = {d_eid: race("TX", "D"), r_eid: race("TX", "R")}
+    return StrategyInputs(now=NOW, cup_end=CUP_END, infos=infos, latest=latest, fair_values=fvs, races=races)
+
+
+class TestStrategyFixerRegressions:
+    def test_strategy_2_same_winner_legs_are_one_value_idea(self) -> None:
+        inp = tx_pair()
+        values = [o for o in S.generate_signals(inp) if o.kind == "value"]
+        assert [o.idea_id for o in values] == ["value:x9026:yes"]  # NO on x9027 is the same bet: dropped
+        # alone, the NO-R leg is an idea of its own (the rule removes only the duplicate)
+        alone = copy.deepcopy(inp)
+        alone.fair_values.pop("9026")
+        assert [o.idea_id for o in S.generate_signals(alone) if o.kind == "value"] == ["value:x9027:no"]
+        # one quarter-Kelly bet on "D wins TX", not two (13,246 shares, half-Kelly, before)
+        c = SizingContext(now=NOW, equity=100_000.0, cash=100_000.0, free_cash=100_000.0, start_capital=100_000.0,
+                          cup_end=CUP_END, days_left=(CUP_END - NOW) / 86400, params=P)
+        decs = Z.ConservativePolicy().size_all(values, c)
+        assert sum(d.units for d in decs.values()) == Z.ConservativePolicy().size(values[0], c).units == 6623
+        # the better-scored leg is the one kept: NO-R at 0.495 beats YES-D at 0.505
+        cheaper = [o for o in S.generate_signals(tx_pair(r_bid=0.505, books=False)) if o.kind == "value"]
+        assert [o.idea_id for o in cheaper] == ["value:x9027:no"]
+        # different winners (D38) are still one idea too
+        both_yes = tx_pair(books=False)
+        both_yes.latest["9027"] = tick(0.34, 0.35)
+        both_yes.fair_values["9027"] = fv(0.42, eid="9027", unc=0.005)
+        kept = [o for o in S.generate_signals(both_yes) if o.kind == "value"]
+        assert len(kept) == 1
+
+    @pytest.mark.parametrize("office,title", [
+        ("HOUSE_CONTROL", "Which party will control the House after the midterms?"),
+        ("SENATE_CONTROL", "Which party will control the Senate after the midterms?")])
+    def test_strategy_6_chamber_control_is_a_slow_count(self, office: str, title: str) -> None:
+        d_race = RaceRef(f"2026:{office}:US", office, "US", party="D")
+        r_race = RaceRef(f"2026:{office}:US", office, "US", party="R")
+        assert S.is_chamber(d_race) and not S.is_chamber(race("TX"))
+        assert S.called_prob(d_race, 0.69, P) == P.called_prob_slow  # was called_prob_fast (0.85)
+        assert S.called_prob(d_race, 0.97, P) == S.CHAMBER_SAFE_CALLED_PROB < P.called_prob_safe
+        assert S.called_prob(race("TX"), 0.69, P) == P.called_prob_fast  # state races keep their rule
+        assert S._exit_before("unknown", ["US"], None, CUP_END, P) == pytest.approx(CUP_END - P.closeout_buffer_s)
+        assert S._exit_before("unknown", ["TX"], None, CUP_END, P) is None
+        infos = {"9014": info("9014", "700", title, option="Democrats"),
+                 "9015": info("9015", "700", title, option="Republicans")}
+        latest = {"9014": tick(0.68, 0.69, book=book([(0.68, 5000)], [(0.69, 5000)])),
+                  "9015": tick(0.34, 0.35, book=book([(0.34, 5000)], [(0.35, 5000)]))}
+        races = {"9014": d_race, "9015": r_race}
+        for regime in ("vwap_closeout", "unknown"):
+            inp = StrategyInputs(now=NOW, cup_end=CUP_END, infos=infos, latest=latest, races=races,
+                                 settlement_regime=regime)
+            [b] = [o for o in S.basket_opportunities(inp, P) if o.side == "no"]
+            assert b.bet is not None and b.bet.kind == "bounded" and b.called_prob == P.called_prob_slow
+            assert b.exit_plan is not None and b.exit_plan.exit_before_ts == pytest.approx(CUP_END - P.closeout_buffer_s)
+            assert not any("fast count" in line for line in b.rationale)
+            assert any("chamber control is decided by the last seats counted" in line for line in b.rationale)
+        resolved = StrategyInputs(now=NOW, cup_end=CUP_END, infos=infos, latest=latest, races=races,
+                                  settlement_regime="resolved_outcomes")
+        [b] = [o for o in S.basket_opportunities(resolved, P) if o.side == "no"]
+        assert b.bet is not None and b.bet.kind == "riskless"  # a real 1/0 resolution: riskless again

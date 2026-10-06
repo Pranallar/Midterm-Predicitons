@@ -1,8 +1,9 @@
 """End-to-end browser tests of the dashboard UI (Playwright via node).
 
-Runs ``tests/e2e/ui_smoke.cjs`` (every view including the Simulation view, the drawer, themes, outages,
-phone layout, hostile data) and ``tests/e2e/regressions.cjs`` (one check per UI bug fixed after QA, named
-after its id, plus the Simulation view's states on ``page.route()`` fixtures)
+Runs ``tests/e2e/ui_smoke.cjs`` (every view including the Simulation and Outside moves views, the drawer,
+themes, outages, phone layout, hostile data; on the real demo it waits up to 200 s for the scripted New
+Hampshire Senate (D) lagging alert) and ``tests/e2e/regressions.cjs`` (one check per UI bug fixed after QA,
+named after its id, plus the Simulation and Outside moves views' states on ``page.route()`` fixtures)
 against ``tests/e2e/serve_demo.py`` (the simulated market: no API key, no network). Both are
 skipped when node or the Playwright package is not installed. Screenshots go to a temporary
 folder here; run ``node tests/e2e/ui_smoke.cjs`` directly to refresh ``docs/screenshots/``.
@@ -91,7 +92,8 @@ def test_dashboard_ui_smoke(tmp_path: Path) -> None:
     assert done.returncode == 0, "UI smoke test failed:\n" + output[-8000:]
     assert "all checks passed" in done.stdout, output[-8000:]
     shots = sorted(p.name for p in Path(env["E2E_SCREENSHOT_DIR"]).glob("*.png"))
-    for view in ("overview", "markets", "surges", "high", "strategy", "sim", "drawer"):
+    for view in ("overview", "markets", "surges", "moves", "high", "strategy", "sim", "drawer"):
         for theme in ("light", "dark"):
             assert f"{view}-{theme}.png" in shots, shots
     assert "mobile-390.png" in shots, shots
+    assert "moves-390.png" in shots, shots  # the Outside moves view at phone width (docs/OUTSIDE_MOVES.md §19.6)

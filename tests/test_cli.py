@@ -1282,8 +1282,12 @@ def test_dashboard_simulation_options_parse() -> None:
                   "--sizing", "chaser", "--all-collateral", "--paper-capital", "50000"])
     assert (args.no_paper, args.fair_value, args.regime, args.sizing, args.all_collateral, args.paper_capital) == (
         True, "manual", "vwap_closeout", "chaser", True, 50000.0)
-    assert web.simulation_options(args) == {"paper": False, "fair_value": "manual", "regime": "vwap_closeout",
-                                            "sizing": "chaser", "all_collateral": True, "paper_capital": 50000.0}
+    options = web.simulation_options(args)
+    expected = {"paper": False, "fair_value": "manual", "regime": "vwap_closeout", "sizing": "chaser",
+                "all_collateral": True, "paper_capital": 50000.0}
+    assert {k: options.get(k) for k in expected} == expected
+    # the outside-move keys (package server, §18.1) are checked by test_dashboard_moves_options_reach_the_builders
+    assert set(options) - set(expected) <= {"moves", "moves_poll_s", "moves_book_reads_per_min"}
     plain = parse(["dashboard"])
     assert (plain.no_paper, plain.fair_value, plain.no_fair_value, plain.sizing, plain.all_collateral, plain.paper_capital) == (
         False, "auto", False, "conservative", False, None)
@@ -1433,9 +1437,12 @@ def test_paper_refuses_a_store_another_process_is_tracking(tmp_path: Path, capsy
     code = cli.main(["paper", "--demo", "--fast", "--hours", "0.1", "--no-news", "--data-dir", str(data)], out=io.StringIO())
     err = capsys.readouterr().err
     assert code == 2
-    assert (f"Another process (pid 1234 on my-laptop) is already running the tracker on {db}: stop it, or use --data-dir "
-            "for a separate copy. Running two would double the API reads; the account allows 100 per minute across all "
+    # another machine: its liveness cannot be checked, so the message says when the lock frees itself (live-5)
+    assert (f"Another process (pid 1234 on my-laptop) is already running the tracker on {db}: stop it first. If it has "
+            "already ended, the lock frees itself within ") in err
+    assert ("start again then. Running two would double the API reads; the account allows 100 per minute across all "
             "keys.") in err
+    assert "separate copy" not in err
     assert db.is_file()  # the other process's database was not deleted
 
 
@@ -1457,7 +1464,7 @@ def test_live_paper_lease_conflict_exits_2(monkeypatch: pytest.MonkeyPatch, caps
     monkeypatch.setattr(web, "build_live", lambda settings, args, out=None: BusyRuntime())
     assert cli.main(["paper", "--hours", "1"], out=io.StringIO()) == 2
     assert ("error: Another process (pid 1234 on my-laptop) is already running the tracker on data/cup/tracker.sqlite3: "
-            "stop it, or use --data-dir for a separate copy.") in capsys.readouterr().err
+            "stop it first.") in capsys.readouterr().err
     assert closed == [True]
 
 
@@ -1586,3 +1593,519 @@ def test_paper_final_lines_name_the_settlements() -> None:
     assert "  Settled while running: 2 positions in 2 portfolios (Will the Maine debate happen?)." in lines
     body["trades"] = [t for t in body["trades"] if t["exit_reason"] != "settled"]
     assert not any(line.startswith("  Settled while running") for line in cli.paper_final_lines(body))
+
+
+def test_ui_4_and_ui_7_paper_text_names_the_default_capital_and_legging_exits() -> None:
+    """[integration, round 3] The text summary says when a run kept the default capital (ui-4) and lists legging exits of
+    sets still held apart from the closed ideas (ui-7); a run on the account value says nothing extra."""
+    port = {"portfolio_id": "human:conservative", "label": "You", "pnl_liq": 12.0, "pnl_liq_pct": 0.00012, "fills": 4,
+            "trades_closed": 1, "positions_open": 2, "legging_trades": 2, "legging_pnl": -3.2}
+    body = {"now": 0.0, "run": {"hours_run": 1.0, "target_hours": 2.0, "start_capital": 100000.0,
+                                "capital_source": "default 100,000"}, "portfolios": [port], "headline": None}
+    lines = cli.paper_summary_lines(body)
+    assert lines[1].startswith("  Start capital: the default 100,000 (your account value was not known")
+    assert lines[2].endswith("closed 1  open 2  (+2 legging exits -3, not closed ideas)")
+    body["run"]["capital_source"] = "account value"
+    port["legging_trades"] = 0
+    lines = cli.paper_summary_lines(body)
+    assert len(lines) == 2 and lines[1].endswith("closed 1  open 2")
+
+
+# --------------------------------------------------------------------------- integration regressions (round 3)
+
+
+def test_lookahead_5_and_lookahead_1_backtest_demo_text_has_the_demo_caveat_and_the_overlap(capsys: Any) -> None:
+    """lookahead-5: every demo result shown carries DEMO_CAVEAT (the demo's outside prices lead the Cup by
+    design), as `paper --demo` does. lookahead-1: the demo simulation the replay runs on is itself a paper run over
+    exactly that window, so the text also says the backtest is not an independent check (about 1 h here)."""
+    from supermarket_bot.paper import DEMO_CAVEAT, TABLE_WARNING
+
+    out = io.StringIO()
+    assert cli.main(["backtest", "--demo", "--demo-hours", "1"], out=out) == 0, capsys.readouterr().err
+    lines = _lines(out.getvalue())
+    assert f"Note: {DEMO_CAVEAT}" in lines
+    head = next(i for i, line in enumerate(lines) if line.startswith("Headline verdict"))
+    assert lines.index(f"Note: {DEMO_CAVEAT}") == head + 1  # right under the verdict it qualifies
+    assert TABLE_WARNING.format(n=9) in lines and "Read the verdict with these in mind:" in lines
+    overlap = [line for line in lines if "not an independent check" in line]
+    assert len(overlap) == 1 and overlap[0].startswith("Warning: 1.0 h of this window were also seen by a paper run")
+    assert "the ones the paper run read itself" in overlap[0]  # its real-book fills are the paper run's own reads
+
+
+def test_lookahead_1_backtest_on_a_store_counts_a_completed_and_a_reset_paper_run(tmp_path: Path, capsys: Any) -> None:
+    """lookahead-1 (§6.12.3, D26): the CLI backtest takes the overlap from the store's paper runs, so a window that
+    a completed (or reset) run covered carries OVERLAP_WARNING and overlap_hours ~= the covered hours."""
+    import sqlite3
+
+    data = tmp_path / "sim"
+    assert cli.main(["paper", "--demo", "--fast", "--hours", "1.2", "--json", "--no-news", "--data-dir", str(data)],
+                    out=io.StringIO()) == 0
+    db = data / "demo" / "tracker.sqlite3"
+    with sqlite3.connect(db) as con:
+        [(started, ended)] = con.execute("SELECT started_at, ended_at FROM paper_runs").fetchall()
+    assert ended is not None  # completed: no longer the current run
+    out = io.StringIO()
+    assert cli.main(["backtest", "--store", str(db), "--hours", "1", "--json"], out=out) == 0, capsys.readouterr().err
+    report = json.loads(out.getvalue())
+    assert report["overlap_hours"] == pytest.approx(1.0, abs=1e-6)
+    assert "not an independent check" in report["warnings"][0]
+    # the same window seen by two runs (one ended by a reset, then a new one) is counted once
+    with sqlite3.connect(db) as con:
+        con.execute("UPDATE paper_runs SET ended_at = ? WHERE ended_at IS NOT NULL", (started + 1800.0,))
+        con.execute("INSERT INTO paper_runs (run_id, started_at, config, state, updated_at, ended_at) "
+                    "VALUES ('run-later', ?, '{}', '{}', ?, NULL)", (started + 1200.0, started + 1.2 * 3600))
+    out = io.StringIO()
+    assert cli.main(["backtest", "--store", str(db), "--hours", "1", "--json"], out=out) == 0
+    report = json.loads(out.getvalue())
+    window = report["window"]
+    expected = (window["end"] - max(window["start"], started)) / 3600.0
+    assert report["overlap_hours"] == pytest.approx(expected, abs=1e-6)
+    text = io.StringIO()
+    assert cli.main(["backtest", "--store", str(db), "--hours", "1"], out=text) == 0
+    assert sum("not an independent check" in line for line in _lines(text.getvalue())) == 1
+
+
+def test_live_5_a_live_paper_run_stops_cleanly_on_sighup(monkeypatch: pytest.MonkeyPatch, capsys: Any) -> None:
+    """live-5: closing the terminal of a live `paper` run (SIGHUP) stops it like Ctrl-C: the runtime is closed
+    (the tracker stops and releases its lease) and the handler is restored afterwards."""
+    import os
+    import signal
+    import threading
+
+    from supermarket_bot import web
+
+    if threading.current_thread() is not threading.main_thread() or not hasattr(signal, "SIGHUP"):
+        pytest.skip("needs the main thread and SIGHUP")
+
+    class Unhandled(Exception):
+        pass
+
+    def fallback(signum: int, frame: Any) -> None:
+        raise Unhandled("SIGHUP reached the test's own handler")
+
+    closed: List[bool] = []
+
+    class Tracker:
+        paper_runner = object()
+        running = True
+
+        def paper_view(self) -> Dict[str, Any]:
+            return {"run": {"hours_run": 0.0, "target_hours": 1.0}, "portfolios": []}
+
+        def status(self) -> Dict[str, Any]:
+            return {}
+
+        def paper_end(self, reason: str) -> None:
+            raise AssertionError("an interrupted run stays open")
+
+    class Runtime:
+        tracker = Tracker()
+        app = type("A", (), {"paper": lambda self: {"run": {"hours_run": 0.0}, "portfolios": []}})()
+
+        def start(self) -> None:
+            threading.Timer(0.3, lambda: os.kill(os.getpid(), signal.SIGHUP)).start()
+
+        def close(self) -> None:
+            closed.append(True)
+
+    monkeypatch.setattr(web, "build_live", lambda settings, args, out=None: Runtime())
+    original = signal.signal(signal.SIGHUP, fallback)
+    try:
+        code = cli.main(["paper", "--hours", "1"], out=io.StringIO())
+        assert code == 130, capsys.readouterr().err
+        assert closed == [True]
+        assert signal.getsignal(signal.SIGHUP) is fallback  # restored
+    finally:
+        signal.signal(signal.SIGHUP, original)
+
+
+# --------------------------------------------------------------------------- moves (docs/OUTSIDE_MOVES.md §17)
+
+
+def test_moves_and_dashboard_moves_options_parse() -> None:
+    from supermarket_bot import web
+
+    parse = cli.build_parser().parse_args
+    m = parse(["moves"])
+    assert (m.demo, m.fast, m.hours, m.poll, m.interval, m.book_reads, m.bell, m.only_lagging, m.summary_every) == (
+        False, False, None, 15.0, 30.0, 4, False, False, 15.0)
+    assert (m.replay, m.since, m.store, m.no_news, m.json, m.data_dir, m.tournament) == (
+        False, None, None, False, False, None, None)
+    m = parse(["moves", "--demo", "--fast", "--hours", "1.5", "--poll", "30", "--interval", "20", "--book-reads", "0",
+               "--bell", "--only-lagging", "--summary-every", "5", "--no-news", "--json", "--data-dir", "x",
+               "--tournament", "cup", "--env-file", "e.env"])
+    assert (m.demo, m.fast, m.hours, m.poll, m.interval, m.book_reads, m.bell, m.only_lagging, m.summary_every) == (
+        True, True, 1.5, 30.0, 20.0, 0, True, True, 5.0)
+    assert (m.no_news, m.json, m.data_dir, m.tournament, m.env_file) == (True, True, "x", "cup", "e.env")
+    r = parse(["moves", "--replay", "--since", "2026-10-01T00:00:00Z", "--store", "t.sqlite3"])
+    assert (r.replay, r.since, r.store) == (True, "2026-10-01T00:00:00Z", "t.sqlite3")
+    d = parse(["dashboard"])
+    assert (d.no_moves, d.moves_poll, d.moves_book_reads) == (False, 15.0, 4)
+    d = parse(["dashboard", "--no-moves", "--moves-poll", "30", "--moves-book-reads", "0"])
+    assert (d.no_moves, d.moves_poll, d.moves_book_reads) == (True, 30.0, 0)
+    assert not hasattr(parse(["paper"]), "no_moves")  # the paper parser has no moves options: never the watcher
+    for bad in (["moves", "--book-reads", "31"], ["moves", "--book-reads", "-1"], ["moves", "--hours", "0"],
+                ["moves", "--summary-every", "0"], ["moves", "--poll", "often"], ["dashboard", "--moves-book-reads", "31"],
+                ["dashboard", "--moves-poll", "x"]):
+        with pytest.raises(SystemExit) as caught:
+            parse(bad)
+        assert caught.value.code == 2, bad
+
+
+def test_dashboard_moves_options_reach_the_builders() -> None:
+    """The parsed dashboard options become build_demo / build_live keywords (web.simulation_options, package server,
+    docs/OUTSIDE_MOVES.md §18.1); ``paper`` has none of them, so it never runs the watcher."""
+    from supermarket_bot import web
+
+    parse = cli.build_parser().parse_args
+    options = web.simulation_options(parse(["dashboard", "--no-moves", "--moves-poll", "30", "--moves-book-reads", "0"]))
+    assert (options["moves"], options["moves_poll_s"], options["moves_book_reads_per_min"]) == (False, 30.0, 0)
+    on = web.simulation_options(parse(["dashboard"]))
+    assert (on["moves"], on["moves_poll_s"], on["moves_book_reads_per_min"]) == (True, 15.0, 4)
+    assert web.simulation_options(parse(["paper"]))["moves"] is False  # the paper command never runs the watcher
+
+
+@pytest.mark.parametrize("argv, message", [
+    (["moves", "--fast"], "--fast needs --demo"),
+    (["moves", "--demo", "--poll", "4"], "--poll must be between 5 and 120 seconds"),
+    (["moves", "--demo", "--poll", "121"], "--poll must be between 5 and 120 seconds"),
+    (["moves", "--demo", "--interval", "0.5"], "--interval must be at least 1 second"),
+    (["moves", "--demo", "--since", "2026-10-01T00:00:00Z"], "--since and --store are for --replay"),
+    (["moves", "--replay", "--demo"], "--replay reads a stored database"),
+    (["dashboard", "--demo", "--moves-poll", "4"], "--moves-poll must be between 5 and 120 seconds"),
+    (["dashboard", "--demo", "--moves-poll", "500"], "--moves-poll must be between 5 and 120 seconds"),
+])
+def test_moves_usage_errors_exit_2(argv: List[str], message: str, capsys: Any) -> None:
+    assert cli.main(argv, out=io.StringIO()) == 2
+    assert message in capsys.readouterr().err
+
+
+def test_moves_replay_and_live_errors(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: Any) -> None:
+    assert cli.main(["moves", "--replay", "--store", str(tmp_path / "missing.sqlite3")], out=io.StringIO()) == 2
+    assert "no such database" in capsys.readouterr().err
+    assert cli.main(["moves", "--replay", "--data-dir", str(tmp_path / "empty")], out=io.StringIO()) == 2
+    assert "no tracker database under" in capsys.readouterr().err
+    monkeypatch.delenv("SUPERMARKET_API_KEY")
+    assert cli.main(["moves", "--env-file", str(tmp_path / "none.env")], out=io.StringIO()) == 2  # live needs a key
+    assert "SUPERMARKET_API_KEY" in capsys.readouterr().err
+
+
+def test_dashboard_moves_options_pass_through(monkeypatch: pytest.MonkeyPatch) -> None:
+    from supermarket_bot import web
+
+    seen: List[Any] = []
+    monkeypatch.setattr(web, "run_dashboard", lambda settings, args, out=None: seen.append(args) or 0)
+    assert cli.main(["dashboard", "--demo", "--no-moves", "--moves-poll", "20", "--moves-book-reads", "2"], out=io.StringIO()) == 0
+    assert (seen[0].no_moves, seen[0].moves_poll, seen[0].moves_book_reads) == (True, 20.0, 2)
+    assert cli.main(["dashboard", "--demo"], out=io.StringIO()) == 0
+    assert (seen[1].no_moves, seen[1].moves_poll, seen[1].moves_book_reads) == (False, 15.0, 4)
+
+
+class _FakeWatcher:
+    """Stands in for moves.OutsideMoveWatcher in the CLI plumbing tests."""
+
+    poll_s = 15.0
+
+    def __init__(self, alerts_path: Path) -> None:
+        self.alerts_path = alerts_path
+        self.listeners: List[Any] = []
+
+    def add_listener(self, fn: Any) -> None:
+        self.listeners.append(fn)
+
+    def summary(self) -> Dict[str, Any]:
+        return {"watching": {"outcomes": 237, "matched": 231, "venues": 2},
+                "venues": [{"venue": "polymarket", "matched": 231}, {"venue": "kalshi", "matched": 220}],
+                "summary": {"sentence": "No outside move has been measured yet."}, "counts": {}, "caveats": ["C1", "C2"]}
+
+    def emit(self, kind: str, alert_id: str, status: str, outcome: str = "pending") -> None:
+        from supermarket_bot.moves import MoveEvent
+
+        event = MoveEvent(kind=kind, at=1_791_209_115.0, alert_id=alert_id, status=status, lag_outcome=outcome,
+                          alert={"alert_id": alert_id, "status": status})
+        for fn in self.listeners:
+            fn(event)
+
+
+class _FakeTracker:
+    def __init__(self, watcher: _FakeWatcher, stop_after: int = 10_000, interrupt: bool = False) -> None:
+        self.moves = watcher
+        self.checks = 0
+        self.stop_after = stop_after
+        self.interrupt = interrupt
+        self._clock = lambda: 1_791_209_400.0
+
+    @property
+    def running(self) -> bool:
+        self.checks += 1
+        if self.checks == 1:  # the watcher's first events arrive while the command waits
+            self.moves.emit("opened", "mv-1", "lagging")
+            self.moves.emit("opened", "mv-2", "moved_first", "cup_first")
+            self.moves.emit("status", "mv-1", "already_moved", "followed")
+            self.moves.emit("status", "mv-2", "moved_first", "cup_first")
+            self.moves.emit("closed", "mv-1", "already_moved", "followed")
+        if self.interrupt and self.checks >= 2:
+            raise KeyboardInterrupt
+        return self.checks < self.stop_after
+
+    def status(self) -> Dict[str, Any]:
+        return {"fatal_error": None}
+
+    def moves_view(self) -> Dict[str, Any]:
+        return self.moves.summary()
+
+
+@pytest.fixture
+def fake_moves(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Dict[str, Any]:
+    """``moves`` (live) against a fake runtime, with moves.format_event_lines / summary_lines stubbed: the CLI's
+    own plumbing (start line, listener, filters, bell flag, JSON, exit codes), independent of the watcher."""
+    import supermarket_bot.moves as moves_mod
+    from supermarket_bot import web
+
+    state: Dict[str, Any] = {"bells": [], "built": [], "closed": 0, "interrupt": False}
+
+    def fake_lines(event: Any, *, bell: bool = False) -> List[str]:
+        state["bells"].append(bell)
+        return [f"[moves 14:05:15] {event.kind.upper()} {event.alert_id} {event.status}" + ("\a" if bell else "")]
+
+    monkeypatch.setattr(moves_mod, "format_event_lines", fake_lines)
+    monkeypatch.setattr(moves_mod, "summary_lines", lambda summary, venues, now: [f"[moves] summary: {summary['sentence']}",
+                                                                                  f"    venues: {len(venues)}"])
+
+    class Runtime:
+        def __init__(self) -> None:
+            self.moves = _FakeWatcher(tmp_path / "data" / "cup" / "alerts.jsonl")
+            self.tracker = _FakeTracker(self.moves, stop_after=3, interrupt=state["interrupt"])
+            self.app = None
+
+        def start(self) -> None:
+            pass
+
+        def close(self) -> None:
+            state["closed"] += 1
+
+    def build_live(settings: Any, args: Any, out: Any = None) -> Any:
+        state["built"].append(args)
+        return Runtime()
+
+    monkeypatch.setattr(web, "build_live", build_live)
+    return state
+
+
+def test_moves_live_plumbing_text(fake_moves: Dict[str, Any]) -> None:
+    out = io.StringIO()
+    assert cli.main(["moves", "--hours", "1"], out=out) == 1  # the fake tracker stops: exit 1 after the final block
+    args = fake_moves["built"][0]
+    assert (args.no_paper, args.no_moves, args.moves_poll, args.moves_book_reads) == (True, False, 15.0, 4)
+    lines = _lines(out.getvalue())
+    assert lines[0].startswith("Watching outside prices: Polymarket and Kalshi every 15 s for 231 matched outcomes "
+                               "(GET only, no account). Alerts also go to ")
+    assert lines[0].endswith("alerts.jsonl. Nothing is traded. Ctrl-C to stop.")
+    assert lines[1:5] == ["[moves 14:05:15] OPENED mv-1 lagging", "[moves 14:05:15] OPENED mv-2 moved_first",
+                          "[moves 14:05:15] STATUS mv-1 already_moved", "[moves 14:05:15] STATUS mv-2 moved_first"]
+    assert "CLOSED" not in out.getvalue()  # closed events print nothing in text mode
+    assert lines[5:] == ["[moves] summary: No outside move has been measured yet.", "    venues: 2", "  - C1", "  - C2"]
+    assert fake_moves["bells"] == [False] * 4 and fake_moves["closed"] == 1
+
+
+def test_moves_live_plumbing_bell_only_lagging_and_json(fake_moves: Dict[str, Any]) -> None:
+    out = io.StringIO()
+    cli.main(["moves", "--bell", "--only-lagging"], out=out)
+    events = [line for line in _lines(out.getvalue()) if line.startswith("[moves 14")]
+    assert events == ["[moves 14:05:15] OPENED mv-1 lagging\a", "[moves 14:05:15] STATUS mv-1 already_moved\a"]
+    assert fake_moves["bells"] == [True, True]  # the bell flag goes to format_event_lines (actionable openings only)
+    out = io.StringIO()
+    cli.main(["moves", "--json"], out=out)
+    rows = [json.loads(line) for line in out.getvalue().splitlines()]
+    assert [(r["type"], r.get("event")) for r in rows] == [("event", "opened"), ("event", "opened"), ("event", "status"),
+                                                            ("event", "status"), ("event", "closed"), ("summary", None)]
+    assert rows[0]["alert"] == {"alert_id": "mv-1", "status": "lagging"}
+    assert rows[-1]["final"] is True and rows[-1]["caveats"] == ["C1", "C2"] and len(rows[-1]["venues"]) == 2
+
+
+def test_moves_live_ctrl_c_prints_the_final_block_and_exits_130(fake_moves: Dict[str, Any]) -> None:
+    fake_moves["interrupt"] = True
+    out = io.StringIO()
+    assert cli.main(["moves"], out=out) == 130
+    assert "[moves] summary: No outside move has been measured yet." in out.getvalue() and fake_moves["closed"] == 1
+
+
+def test_moves_live_lease_conflict_exits_2(monkeypatch: pytest.MonkeyPatch, capsys: Any) -> None:
+    from supermarket_bot import web
+    from supermarket_bot.tracker import TrackerBusy
+
+    class BusyRuntime:
+        def __init__(self) -> None:
+            self.moves = _FakeWatcher(Path("alerts.jsonl"))
+            self.tracker = _FakeTracker(self.moves)
+
+        def start(self) -> None:
+            raise TrackerBusy({"pid": 1234, "host": "my-laptop"}, "data/cup/tracker.sqlite3")
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(web, "build_live", lambda settings, args, out=None: BusyRuntime())
+    assert cli.main(["moves"], out=io.StringIO()) == 2
+    assert "is already running the tracker on data/cup/tracker.sqlite3" in capsys.readouterr().err
+
+
+# ---- the real demo (needs the watcher and the builders: docs/OUTSIDE_MOVES.md §15.2 outcomes)
+
+MOVES_DEMO_HOURS = "2"
+
+
+@pytest.fixture(scope="module")
+def moves_demo_run(tmp_path_factory: Any) -> Dict[str, Any]:
+    """``moves --demo --fast --hours 2 --bell`` once, with --data-dir kept for --replay."""
+    import time
+
+    data = tmp_path_factory.mktemp("moves") / "kept"
+    out = io.StringIO()
+    started = time.monotonic()
+    code = _moves_main(["moves", "--demo", "--fast", "--hours", MOVES_DEMO_HOURS, "--bell", "--no-news", "--data-dir",
+                        str(data)], out)
+    return {"code": code, "text": out.getvalue(), "data": data, "seconds": time.monotonic() - started}
+
+
+def _moves_main(argv: List[str], out: Any) -> int:
+    """``cli.main`` for a real ``moves --demo`` run (docs/OUTSIDE_MOVES.md §18.1)."""
+    return cli.main(argv, out=out)
+
+
+def test_moves_demo_fast_two_hours_text(moves_demo_run: Dict[str, Any]) -> None:
+    from supermarket_bot.moves import MOVES_CAVEATS, MOVES_DEMO_CAVEAT
+
+    assert moves_demo_run["code"] == 0
+    text = moves_demo_run["text"]
+    lines = _lines(text)
+    assert lines[0] == ("Watching the demo's scripted outside venues (Demo venue A, Demo venue B) every 15 s. Demo data: "
+                        "the moves are scripted. Nothing is traded.")
+    assert lines[1].startswith("Alerts are written to ") and lines[1].endswith("demo/alerts.jsonl.")
+    heads = [line for line in lines if line.startswith("[moves ") and "] summary:" not in line]
+    tags = {tag for tag in ("CUP LAGGING", "FOLLOWED", "CUP MOVED FIRST", "REVERTED", "NOT FOLLOWED") if any(tag in h for h in heads)}
+    assert tags == {"CUP LAGGING", "FOLLOWED", "CUP MOVED FIRST", "REVERTED", "NOT FOLLOWED"}
+    assert any("New Hampshire Senate (D)" in h and "CUP LAGGING" in h for h in heads)
+    assert any(line.startswith("    suggestion (not a sure thing): Buy YES at ") for line in lines)
+    assert any(line.startswith("    suggestion (not a sure thing): Buy NO at ") for line in lines)  # Ohio: the outside fell
+    assert not any("Georgia Governor" in h or "Michigan Governor" in h for h in heads)  # 9038 / 9041 never alert
+    summaries = [line for line in lines if "] summary: " in line]
+    assert summaries and "far too few to say whether the Cup lags" in summaries[-1]
+    # every 15 simulated minutes and once at the end (the final block is not repeated by the periodic one)
+    assert len(summaries) == 8 and len({s.split("]")[0] for s in summaries}) == 8
+    assert summaries[-1].startswith("[moves 16:00:00] summary: ")
+    for caveat in list(MOVES_CAVEATS) + [MOVES_DEMO_CAVEAT]:
+        assert f"  - {caveat}" in lines
+    # (integration) the final block gives the lag numbers with their sample sizes, not only the sentence
+    study = [line for line in lines if line.startswith("    lag study: ")]
+    assert study == ["    lag study: 7 resolved outside-led moves on 4 races; 2 where the Cup moved first; not counted: "
+                     "3 excluded (converging or no Cup base), 0 censored, 0 still being measured"]
+    at = lines.index(study[0])
+    assert lines[at + 1].startswith("      followed within 1 min 0/7 (0%), 5 min ") and "1 h 4/7 (57%)" in lines[at + 1]
+    assert lines[at + 2] == "      never followed 3/7 (43%): 2 came back, 1 did not follow within 60 min"
+    assert any(line.startswith("      gap left 4 min after the alert, net of the spread: mean ") and "(n=7; " in line
+               for line in lines[at:at + 6])
+    assert any(line.startswith("      bought 4 min after the alert, sold 30 min later: mean ") for line in lines[at:at + 6])
+    # --bell: the bell only on an actionable opening (a lagging alert with a suggestion), on its first line
+    belled = [line for line in lines if "\a" in line]
+    assert belled and all(line.startswith("[moves ") and "CUP LAGGING" in line for line in belled)
+    assert all(line.endswith("\a") for line in belled)
+
+
+def test_moves_demo_fast_replay_prints_the_same_alerts_and_summary(moves_demo_run: Dict[str, Any]) -> None:
+    db = moves_demo_run["data"] / "demo" / "tracker.sqlite3"
+    assert db.is_file() and (moves_demo_run["data"] / "demo" / "alerts.jsonl").is_file()
+    out = io.StringIO()
+    assert cli.main(["moves", "--replay", "--store", str(db)], out=out) == 0
+    replay = _lines(out.getvalue())
+    run = _lines(moves_demo_run["text"])
+    assert replay[0].startswith("Replaying 12 stored outside-move alert(s) from ")
+
+    def races(lines: List[str]) -> List[str]:
+        return sorted({line.split("  ")[1] for line in lines if line.startswith("[moves ") and "] summary:" not in line})
+
+    assert races(replay) == races(run)
+    sentence = lambda lines: [line.split("] summary: ", 1)[1] for line in lines if "] summary: " in line][-1]  # noqa: E731
+    assert sentence(replay) == sentence(run)
+    study = lambda lines: [line for line in lines if line.startswith("    lag study: ") or line.startswith("      ")]  # noqa: E731
+    assert study(replay) and study(replay) == study(run)  # the same numbers from the database
+    # suppressed moves are not stored: the replay says so instead of "nothing"
+    assert "    filtered out: not kept in the database (a replay shows the alerts only)" in replay
+    assert not any(line.startswith("    filtered out today: ") for line in replay)
+
+    def tags(lines: List[str]) -> Dict[str, int]:
+        heads = [line for line in lines if line.startswith("[moves ") and "] summary:" not in line]
+        return {tag: sum(1 for h in heads if f"] {tag}  " in h) for tag in
+                ("CUP LAGGING", "CUP MOVED FIRST", "FOLLOWED", "REVERTED", "NOT FOLLOWED", "CENSORED")}
+
+    assert tags(replay) == tags(run)  # one opening per alert, one status line per resolved lag (no duplicates)
+    assert tags(run)["CUP MOVED FIRST"] == 2 and tags(run)["FOLLOWED"] == 4 and tags(run)["NOT FOLLOWED"] == 1
+    # the suggestion as it was when the alert opened (alerts.jsonl), not the closed alert's empty trade
+    suggestions = lambda lines: [line for line in lines if line.startswith("    suggestion (not a sure thing): ")]  # noqa: E731
+    assert suggestions(replay) == suggestions(run) and suggestions(run)
+    assert not any(line.startswith("    no trade suggested") for line in replay)
+    out = io.StringIO()
+    assert cli.main(["moves", "--replay", "--store", str(db), "--json"], out=out) == 0
+    rows = [json.loads(line) for line in out.getvalue().splitlines()]
+    assert [r["type"] for r in rows].count("alert") == 12 and rows[-1]["type"] == "summary"
+    out = io.StringIO()
+    assert cli.main(["moves", "--replay", "--store", str(db), "--only-lagging"], out=out) == 0
+    only = tags(_lines(out.getvalue()))
+    assert only["CUP LAGGING"] == tags(run)["CUP LAGGING"] and only["CUP MOVED FIRST"] == 0
+
+
+def test_moves_replay_without_alerts_jsonl_uses_the_stored_opening_suggestion(moves_demo_run: Dict[str, Any],
+                                                                               tmp_path: Path) -> None:
+    """Without alerts.jsonl the replay prints each alert's suggestion as it opened from the database (the alert
+    keeps ``opened_trade`` after the live trade is cleared on close); only a row stored WITHOUT it says the
+    suggestion was not kept, and never "no trade suggested" (it never claims there was no edge)."""
+    import shutil
+    import sqlite3
+
+    src = moves_demo_run["data"] / "demo"
+    for f in src.glob("tracker.sqlite3*"):
+        shutil.copy(f, tmp_path / f.name)
+    db = tmp_path / "tracker.sqlite3"
+    out = io.StringIO()
+    assert cli.main(["moves", "--replay", "--store", str(db)], out=out) == 0
+    lines = _lines(out.getvalue())
+    suggestions = lambda ls: [line for line in ls if line.startswith("    suggestion (not a sure thing): ")]  # noqa: E731
+    assert suggestions(lines) and suggestions(lines) == suggestions(_lines(moves_demo_run["text"]))
+    assert not any(line.startswith("    suggestion at the time: not kept") for line in lines)
+    assert not any(line.startswith("    no trade suggested") for line in lines)
+    # an alert row stored without its opening suggestion (an older build): says so instead of inventing one
+    con = sqlite3.connect(str(db))
+    try:
+        for alert_id, data in con.execute("SELECT alert_id, data FROM move_alerts").fetchall():
+            row = json.loads(data)
+            for key in ("opened_trade", "opened_trade_note"):
+                row.pop(key, None)
+            con.execute("UPDATE move_alerts SET data = ? WHERE alert_id = ?", (json.dumps(row), alert_id))
+        con.commit()
+    finally:
+        con.close()
+    out = io.StringIO()
+    assert cli.main(["moves", "--replay", "--store", str(db)], out=out) == 0
+    lines = _lines(out.getvalue())
+    kept = [line for line in lines if line.startswith("    suggestion at the time: not kept")]
+    lagging = [line for line in lines if "] CUP LAGGING  " in line]
+    assert lagging and len(kept) == len(lagging)
+    assert not any(line.startswith("    no trade suggested") for line in lines)  # never claims there was no edge
+
+
+def test_moves_demo_fast_json_only_lagging_and_determinism(methods: List[Tuple[str, str]]) -> None:
+    outs = []
+    for argv in (["--json"], ["--json"], ["--only-lagging"]):
+        out = io.StringIO()
+        assert _moves_main(["moves", "--demo", "--fast", "--hours", "0.25", "--no-news", *argv], out) == 0
+        outs.append(out.getvalue())
+    assert outs[0] == outs[1]  # deterministic (D42)
+    rows = [json.loads(line) for line in outs[0].splitlines()]
+    assert {r["type"] for r in rows} == {"event", "summary"} and rows[-1]["final"] is True
+    opened = [r["alert"] for r in rows if r["type"] == "event" and r["event"] == "opened"]
+    assert {a["exchange_id"] for a in opened} >= {"9035", "9036", "9037", "9039", "9040"}
+    assert not {a["exchange_id"] for a in opened} & {"9038", "9041"}
+    lagging = [line for line in _lines(outs[2]) if line.startswith("[moves ") and "] summary:" not in line]
+    assert lagging and not any("CUP MOVED FIRST" in line for line in lagging)
+    assert any("CUP LAGGING" in line for line in lagging)
+    assert_get_only(methods)

@@ -39,9 +39,11 @@ same as selling YES at `1 - q`; for YES best bid `b` and best ask `a`, the NO as
 | `paper.py`, `study.py`, `backtest.py` | paper trader, signal-level event study, replay backtest | models, sizing, strategy, depth |
 | `pipeline.py` | strategy inputs and paper observations from the tracker's view (no reads); headless driver | models, store |
 | `readonly.py` | runtime GET-only guards for every client the simulator builds | – |
+| `moves.py` | outside-move alerts: poll the matched Polymarket / Kalshi markets, detect, classify vs the Cup, the lag study | models, fairvalue (providers) |
 
 The paper trader, outside fair values, sizing policies and backtest are specified in
-[`docs/PAPER_TRADING.md`](PAPER_TRADING.md) (see "Paper trading and outside fair values" below).
+[`docs/PAPER_TRADING.md`](PAPER_TRADING.md) (see "Paper trading and outside fair values" below); the
+outside-move alerts in [`docs/OUTSIDE_MOVES.md`](OUTSIDE_MOVES.md) (see "Outside-move alerts" below).
 
 ## Rate budget (per account: 100 reads + 30 writes per minute, shared by all keys)
 
@@ -77,17 +79,23 @@ tracker splits that budget:
 | analysis | ~2 (bursts <= 20) |
 | dashboard drawers | 4 per open drawer |
 | paper | <= 20 (6 during the backfill) |
+| outside-move Cup books | 0-1 typical, <= 4 (`MovesBudget`, behind the reserve, skipped when there is no room) |
 | **total** | **~36-40 steady, ~80 at start-up (plus retries)** |
 
 `status()["read_budget"]` reports the projection from the live outcome count
 (`projected_per_min`, a warning above 75), the paper budget and the reserve. One process per
-account: a store lease makes a second tracker on the same database refuse to start.
+account: a store lease makes a second tracker on the same database refuse to start. Its heartbeat has
+its own thread (every interval / 3), so a cycle stuck in client retries never lets it lapse; a holder
+on the same machine is checked by pid (running: refused whatever its heartbeat age; gone after a crash
+or a closed terminal: taken over at once), and SIGTERM / SIGHUP stop the process like Ctrl-C so the
+lease is released.
 
 News providers are separate hosts with their own politeness limits: GDELT at most 1
 request per 5 s; Google News at most 1 request per 2 s. Results are cached in the store
 for 20 minutes per query. Polymarket and Kalshi (outside fair values) are read anonymously
 with GET only, each with its own 30/min limiter and a 30-s deadline per refresh (about 5 and 3
-reads a minute).
+reads a minute). With the outside-move watcher the limiters are 45/min: its 15-s polls add about 20
+(Polymarket) and 12 (Kalshi) batched reads a minute, never touching the Super Market budget.
 
 ## Analytics (pure, `analytics.py`)
 
@@ -423,3 +431,31 @@ short:
   (g)-(l) (markets 316-326, exchanges 9024-9034) and a `SimClock` fast mode in which every
   limiter runs on simulated time, so a 2-hour run takes seconds and is byte-for-byte
   reproducible.
+
+## Outside-move alerts
+
+The full, normative design is [`docs/OUTSIDE_MOVES.md`](OUTSIDE_MOVES.md). In short:
+
+* **Watcher** (`moves.OutsideMoveWatcher`): every 15 s it polls the Polymarket and Kalshi markets the
+  fair-value refresh has validated (batched GETs through the same provider objects, so each host's 45/min
+  limiter and 429 backoff are shared; the refresh always keeps its headroom), stamps each quote on arrival,
+  detects moves over 1/5/15/60 minutes against both a points minimum and the outcome's own outside
+  volatility, filters noise (each dropped move is listed with its reason), compares each move with the Cup
+  at the same moment (lagging / already moved / moved first / reverted), suggests a hand trade for a lagging
+  alert (a suggestion only) and measures whether and when the Cup followed (the lag study). Alerts and
+  samples persist in the store (schema v3: `outside_quotes` 3 days, `move_alerts` 30 days) and in an
+  append-only `alerts.jsonl`.
+* **Tracker** (`tracker.py`): the watcher is bound to a `TrackerCupFeed` (the lock-free published snapshot
+  quotes, the series cache, stored books, and at most `moves_reads_per_min` = 4 fresh Cup books a minute in
+  `MovesBudget`, behind the 12-slot read reserve and never waited for; those books are not stored, so the
+  paper trader's inputs stay independent) and stepped every `poll_s` in its own **`tracker-moves`** thread
+  (after the first cycle). Its failures are the "outside moves" problem (a warning); `status()` adds
+  `moves` and `read_budget.moves`, and the read projection adds the 4.
+* **Lock rule** (extends D43): the watcher's lock is a leaf: never held while calling the fair-value service,
+  a provider, the Cup feed (the tracker), the store, the file or a listener; the tracker never calls the
+  watcher while holding `tracker._lock`, and `status()` / the web handlers read its published dicts
+  lock-free. Providers' I/O locks are taken only inside `refresh` / `poll`.
+* **Integration**: `/api/moves`, the "Outside moves" view, the `moves` command (live, demo, fast,
+  `--replay`), `dashboard --no-moves`, and the demo's scripted outside venues (markets 327-333, exchanges
+  9035-9041, only with `DemoMarket(outside_moves=True)`; the default demo is unchanged).
+  `pipeline.run_simulation(moves_every_s=15)` sub-steps the watcher between fast-demo steps.

@@ -3,10 +3,10 @@
 1. Runtime: a fast demo simulation with the paper trader and outside fair values (the demo feed plus Polymarket and
    Kalshi providers on recording fixture transports) for 200 steps sends nothing but GETs; every Super Market client
    the builders create carries the GET-only guard; a direct POST raises ``ReadOnlyViolation``; outside requests are
-   anonymous.
+   anonymous. The same with the outside-move watcher (docs/OUTSIDE_MOVES.md §0): its polls and its Cup book reads.
 2. The Polymarket and Kalshi providers against fixture transports: GET only.
-3. Static (AST) over every simulator module: no write call, no write verb, no ``/orders`` path, except an explicit
-   allowlist of (file, enclosing function).
+3. Static (AST) over every simulator module (``moves.py`` included, with no allowlist entry): no write call, no write
+   verb, no ``/orders`` path, except an explicit allowlist of (file, enclosing function).
 
 Offline.
 """
@@ -135,6 +135,65 @@ def test_a_fast_simulation_with_paper_and_fair_values_sends_only_gets(tmp_path: 
     assert {r.url.host for r in outside.calls} >= {"gamma-api.polymarket.com"}
 
 
+def test_a_fast_simulation_with_outside_moves_sends_only_gets(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """docs/OUTSIDE_MOVES.md §0 / §22: a fast demo with the outside-move watcher (its scripted venues, Cup order-book
+    reads for lagging alerts) and, polled by a second watcher on the same tracker, the real Polymarket and Kalshi
+    providers on the recording fixture transports: every Super Market and every outside request is an anonymous GET,
+    and no outside poll ever goes through the Super Market client."""
+    from supermarket_bot.moves import MoveParams, OutsideMoveWatcher
+    from supermarket_bot.tracker import TrackerCupFeed
+
+    sm_calls: List[httpx.Request] = []
+    original = demo_mod.DemoMarket.transport
+
+    def recording_transport(self: Any) -> httpx.MockTransport:
+        inner = original(self)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            sm_calls.append(request)
+            return inner.handle_request(request)
+
+        return httpx.MockTransport(handler)
+
+    monkeypatch.setattr(demo_mod.DemoMarket, "transport", recording_transport)
+    outside = OutsideRecorder()
+    clock = demo_mod.SimClock(demo_mod.SIM_T0)
+    made: List[Any] = []
+
+    def providers(market: Any) -> List[Any]:
+        kw = dict(transport=httpx.MockTransport(outside), reads_per_min=100_000, clock=clock, sleep=lambda s: None)
+        made.extend([PolymarketProvider(**kw), KalshiProvider(**kw)])
+        return [demo_mod.DemoFairValueProvider(market)] + made
+
+    runtime = web.build_demo(tmp_path, 30.0, out=io.StringIO(), clock=clock, fair_value_providers=providers,
+                             moves=True, paper=False, news=False)
+    try:
+        assert runtime.moves is not None and runtime.tracker.moves is runtime.moves
+        assert is_guarded(runtime.client) and is_guarded(runtime.tracker._quick)
+        http_watcher = OutsideMoveWatcher(runtime.fair_values, providers=made, cup=TrackerCupFeed(runtime.tracker),
+                                          clock=clock, params=MoveParams(poll_s=15.0))
+        before = len(sm_calls)
+        for _ in range(20):
+            pipeline.run_simulation(runtime, clock, hours=60 / 3600, step_s=30.0, moves_every_s=15.0, end_run=False)
+            http_watcher.step()
+        steps = runtime.tracker.status()["moves"]["steps"]
+        assert steps >= 40 and sm_calls[before:]  # the watcher stepped (and the Cup was read) during the run
+        with pytest.raises(ReadOnlyViolation):
+            runtime.tracker._quick.request("POST", "/orders", json={"exchangeId": "9035"})
+        secrets = list(getattr(runtime.client, "_secrets", ()))
+    finally:
+        runtime.close()
+        for p in made:
+            p.close()
+    _assert_reads_only(sm_calls)
+    _assert_reads_only(outside.calls)
+    _assert_anonymous(outside.calls, secrets)
+    # the watcher's own outside reads are the batched /markets reads of the validated matches (GET, no account)
+    polls = [r for r in outside.calls if r.url.path.endswith("/markets") and ("id" in r.url.params or "tickers" in r.url.params)]
+    assert polls and all(r.method == "GET" for r in polls)
+    assert not any("polymarket" in r.url.host or "kalshi" in r.url.host for r in sm_calls)
+
+
 def test_every_builder_client_is_guarded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("SUPERMARKET_LLM", raising=False)
     demo_rt = web.build_demo(tmp_path / "d", 30.0, out=io.StringIO(), news=False)
@@ -204,7 +263,8 @@ def test_outside_providers_only_get(provider_cls: Any) -> None:
 # --------------------------------------------------------------------------- (3) static AST check
 
 STATIC_FILES = ("fairvalue.py", "paper.py", "backtest.py", "study.py", "pipeline.py", "sizing.py", "strategy.py", "depth.py",
-                "readonly.py", "tracker.py", "cli.py", "demo.py", "store.py", "web.py")
+                "readonly.py", "tracker.py", "cli.py", "demo.py", "store.py", "web.py",
+                "moves.py")  # docs/OUTSIDE_MOVES.md §0: the outside-move watcher, with NO allowlist entry
 WRITE_ATTRS = {"post", "put", "patch", "delete", "send", "stream", "build_request", "mint_realtime_token"}
 WRITE_VERBS = {"POST", "PUT", "PATCH", "DELETE"}
 READ_VERBS = {"GET", "HEAD"}
@@ -258,6 +318,11 @@ def _scan(path: Path) -> List[Tuple[str, int, str, str]]:
 
     visit(tree, "<module>")
     return hits
+
+
+def test_static_moves_py_is_scanned_and_has_no_allowlist_entry() -> None:
+    assert "moves.py" in STATIC_FILES and not any(f == "moves.py" for f, _ in ALLOWLIST)
+    assert _scan(PACKAGE / "moves.py") == []
 
 
 def test_static_no_write_paths_outside_the_allowlist() -> None:

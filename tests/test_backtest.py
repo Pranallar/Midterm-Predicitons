@@ -630,8 +630,10 @@ def test_sweep_rows_limit_and_warning(fixed_sizing: Fixed) -> None:
     assert len(rep.sweep) == 3
     assert {r["label"] for r in rep.sweep} == {"latency_s=30", "latency_s=120", "latency_s=300"}
     for row in rep.sweep:
-        assert set(row) == {"params", "label", "pnl_liq", "trades_closed", "verdict_level", "max_drawdown"}
-    pnls = [r["pnl_liq"] for r in rep.sweep]
+        assert set(row) == {"params", "label", "pnl_liq", "verdict_pnl", "synthetic_pnl", "trades_closed", "verdict_level",
+                            "max_drawdown"}
+        assert row["verdict_pnl"] == pytest.approx(row["pnl_liq"] - row["synthetic_pnl"])
+    pnls = [r["verdict_pnl"] for r in rep.sweep]  # ranked by the verdict's P&L (no assumed fills)
     assert pnls == sorted(pnls, reverse=True)
     assert B.SWEEP_WARNING.format(n=3) in rep.warnings
     two = B.sweep(src, cfg(hours=1.0), {"min_value_edge": [0.01, 0.02], "latency_s": [30, 60]}, signal_fn=value_signal())
@@ -710,3 +712,108 @@ def test_full_size_performance() -> None:
     rep = B.run_backtest(src, BacktestConfig(start=T0, end=T0 + 24 * 3600, step_s=300.0))
     took = time.monotonic() - t0
     assert rep.window["steps"] == 289 and took < B.PERFORMANCE_TARGET_S, took
+
+
+def test_accounting_4_the_replay_names_the_assumed_fills_in_its_pnl_column(fixed_sizing: Fixed) -> None:
+    hours = [{"ts": T0 - 3600 + k * 3600, "open": 0.5, "high": 0.52, "low": 0.49, "close": 0.5, "volume": 5000,
+              "trade_count": 9} for k in range(4)]
+    src = tx_history(with_books=False, candles={("103", "1h"): hours})
+    rep = B.run_backtest(src, cfg(hours=1.0), signal_fn=value_signal())
+    bot = rep.portfolios[1]
+    v = bot.verdict
+    assert v.synthetic_excluded == 1 and v.n_ideas == 0
+    # the table's "P&L at liquidation" (pnl_liq) includes the assumed fill; the verdict states the P&L without it
+    assert v.pnl_liq == pytest.approx(bot.pnl_liq - v.synthetic_pnl) and v.pnl_liq == pytest.approx(0.0)
+    (w,) = [w for w in rep.warnings if w.startswith("The P&L at liquidation column includes assumed fills")]
+    assert f"policy:conservative {v.synthetic_pnl:+,.2f} from 1 idea" in w
+    assert w.endswith("The verdict sentences state the P&L without them.")
+    clean = B.run_backtest(tx_history(), cfg(hours=1.0), signal_fn=value_signal())
+    assert not any("assumed fills" in w for w in clean.warnings)
+
+
+def test_ui_4_a_replay_keeps_its_fixed_capital(fixed_sizing: Fixed) -> None:
+    # the replayed leaderboard carries an initial balance; the replay's capital is fixed (default 100,000)
+    src = tx_history(leaderboards=[LeaderboardSnapshot(at=T0 - 600, initial_balance=50_000.0)])
+    rep = B.run_backtest(src, cfg(hours=1.0), signal_fn=value_signal())
+    assert all(p.start_capital == P.DEFAULT_START_CAPITAL for p in rep.portfolios)
+    assert all(p.fills == 0 or p.cash < P.DEFAULT_START_CAPITAL for p in rep.portfolios)
+
+
+def test_accounting_4_the_sweep_is_ranked_without_assumed_fills(fixed_sizing: Fixed, monkeypatch: pytest.MonkeyPatch) -> None:
+    real = B.run_backtest
+
+    def fake(source: Any, config: Any = None, **kw: Any) -> Any:
+        rep = real(source, config, **kw)
+        lat = float(config.latency_s)
+        port = next(p for p in rep.portfolios if p.portfolio_id == "human:conservative")
+        # latency 30: +10 of its own; latency 120: +1 of its own but +50 from assumed fills
+        own, assumed = (10.0, 0.0) if lat < 60 else (1.0, 50.0)
+        port.pnl_liq = own + assumed
+        port.verdict.pnl_liq, port.verdict.synthetic_pnl = own, assumed
+        return rep
+
+    monkeypatch.setattr(B, "run_backtest", fake)
+    rep = B.sweep(tx_history(), cfg(hours=1.0), {"latency_s": [30, 120]}, signal_fn=value_signal())
+    assert [r["label"] for r in rep.sweep] == ["latency_s=30", "latency_s=120"]
+    assert [(r["pnl_liq"], r["verdict_pnl"], r["synthetic_pnl"]) for r in rep.sweep] == [(10.0, 10.0, 0.0), (51.0, 1.0, 50.0)]
+
+
+# --------------------------------------------------------------------------- integration round: lookahead follow-ups
+
+
+class _RunsHistory(B.MemoryHistory):
+    """A MemoryHistory that also keeps paper runs, as the store does (``paper_run_times``)."""
+
+    def __init__(self, runs: Sequence[Dict[str, Any]], **kw: Any) -> None:
+        super().__init__(**kw)
+        self._runs = [dict(r) for r in runs]
+
+    def paper_run_times(self) -> List[Dict[str, Any]]:
+        return [dict(r) for r in self._runs]
+
+
+def test_lookahead_1_run_backtest_counts_every_stored_paper_run(fixed_sizing: Fixed) -> None:
+    """lookahead-1: run_backtest itself (not only the CLI/dashboard wrappers) takes the overlap from every stored paper
+    run -- here a run that ENDED inside the window and no live_run_started_at at all -- and names the stored books as
+    the paper run's own reads; the sweep's shared preload keeps the runs too."""
+    base = tx_history()
+    runs = [{"run_id": "a", "started_at": T0 - 3600, "updated_at": T0 + 1800, "ended_at": T0 + 1800},
+            {"run_id": "b", "started_at": T0 + 5400, "updated_at": T0 + 6000, "ended_at": None}]
+    src = _RunsHistory(runs, exchanges=base.exchanges(), points={"103": ticks(T0 - 7 * 3600, T0 + 7 * 3600, 0.50, 0.51)},
+                       books={"103": books("103", T0 - 3600, T0 + 7 * 3600, [(0.50, 500)], [(0.51, 500)])})
+    rep = B.run_backtest(src, cfg(hours=2.0), signal_fn=value_signal(), clock=lambda: T0 + 9000)
+    assert rep.coverage["book_snapshot_share"] > 0  # it filled on the stored books
+    # [T0, T0+1800] (ended) and [T0+5400, window end] (still open: it runs until now, T0+9000)
+    assert rep.overlap_hours == pytest.approx(0.5 + 0.5)
+    assert rep.warnings[0].startswith(B.OVERLAP_WARNING.format(h=1.0))
+    from supermarket_bot import pipeline
+
+    assert pipeline.OVERLAP_BOOKS_NOTE in rep.warnings[0]
+    again = pipeline.apply_paper_overlap(rep, pipeline.paper_run_intervals(src, now=T0 + 9000))
+    assert sum("independent check" in w for w in again.warnings) == 1 and again.overlap_hours == pytest.approx(1.0)
+    pre = B.PreloadedHistory(src, T0, T0 + 7200)
+    assert [r["run_id"] for r in pre.paper_run_times()] == ["a", "b"]
+    clean = B.run_backtest(_RunsHistory([], exchanges=base.exchanges(),
+                                        points={"103": ticks(T0 - 7 * 3600, T0 + 7 * 3600, 0.50, 0.51)}),
+                           cfg(hours=2.0), signal_fn=lambda i, p: [])
+    assert clean.overlap_hours is None and not any("independent check" in w for w in clean.warnings)
+
+
+def test_lookahead_2_a_record_fetched_after_its_availability_is_not_replayed() -> None:
+    """lookahead-2 (rows recorded before the fair-value service stamped records at the refresh's return): a record
+    stamped ts = refresh START whose quotes were fetched later (as_of > t - latency) is not available yet, and a refresh
+    row's fetched_at never moves as_of past t - latency."""
+    early = [FairValueRecord(ts=T0 + 600, exchange_id="103", value=0.65, source="polymarket", usable=True,
+                             confidence="high", as_of=T0 + 640, venues=["polymarket"],
+                             detail={"match_kind": "EXACT", "match_confidence": 1.0})]
+    refs = [FairValueRefresh(ts=T0 + 600, venues={"polymarket": {"status": "ok", "fetched_at": T0 + 640}})]
+    market, guard = market_at(tx_history(fair_values=early, refreshes=refs), cfg(hours=1.0, latency_s=30.0))
+    guard.set_time(T0 + 660)  # the record is "available" by ts (<= t - 30) but its data was fetched at T0+640 > T0+630
+    assert market.inputs(T0 + 660).fair_values == {}
+    guard.set_time(T0 + 670)
+    assert market.inputs(T0 + 670).fair_values["103"].value == 0.65
+    rec = FairValueRecord(ts=T0, exchange_id="103", value=0.6, source="polymarket", usable=True, confidence="high",
+                          as_of=T0, venues=["polymarket"])
+    late_fetch = FairValueRefresh(T0 + 300, {"polymarket": {"status": "ok", "fetched_at": T0 + 340}})
+    assert B.replay_fair_value(rec, late_fetch, T0 + 360, 60.0).as_of == T0  # T0+340 > T0+300: not yet known
+    assert B.replay_fair_value(rec, late_fetch, T0 + 400, 60.0).as_of == T0 + 340

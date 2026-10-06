@@ -5,7 +5,7 @@ Thread-safe: one connection guarded by a lock (WAL mode on file databases). Pass
 for tests. See docs/DESIGN.md. :meth:`TrackerStore.open_read_only` opens a second, read-only
 connection on the same file (the dashboard's backtests never touch the live connection).
 
-Layout (schema version 2, tracked with ``PRAGMA user_version``; version 1 databases migrate in place):
+Layout (schema version 3, tracked with ``PRAGMA user_version``; version 1 and 2 databases migrate in place):
 
 * ``markets`` / ``exchanges``: metadata from the market list (one row per market / outcome).
 * ``ticks``: our own bulk-price snapshots, ``PRIMARY KEY (exchange_id, ts)``. Pruned to the
@@ -28,6 +28,13 @@ Added in schema version 2 (replays and the paper trader):
 * ``paper_runs`` / ``paper_orders`` / ``paper_fills`` / ``paper_trades`` / ``paper_equity`` /
   ``paper_events``: the paper trader's runs (``paper.PaperPersistence``).
 
+Added in schema version 3 (outside-move alerts, docs/OUTSIDE_MOVES.md §14; ``moves.MovesPersistence``):
+
+* ``outside_quotes``: polled Polymarket / Kalshi (or demo venue) samples, stored on a one-tick change plus a
+  300-s heartbeat, kept 3 days (about 35 MB a day live).
+* ``move_alerts``: every outside-move alert with its lag outcome (the JSON ``data`` is ``MoveAlert.to_dict()``),
+  kept 30 days.
+
 All timestamps are epoch seconds (UTC floats). API ISO strings are converted with
 :func:`books.parse_time`.
 """
@@ -38,6 +45,8 @@ import dataclasses
 import json
 import logging
 import math
+import os
+import socket
 import sqlite3
 import threading
 import time
@@ -65,12 +74,19 @@ from .models import (
 
 log = logging.getLogger("supermarket_bot")
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 TICK_RETENTION_S = 10 * 86400.0  # ticks older than this (relative to the newest insert) are pruned
 TICK_GAP_S = 900.0  # a pause between ticks longer than this is a tracking gap: candles fill it
 PRUNE_EVERY = 500  # tick inserts between prunes
 NEWS_RETENTION_S = 7 * 86400.0
 PAPER_RUN_RETENTION_S = 30 * 86400.0  # paper runs ended longer ago are deleted with their rows
+# docs/OUTSIDE_MOVES.md §14 (schema v3, package "wiring"): outside-move samples and alerts
+OUTSIDE_QUOTE_RETENTION_S = 3 * 86400.0  # stored outside samples (on a one-tick change + 300-s heartbeat)
+MOVE_ALERT_RETENTION_S = 30 * 86400.0  # outside-move alerts and their lag outcomes
+# A lease held by a LIVE process on this machine is refused whatever its heartbeat age (live-1: a cycle stuck in
+# client retries is not a dead tracker), up to this age (a hung, suspended or recycled pid cannot lock a store out
+# for ever).
+LEASE_LIVE_HOLDER_MAX_S = 600.0
 BOOK_SNAPSHOT_DEPTH = 20  # levels per side kept in book_snapshots
 RESOLUTION_SECONDS: Dict[str, float] = {"1m": 60.0, "5m": 300.0, "1h": 3600.0, "1d": 86400.0, "1w": 604800.0}
 _MAX_RESOLUTION_S = max(RESOLUTION_SECONDS.values())
@@ -205,7 +221,29 @@ CREATE TABLE IF NOT EXISTS paper_events (
     data TEXT NOT NULL, PRIMARY KEY (run_id, event_id));
 """
 
-_MIGRATIONS: Dict[int, str] = {1: _SCHEMA_V1, 2: _SCHEMA_V2}
+# docs/OUTSIDE_MOVES.md §14: outside-move samples and alerts (moves.MovesPersistence)
+_SCHEMA_V3 = """
+CREATE TABLE IF NOT EXISTS outside_quotes (
+    exchange_id TEXT NOT NULL, venue TEXT NOT NULL, ts REAL NOT NULL,
+    bid REAL, ask REAL, value REAL, spread REAL, bid_size REAL, ask_size REAL, liquidity REAL,
+    flags TEXT NOT NULL DEFAULT '[]', external_id TEXT NOT NULL DEFAULT '',
+    match_kind TEXT NOT NULL DEFAULT 'EXACT', match_confidence REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY (exchange_id, venue, ts)) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS outside_quotes_ts ON outside_quotes (ts);
+CREATE TABLE IF NOT EXISTS move_alerts (
+    alert_id TEXT PRIMARY KEY, exchange_id TEXT NOT NULL, race_key TEXT,
+    detected_at REAL NOT NULL, updated_at REAL NOT NULL, closed_at REAL,
+    state TEXT NOT NULL, status TEXT NOT NULL, lag_outcome TEXT NOT NULL, lag_s REAL,
+    demo INTEGER NOT NULL DEFAULT 0, data TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS move_alerts_detected ON move_alerts (detected_at);
+CREATE INDEX IF NOT EXISTS move_alerts_state ON move_alerts (state, detected_at);
+"""
+
+_MIGRATIONS: Dict[int, str] = {1: _SCHEMA_V1, 2: _SCHEMA_V2, 3: _SCHEMA_V3}
+_OUTSIDE_QUOTE_COLUMNS: Tuple[str, ...] = (
+    "exchange_id", "venue", "ts", "bid", "ask", "value", "spread", "bid_size", "ask_size", "liquidity", "flags",
+    "external_id", "match_kind", "match_confidence",
+)
 _PAPER_TABLES = ("paper_orders", "paper_fills", "paper_trades", "paper_equity", "paper_events")
 
 # Surge dataclass field -> column (only ``window`` differs: it is an SQL keyword).
@@ -463,6 +501,72 @@ def _merge_surges(old: Surge, new: Surge) -> Surge:
 # --------------------------------------------------------------------------- store
 
 
+def _process_started_at(pid: int) -> Optional[float]:
+    """Wall-clock start time of process ``pid`` from Linux ``/proc`` (None elsewhere, or when unreadable)."""
+    try:
+        with open(f"/proc/{int(pid)}/stat", "rb") as fh:
+            stat = fh.read().decode("ascii", "replace")
+        start_ticks = float(stat[stat.rindex(")") + 2:].split()[19])  # field 22 (starttime), after "(comm) "
+        btime = None
+        with open("/proc/stat", "rb") as fh:
+            for line in fh:
+                if line.startswith(b"btime "):
+                    btime = float(line.split()[1])
+                    break
+        if btime is None:
+            return None
+        return btime + start_ticks / float(os.sysconf("SC_CLK_TCK"))
+    except (OSError, ValueError, IndexError, AttributeError):
+        return None
+
+
+def _owner_created_at(owner_id: Any) -> Optional[float]:
+    """The wall-clock time a tracker's ``owner_id`` (``host:pid:time:seq``) was made, else None."""
+    parts = str(owner_id or "").rsplit(":", 3)
+    if len(parts) != 4:
+        return None
+    try:
+        value = float(parts[2])
+    except ValueError:
+        return None
+    return value if math.isfinite(value) and value > 0 else None
+
+
+def lease_holder_alive(holder: Mapping[str, Any]) -> Optional[bool]:
+    """Whether the process holding a lease is still running (live-5): True / False for another process on THIS
+    machine (``host`` is this host name), None when it cannot be told (another machine, this very process, no
+    pid, or a platform without a safe check -- ``os.kill(pid, 0)`` would terminate the process on Windows).
+    A pid that was recycled by a process started after the lease's tracker was created counts as ended."""
+    try:
+        pid = int(holder.get("pid"))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    if pid <= 0 or pid == os.getpid() or os.name != "posix":
+        return None
+    try:
+        if str(holder.get("host") or "") != socket.gethostname():
+            return None
+    except OSError:
+        return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass  # it exists (another user's process)
+    except OSError:
+        return None
+    created = _owner_created_at(holder.get("owner_id"))
+    started = _process_started_at(pid)
+    mine = _process_started_at(os.getpid())
+    wall = time.time()
+    # the /proc clock is trusted only when it puts this process's own start in the past
+    if created is not None and started is not None and mine is not None and mine <= wall + 2.0:
+        if started > created + 2.0:
+            return False  # the pid now belongs to a process that started after that tracker: it ended
+    return True
+
+
 class TrackerStore:
     def __init__(self, path: Union[str, Path] = ":memory:", clock: Callable[[], float] = time.time, *,
                  _read_only: bool = False) -> None:
@@ -481,6 +585,7 @@ class TrackerStore:
         self._pruned_once = False
         self._tick_ids: Set[str] = set()  # exchanges that received ticks through this store object
         self._closed = False
+        self.last_takeover: Optional[Dict[str, Any]] = None  # the lease holder acquire_lease last took over
         if self.read_only:
             if not Path(self.path).is_file():
                 raise FileNotFoundError(f"{self.path}: no such database")
@@ -684,7 +789,11 @@ class TrackerStore:
             conn.executemany("DELETE FROM book_snapshots WHERE exchange_id = ? AND ts < ?", [(eid, cutoff) for eid in ids])
         conn.execute("DELETE FROM fair_values WHERE ts < ?", (cutoff,))
         conn.execute("DELETE FROM fair_value_refreshes WHERE ts < ?", (cutoff,))
-        self._prune_paper_runs(conn, cutoff + TICK_RETENTION_S - PAPER_RUN_RETENTION_S)
+        newest = cutoff + TICK_RETENTION_S
+        self._prune_paper_runs(conn, newest - PAPER_RUN_RETENTION_S)
+        # outside-move samples (3 days) and alerts (30 days), relative to the newest tick like the rest (§14)
+        conn.execute("DELETE FROM outside_quotes WHERE ts < ?", (newest - OUTSIDE_QUOTE_RETENTION_S,))
+        conn.execute("DELETE FROM move_alerts WHERE detected_at < ?", (newest - MOVE_ALERT_RETENTION_S,))
 
     @staticmethod
     def _prune_paper_runs(conn: sqlite3.Connection, ended_before: float) -> None:
@@ -1187,6 +1296,112 @@ class TrackerStore:
         rows = self._query(sql + " ORDER BY ts", params)
         return [FairValueRefresh(ts=r["ts"], venues=dict(_load_json(r["venues"], {}))) for r in rows]
 
+    # outside moves (docs/OUTSIDE_MOVES.md §14; moves.MovesPersistence) -----------
+    def add_outside_quotes(self, rows: Sequence[Mapping[str, Any]]) -> int:
+        """Upsert ``moves.OutsideSample.to_dict()`` rows by (exchange_id, venue, ts); returns the rows written.
+        Rows without an exchange id, a venue or a finite ``ts`` are skipped."""
+        records: List[Tuple[Any, ...]] = []
+        for raw in rows or ():
+            if not isinstance(raw, Mapping):
+                continue
+            eid, venue, ts = raw.get("exchange_id"), raw.get("venue"), _num(raw.get("ts"))
+            if eid is None or venue is None or ts is None:
+                continue
+            flags = raw.get("flags")
+            records.append((
+                str(eid), str(venue), ts, _num(raw.get("bid")), _num(raw.get("ask")), _num(raw.get("value")),
+                _num(raw.get("spread")), _num(raw.get("bid_size")), _num(raw.get("ask_size")), _num(raw.get("liquidity")),
+                _dumps([str(f) for f in flags] if isinstance(flags, (list, tuple)) else []),
+                str(raw.get("external_id") or ""), str(raw.get("match_kind") or "EXACT"),
+                _num(raw.get("match_confidence")) or 0.0,
+            ))
+        if not records:
+            return 0
+        marks = ", ".join("?" for _ in _OUTSIDE_QUOTE_COLUMNS)
+        with self._write() as conn:
+            conn.executemany(
+                f"INSERT OR REPLACE INTO outside_quotes ({', '.join(_OUTSIDE_QUOTE_COLUMNS)}) VALUES ({marks})", records)
+        return len(records)
+
+    def outside_quotes(self, since: float, until: Optional[float] = None,
+                       exchange_ids: Optional[Sequence[str]] = None) -> List[Dict[str, Any]]:
+        """Stored samples with since <= ts <= until, oldest first (ties by exchange_id, venue), as dicts with the
+        ``OutsideSample.to_dict()`` keys (``flags`` decoded)."""
+        base = f"SELECT {', '.join(_OUTSIDE_QUOTE_COLUMNS)} FROM outside_quotes WHERE ts >= ?"
+        params: List[Any] = [float(since)]
+        if until is not None:
+            base += " AND ts <= ?"
+            params.append(float(until))
+        rows: List[sqlite3.Row] = []
+        if exchange_ids is None:
+            rows = self._query(base + " ORDER BY ts, exchange_id, venue", params)
+        else:
+            ids = sorted({str(e) for e in exchange_ids})
+            for i in range(0, len(ids), 500):
+                chunk = ids[i:i + 500]
+                marks = ", ".join("?" for _ in chunk)
+                rows += self._query(base + f" AND exchange_id IN ({marks})", params + chunk)
+            rows.sort(key=lambda r: (r["ts"], r["exchange_id"], r["venue"]))
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            item = {name: r[name] for name in _OUTSIDE_QUOTE_COLUMNS}
+            item["flags"] = [str(f) for f in _load_json(r["flags"], []) or []]
+            out.append(item)
+        return out
+
+    def put_move_alerts(self, rows: Sequence[Mapping[str, Any]]) -> int:
+        """Upsert ``moves.MoveAlert.to_dict()`` rows by alert_id (indexed columns + the JSON ``data``); returns the
+        rows written. ``lag_outcome`` / ``lag_s`` come from ``data["lag"]``."""
+        records: List[Tuple[Any, ...]] = []
+        for raw in rows or ():
+            if not isinstance(raw, Mapping) or not raw.get("alert_id") or raw.get("exchange_id") is None:
+                continue
+            detected = _num(raw.get("detected_at"))
+            if detected is None:
+                continue
+            updated = _num(raw.get("updated_at"))
+            lag = raw.get("lag") if isinstance(raw.get("lag"), Mapping) else {}
+            race_key = raw.get("race_key")
+            records.append((
+                str(raw["alert_id"]), str(raw["exchange_id"]), str(race_key) if race_key is not None else None,
+                detected, updated if updated is not None else detected, _num(raw.get("closed_at")),
+                str(raw.get("state") or "open"), str(raw.get("status") or ""), str(lag.get("outcome") or "pending"),
+                _num(lag.get("lag_s")), int(bool(raw.get("demo"))), _dumps(dict(raw)),
+            ))
+        if not records:
+            return 0
+        with self._write() as conn:
+            conn.executemany(
+                "INSERT OR REPLACE INTO move_alerts (alert_id, exchange_id, race_key, detected_at, updated_at, closed_at, "
+                "state, status, lag_outcome, lag_s, demo, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                records,
+            )
+        return len(records)
+
+    def move_alerts(self, since: Optional[float] = None, until: Optional[float] = None, state: Optional[str] = None,
+                    limit: int = 5000) -> List[Dict[str, Any]]:
+        """Stored alert dicts with detected_at in [since, until] (and ``state``), the newest ``limit``, oldest first
+        (ties by alert_id). Works on a read-only store too (``moves --replay``)."""
+        sql = "SELECT data FROM move_alerts WHERE 1 = 1"
+        params: List[Any] = []
+        if since is not None:
+            sql += " AND detected_at >= ?"
+            params.append(float(since))
+        if until is not None:
+            sql += " AND detected_at <= ?"
+            params.append(float(until))
+        if state is not None:
+            sql += " AND state = ?"
+            params.append(str(state))
+        sql += " ORDER BY detected_at DESC, alert_id DESC LIMIT ?"
+        params.append(max(0, int(limit)))
+        out: List[Dict[str, Any]] = []
+        for r in reversed(self._query(sql, params)):
+            data = _load_json(r["data"], None)
+            if isinstance(data, dict):
+                out.append(data)
+        return out
+
     # book snapshots ------------------------------------------------------------
     def add_book_snapshots(self, rows: Sequence[Any]) -> int:
         """Store order-book reads: dicts ``{"exchange_id", "ts", "source", "bids", "asks", "sequence"}`` or
@@ -1307,19 +1522,33 @@ class TrackerStore:
     # leases (one tracker per database, D46) ---------------------------------------
     def acquire_lease(self, name: str, owner: Mapping[str, Any], now: float, ttl_s: float) -> Optional[Dict[str, Any]]:
         """Take (or renew) the lease ``name`` for ``owner`` (``{"owner_id", "pid", "host"}``). Returns None when it
-        is ours now, else the live holder ``{"owner_id", "pid", "host", "heartbeat_at"}`` (its heartbeat is younger
-        than ``ttl_s``). An older lease is taken over."""
+        is ours now, else the live holder ``{"owner_id", "pid", "host", "heartbeat_at", "alive"}``.
+
+        Who holds it (D46, live-1 / live-5): another process on THIS machine is asked directly
+        (:func:`lease_holder_alive`): while it runs, the lease is refused whatever its heartbeat age (up to
+        LEASE_LIVE_HOLDER_MAX_S: a hung or suspended process cannot lock the store for ever) and ``alive`` is True;
+        once it has ended (a crash, a closed terminal) its lease is taken over at once. A holder on another machine
+        (or this very process) holds it while its heartbeat is younger than ``ttl_s`` (``alive`` None); an older
+        lease is taken over. ``last_takeover`` records the holder a successful call took over (else None)."""
         owner_id = str(owner.get("owner_id"))
         pid = owner.get("pid")
         host = owner.get("host")
         stamp = float(now)
+        self.last_takeover = None
         with self._write(immediate=True) as conn:
             row = conn.execute("SELECT * FROM leases WHERE name = ?", (str(name),)).fetchone()
             if row is not None and row["owner_id"] != owner_id:
+                held = {"owner_id": row["owner_id"], "pid": row["pid"], "host": row["host"],
+                        "heartbeat_at": row["heartbeat_at"]}
                 age = stamp - float(row["heartbeat_at"])
-                if -float(ttl_s) < age < float(ttl_s):
-                    return {"owner_id": row["owner_id"], "pid": row["pid"], "host": row["host"],
-                            "heartbeat_at": row["heartbeat_at"]}
+                alive = lease_holder_alive(held)
+                if alive is True:
+                    limit = max(float(ttl_s), LEASE_LIVE_HOLDER_MAX_S)
+                    if -limit < age < limit:
+                        return {**held, "alive": True}
+                elif alive is None and -float(ttl_s) < age < float(ttl_s):
+                    return {**held, "alive": None}
+                self.last_takeover = {**held, "alive": alive, "age_s": age}
             if row is not None and row["owner_id"] == owner_id:
                 conn.execute("UPDATE leases SET heartbeat_at = ?, pid = ?, host = ? WHERE name = ?",
                              (stamp, pid, host, str(name)))
@@ -1385,6 +1614,13 @@ class TrackerStore:
         """Every stored run, oldest first (``config``/``state`` decoded)."""
         rows = self._query("SELECT * FROM paper_runs ORDER BY started_at, rowid")
         return [d for d in (self._run_dict(r) for r in rows) if d is not None]
+
+    def paper_run_times(self) -> List[Dict[str, Any]]:
+        """Every stored run's ``{"run_id", "started_at", "updated_at", "ended_at"}``, oldest first, without decoding
+        its config or state (what a backtest needs to tell whether its window overlaps a paper run, lookahead-1)."""
+        rows = self._query("SELECT run_id, started_at, updated_at, ended_at FROM paper_runs ORDER BY started_at, rowid")
+        return [{"run_id": r["run_id"], "started_at": r["started_at"], "updated_at": r["updated_at"],
+                 "ended_at": r["ended_at"]} for r in rows]
 
     def paper_put_orders(self, run_id: str, orders: Sequence[Mapping[str, Any]]) -> None:
         rows = [(str(run_id), str(o["order_id"]), str(o.get("portfolio_id") or ""), float(o.get("created_at") or 0.0),

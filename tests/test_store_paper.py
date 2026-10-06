@@ -71,7 +71,7 @@ def _market(mid: str, eids: List[str]) -> Dict[str, Any]:
 
 
 def test_schema_v2_tables_and_version(st: TrackerStore) -> None:
-    assert st.schema_version == SCHEMA_VERSION == 2
+    assert st.schema_version == SCHEMA_VERSION == 3  # v3 (docs/OUTSIDE_MOVES.md §14) keeps every v2 table
     tables = {r[0] for r in st._query("SELECT name FROM sqlite_master WHERE type = 'table'")}
     assert {"fair_values", "fair_value_refreshes", "book_snapshots", "settlements", "leaderboard_snapshots", "leases",
             "paper_runs", "paper_orders", "paper_fills", "paper_trades", "paper_equity", "paper_events"} <= tables
@@ -79,7 +79,7 @@ def test_schema_v2_tables_and_version(st: TrackerStore) -> None:
     assert "fetched_at" in cols
 
 
-def test_v1_database_migrates_to_v2_keeping_its_data(tmp_path: Path) -> None:
+def test_v1_database_migrates_to_v3_keeping_its_data(tmp_path: Path) -> None:
     path = tmp_path / "old.sqlite3"
     conn = sqlite3.connect(str(path))
     conn.executescript(store_mod._SCHEMA_V1 + "\nPRAGMA user_version = 1;")
@@ -91,7 +91,7 @@ def test_v1_database_migrates_to_v2_keeping_its_data(tmp_path: Path) -> None:
 
     st = TrackerStore(path, clock=Clock(T + 100))
     try:
-        assert st.schema_version == 2
+        assert st.schema_version == 3
         assert st.tick_count() == 1 and st.get_state("k") == {"a": 1}
         [old] = st.trades("e1", T - 1)
         assert old.trade_id == "t1" and old.fetched_at is None  # stored before v2: never replayed
@@ -101,9 +101,9 @@ def test_v1_database_migrates_to_v2_keeping_its_data(tmp_path: Path) -> None:
         assert st.paper_load_run(None) is None and st.settlements() == {}
     finally:
         st.close()
-    again = TrackerStore(path)  # re-opening a v2 database is a no-op
+    again = TrackerStore(path)  # re-opening a v3 database is a no-op
     try:
-        assert again.schema_version == 2 and again.tick_count() == 1
+        assert again.schema_version == 3 and again.tick_count() == 1
     finally:
         again.close()
 
@@ -271,7 +271,8 @@ def test_leases_acquire_renew_block_take_over_and_release(st: TrackerStore) -> N
     assert st.acquire_lease("tracker", me, T, ttl_s=90) is None
     assert st.acquire_lease("tracker", me, T + 30, ttl_s=90) is None  # the same owner renews
     holder = st.acquire_lease("tracker", other, T + 60, ttl_s=90)
-    assert holder == {"owner_id": "host:1:a", "pid": 1, "host": "host", "heartbeat_at": T + 30}
+    # another machine (or a holder whose state cannot be checked): held while its heartbeat is fresh
+    assert holder == {"owner_id": "host:1:a", "pid": 1, "host": "host", "heartbeat_at": T + 30, "alive": None}
     assert st.renew_lease("tracker", "host:1:a", T + 100) is True
     assert st.renew_lease("tracker", "laptop:1234:b", T + 100) is False
     assert st.acquire_lease("tracker", other, T + 100 + 91, ttl_s=90) is None  # a stale heartbeat is taken over
@@ -282,6 +283,86 @@ def test_leases_acquire_renew_block_take_over_and_release(st: TrackerStore) -> N
     st.release_lease("tracker", "laptop:1234:b")
     assert st.lease("tracker") is None
     assert st.acquire_lease("tracker", me, T + 300, ttl_s=90) is None
+
+
+def _dead_pid() -> int:
+    """The pid of a process that has just exited (reaped: it no longer exists)."""
+    import subprocess
+    import sys
+
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait(timeout=30)
+    return proc.pid
+
+
+@pytest.mark.skipif(__import__("os").name != "posix", reason="pid liveness is checked on POSIX only")
+def test_live_5_a_fresh_lease_of_a_dead_process_on_this_machine_is_taken_over(st: TrackerStore) -> None:
+    """live-5: after a crash or a closed terminal the lease's heartbeat is still fresh, but its pid (this host) is
+    gone: the next start takes it over at once instead of refusing for 90 s."""
+    import os
+    import socket
+
+    host = socket.gethostname()
+    pid = _dead_pid()
+    crashed = {"owner_id": f"{host}:{pid}:{T - 100:.6f}:1", "pid": pid, "host": host}
+    assert st.acquire_lease("tracker", crashed, T, ttl_s=90) is None
+    me = {"owner_id": f"{host}:{os.getpid()}:{T:.6f}:2", "pid": os.getpid(), "host": host}
+    assert st.acquire_lease("tracker", me, T + 5, ttl_s=90) is None  # 5 s later: heartbeat fresh, pid dead
+    assert st.lease("tracker")["owner_id"] == me["owner_id"]
+    assert st.last_takeover is not None and st.last_takeover["pid"] == pid and st.last_takeover["alive"] is False
+
+
+@pytest.mark.skipif(__import__("os").name != "posix", reason="pid liveness is checked on POSIX only")
+def test_live_1_a_running_process_on_this_machine_keeps_its_lease_whatever_the_heartbeat_age(st: TrackerStore) -> None:
+    """live-1: a tracker whose cycle sits in client retries is alive: a second start is refused even when the
+    heartbeat is older than the TTL (up to LEASE_LIVE_HOLDER_MAX_S), with ``alive`` True."""
+    import socket
+    import subprocess
+    import sys
+    import time as _time
+
+    host = socket.gethostname()
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        holder = {"owner_id": f"{host}:{proc.pid}:{_time.time() + 5:.6f}:1", "pid": proc.pid, "host": host}
+        assert st.acquire_lease("tracker", holder, T, ttl_s=90) is None
+        other = {"owner_id": "x:1:2:3", "pid": 999999, "host": host}
+        busy = st.acquire_lease("tracker", other, T + 206, ttl_s=90)  # 206 s without a heartbeat (TTL 90 s)
+        assert busy is not None and busy["pid"] == proc.pid and busy["alive"] is True
+        late = T + store_mod.LEASE_LIVE_HOLDER_MAX_S + 1  # hung for longer than that: it cannot lock the store
+        assert st.acquire_lease("tracker", other, late, ttl_s=90) is None
+    finally:
+        proc.kill()
+        proc.wait(timeout=30)
+
+
+@pytest.mark.skipif(__import__("os").name != "posix", reason="pid liveness is checked on POSIX only")
+def test_live_5_a_recycled_pid_does_not_hold_a_lease(st: TrackerStore, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A pid that now belongs to a process started after the lease's tracker was created is not that tracker."""
+    import os
+    import socket
+
+    host = socket.gethostname()
+    ppid = os.getppid()  # alive, and started before this test
+    started = store_mod._process_started_at(ppid)
+    if started is None:
+        pytest.skip("no /proc start times here")
+    holder = {"owner_id": f"{host}:{ppid}:{started - 3600:.6f}:1", "pid": ppid, "host": host}  # made before it started
+    assert store_mod.lease_holder_alive(holder) is False
+    holder["owner_id"] = f"{host}:{ppid}:{started + 10:.6f}:1"
+    assert store_mod.lease_holder_alive(holder) is True
+    assert store_mod.lease_holder_alive({"pid": os.getpid(), "host": host}) is None  # this very process
+    assert store_mod.lease_holder_alive({"pid": ppid, "host": "some-other-machine"}) is None
+
+
+def test_lookahead_1_paper_run_times_lists_every_run_without_decoding(st: TrackerStore) -> None:
+    st.paper_save_run("a", T, {"big": "config"}, {"big": "state"}, T + 10)
+    st.paper_end_run("a", T + 3600)
+    st.paper_save_run("b", T + 7200, {}, {}, T + 7300)
+    assert st.paper_run_times() == [
+        {"run_id": "a", "started_at": T, "updated_at": T + 10, "ended_at": T + 3600},
+        {"run_id": "b", "started_at": T + 7200, "updated_at": T + 7300, "ended_at": None},
+    ]
 
 
 # --------------------------------------------------------------------------- read-only connection

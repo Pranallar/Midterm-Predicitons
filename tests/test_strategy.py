@@ -12,6 +12,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import pytest
 
+from supermarket_bot import sizing as Z
 from supermarket_bot import strategy as S
 from supermarket_bot.analytics import SURGE_WINDOWS, _Series, detect_surges, high_band, update_surge_status, window_tolerance
 from supermarket_bot.models import (
@@ -19,10 +20,15 @@ from supermarket_bot.models import (
     SURGE_REVERTED,
     Attribution,
     BacktestResult,
+    BarEstimate,
     ExchangeInfo,
+    FairValue,
     HighBand,
     Opportunity,
     PricePoint,
+    RaceRef,
+    SizingContext,
+    StrategyInputs,
     StrategyParams,
     StrategyReport,
     Surge,
@@ -901,7 +907,10 @@ class TestRound2Regressions:
         assert "your cash (positions not counted) 60,000" in cash.principles[-1]
         assert any("Account value unknown" in a for a in cash.assumptions)
         fade = next(o for o in r.opportunities if o.kind == "fade")
-        assert fade.suggested_shares == math.floor(0.08 * 60_000 / 0.31)  # sized on cash
+        # [updated, strategy-5] sized on the account value (cash plus positions, like the paper engine's equity), not on
+        # the cash: 8% of 100,000; the 40,000 in positions count against the total cap, and the cash caps the order
+        assert fade.suggested_shares == math.floor(0.08 * 100_000 / 0.31)
+        assert fade.suggested_shares * (fade.limit_price or 0.0) <= 60_000
 
     def test_r2_functional_6_no_carry_against_an_arbitrage_leg(self) -> None:
         """The Arizona arbitrage buys YES on 'Any other candidate'; a NO carry on it would pair
@@ -935,3 +944,97 @@ class TestRound2Regressions:
         r = build_report(**scenario(surges=[spike, deeper], latest={"e1": quote(0.29, 0.30)}, bands=[], constraints=None,
                                     overround_rows=()))
         assert [o.surge_id for o in r.opportunities if o.kind == "fade"] == [5]
+
+
+# --------------------------------------------------------------------------- strategy fixer regressions
+
+SLATE = ["PA", "GA", "MI", "WI", "NC", "OH", "TX"]
+BAR = BarEstimate(value=221_500.0, low=221_500.0, high=221_500.0)
+
+
+def value_slate(states: Sequence[str], *, now: float = NOW, bid: float = 0.24, ask: float = 0.25, fair: float = 0.33,
+                settle: float = CUP_END - 30 * H, unc: float = 0.01, regime: str = "unknown", balance: float = BAL,
+                account_value: Optional[float] = None, bar: Optional[BarEstimate] = BAR) -> StrategyInputs:
+    """One Democratic-leaning value idea per state (the same price and fair value in each)."""
+    infos, latest, fvs, races = {}, {}, {}, {}
+    for i, st in enumerate(states):
+        eid = str(9200 + i)
+        infos[eid] = ExchangeInfo(exchange_id=eid, market_id=str(500 + i), option=None,
+                                  market_title=f"Will the Democratic Party win the {st} Senate race?",
+                                  settlement_date=iso(settle))
+        latest[eid] = PricePoint(ts=now, price=round((bid + ask) / 2, 6), bid=bid, ask=ask)
+        fvs[eid] = FairValue(exchange_id=eid, value=fair, source="polymarket", confidence="high", usable=True,
+                             as_of=now - 30, uncertainty=unc, match_kind="EXACT", match_confidence=0.95)
+        races[eid] = RaceRef(f"2026:SENATE:{st}", "SENATE", st, party="D")
+    return StrategyInputs(now=now, cup_end=CUP_END, infos=infos, latest=latest, fair_values=fvs, races=races,
+                          settlement_regime=regime, balance=balance, initial_balance=BAL, account_value=account_value,
+                          bar=bar)
+
+
+def sim_ctx(now: float, *, equity: float = BAL, bar: Optional[BarEstimate] = BAR) -> SizingContext:
+    return SizingContext(now=now, equity=equity, cash=equity, free_cash=equity, start_capital=BAL, cup_end=CUP_END,
+                         days_left=(CUP_END - now) / 86400.0, bar=bar, params=StrategyParams())
+
+
+class TestStrategyFixerRegressions:
+    def test_strategy_1_cards_are_sized_together_like_the_simulator(self) -> None:
+        # chase mode: 7 Democratic-leaning cards used to say 5,333 each (37,333); the simulator funds 5 for 17,504
+        now = CUP_END - 10 * 86400
+        inp = value_slate(SLATE, now=now)
+        r = S.report_from_inputs(inp, sizing="chaser")
+        cards = [o for o in r.opportunities if o.kind == "value"]
+        assert len(cards) == 7 and r.sizing["mode"] == "chase"
+        joint = Z.ChaserPolicy().size_all(S.generate_signals(inp), sim_ctx(now))
+        assert {o.idea_id: o.suggested_shares for o in cards} == {k: d.units for k, d in joint.items()}
+        assert sum(1 for o in cards if o.suggested_shares > 0) == 5  # top_k
+        assert sum(o.suggested_cost for o in cards) == pytest.approx(sum(d.stake for d in joint.values()), abs=1.0)
+        assert S.JOINT_SIZING_LINE in r.sizing["lines"] and S.JOINT_SIZING_LINE in r.sizing["alternative"]["lines"]
+        later = [o for o in cards if any(line.startswith("Sized after the") and "ideas funded before it" in line
+                                         or line.startswith("Sized after the idea funded before it")
+                                         for line in o.sizing["lines"])]
+        assert len(later) == 6  # every card but the first one sized
+        # swing mode (1 day left): ONE bold card (it was 7 x 40,500 = 283,500 on 100,000), held to settlement
+        now = CUP_END - 86400
+        r = S.report_from_inputs(value_slate(SLATE, now=now), sizing="chaser")
+        cards = [o for o in r.opportunities if o.kind == "value"]
+        bolds = [o for o in cards if o.sizing["bold"]]
+        assert r.sizing["mode"] == "swing" and len(bolds) == 1
+        assert sum(o.suggested_shares * (o.limit_price or 0.0) for o in cards) <= BAL + 1e-6  # the cash covers them all
+        b = bolds[0]
+        assert b.exit_plan is not None and b.exit_plan.hold_to_resolution and b.exit_plan.target_bid is None
+        assert not b.exit_plan.dynamic_fv_target and b.target_price is None and S.BOLD_CARD_LINE in b.rationale
+        assert sum(1 for o in cards if any(line.startswith("Bold bet") for line in o.sizing["lines"])) == 1
+        # conservative: 12 cards "within 8%" each used to add up to 75% (cap 60%) and a 3-point swing cost 32% (cap 10%)
+        twelve = SLATE + ["FL", "IA", "NH", "MN", "VA"]
+        inp = value_slate(twelve, bid=0.39, ask=0.40, fair=0.55, settle=CUP_END, unc=0.0, regime="resolved_outcomes",
+                          bar=None)
+        r = S.report_from_inputs(inp, sizing="conservative")
+        cards = [o for o in r.opportunities if o.kind == "value"]
+        assert len(cards) == 12
+        total = sum(o.suggested_cost for o in cards)
+        swing = 3 * sum(o.suggested_shares * (o.factor_delta or 0.0) for o in cards)
+        assert total <= 0.60 * BAL + 1 and swing <= 0.10 * BAL + 1
+        assert any("tilt_cap" in o.sizing["capped_by"] for o in cards)
+        joint = Z.ConservativePolicy().size_all(S.generate_signals(inp), sim_ctx(NOW, bar=None))
+        assert total == pytest.approx(sum(d.stake for d in joint.values()), abs=1.0)
+
+    def test_strategy_5_chaser_m_uses_the_account_value_not_the_cash(self) -> None:
+        # 20,000 cash + 90,000 in positions: M = 221,500 / 110,000 = 2.01 (chase), not 221,500 / 20,000 = 11.07
+        inp = value_slate(["PA"], bid=0.51, ask=0.52, fair=0.58, settle=CUP_END, balance=20_000.0, account_value=110_000.0)
+        r = S.report_from_inputs(inp, sizing="chaser")
+        assert r.sizing["mode"] == "chase" and r.sizing["M"] == pytest.approx(221_500 / 110_000, abs=1e-3)
+        lines = r.sizing["lines"]
+        assert "M = the bar / your value = 221,500 / 110,000 = 2.01" in lines
+        at = lines.index("M = the bar / your value = 221,500 / 110,000 = 2.01")
+        assert lines[at + 1].startswith("Your value here is your account value (110,000: cash plus positions")
+        assert any(line.startswith("Your open positions (90,000 SUSQies at market prices) count against the total cap")
+                   for line in lines)
+        [o] = r.opportunities
+        assert not any(Z.OUT_OF_REACH_LINE in line for line in o.sizing["lines"])
+        assert o.suggested_shares > 0 and o.suggested_shares * (o.limit_price or 0.0) <= 20_000 + 1e-6  # cash caps it
+        # the same player without a known account value: cash is all the bot can see, and it says so
+        cash_only = S.report_from_inputs(value_slate(["PA"], bid=0.51, ask=0.52, fair=0.58, settle=CUP_END,
+                                                     balance=20_000.0), sizing="chaser")
+        assert cash_only.sizing["mode"] == "out_of_reach"
+        assert any("the account value is unknown, so open positions are not counted" in line
+                   for line in cash_only.sizing["lines"])

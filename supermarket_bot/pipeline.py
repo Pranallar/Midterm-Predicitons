@@ -606,13 +606,100 @@ def settlements_from_market(market: Mapping[str, Any], detected_at: float) -> Li
     return out
 
 
+# --------------------------------------------------------------------------- backtest vs the paper runs
+
+# appended to the backtest's OVERLAP_WARNING when the replay filled on stored order books (lookahead-1)
+OVERLAP_BOOKS_NOTE = ("The real order books it fills on there are the ones the paper run read itself, right after "
+                      "its own decisions, so the replay re-uses the paper run's data rather than testing it.")
+_OVERLAP_MARK = "not an independent check"  # in backtest.OVERLAP_WARNING (the dashboard matches it too)
+
+
+def paper_run_intervals(source: Any, now: Optional[float] = None) -> List[Tuple[float, float]]:
+    """``[(start, end)]`` of every paper run the store holds (completed, reset, "settings changed" or still open):
+    an ended run ends at ``ended_at``, an open one at max(``updated_at``, ``now``) (open-ended without either).
+    [] when the source keeps no paper runs."""
+    rows: Any = None
+    for name in ("paper_run_times", "paper_runs"):
+        fn = getattr(source, name, None)
+        if not callable(fn):
+            continue
+        try:
+            rows = fn()
+        except Exception as exc:
+            log.debug("could not read the paper runs (%s): %s", name, exc)
+            rows = None
+            continue
+        break
+    out: List[Tuple[float, float]] = []
+    for r in rows or []:
+        if not isinstance(r, Mapping):
+            continue
+        start = _finite(r.get("started_at"))
+        if start is None:
+            continue
+        end = _finite(r.get("ended_at"))
+        if end is None:
+            ends = [v for v in (_finite(r.get("updated_at")), _finite(now)) if v is not None]
+            end = max(ends) if ends else float("inf")
+        if end > start:
+            out.append((start, end))
+    return out
+
+
+def overlap_seconds(intervals: Sequence[Tuple[float, float]], start: float, end: float) -> float:
+    """Length of the union of ``intervals`` inside ``[start, end]`` (overlapping runs are counted once)."""
+    parts = sorted((max(float(a), float(start)), min(float(b), float(end))) for a, b in intervals)
+    total, cur_a, cur_b = 0.0, None, None
+    for a, b in parts:
+        if b <= a:
+            continue
+        if cur_b is None or a > cur_b:
+            if cur_b is not None:
+                total += cur_b - cur_a  # type: ignore[operator]
+            cur_a, cur_b = a, b
+        else:
+            cur_b = max(cur_b, b)
+    if cur_b is not None:
+        total += cur_b - cur_a  # type: ignore[operator]
+    return total
+
+
+def apply_paper_overlap(report: Any, intervals: Sequence[Tuple[float, float]]) -> Any:
+    """lookahead-1 (§6.12.3, D26): a backtest window that a paper run also saw is not an independent check. Sets
+    ``report.overlap_hours`` from EVERY stored paper run (``paper_run_intervals``: the current one and the ones
+    that ended -- completed, reset, or "settings changed" after a code update), not only from the current run's
+    start, and puts the backtest's OVERLAP_WARNING (with OVERLAP_BOOKS_NOTE when the replay filled on stored
+    order books, which only the paper run writes) first in ``warnings``. Idempotent: an overlap warning the
+    replay added itself is replaced by this one (the larger of the two overlaps is kept)."""
+    from .backtest import OVERLAP_WARNING
+
+    window = getattr(report, "window", None) or {}
+    start, end = _finite(window.get("start")), _finite(window.get("end"))
+    if start is None or end is None or end <= start:
+        return report
+    existing = _finite(getattr(report, "overlap_hours", None))
+    if not intervals and existing is None:
+        return report
+    hours = max(overlap_seconds(intervals, start, end) / 3600.0, existing or 0.0)
+    report.overlap_hours = round(hours, 6)
+    warnings = [w for w in list(getattr(report, "warnings", None) or []) if _OVERLAP_MARK not in str(w)]
+    if hours > 0:
+        text = OVERLAP_WARNING.format(h=hours)
+        coverage = getattr(report, "coverage", None) or {}
+        if (_finite(coverage.get("book_snapshot_share")) or 0.0) > 0:
+            text += " " + OVERLAP_BOOKS_NOTE
+        warnings.insert(0, text)
+    report.warnings = warnings
+    return report
+
+
 # --------------------------------------------------------------------------- headless driver
 
 
 def run_simulation(runtime: Any, clock: Any, *, hours: float, step_s: float = 30.0,
                    summary_every_s: float = 3600.0, on_summary: Optional[Callable[[Dict[str, Any]], None]] = None,
                    backfill_reads_per_step: int = 8, analyses_per_step: int = 2,
-                   end_run: bool = True) -> Dict[str, Any]:
+                   end_run: bool = True, moves_every_s: Optional[float] = None) -> Dict[str, Any]:
     """Drive a demo runtime synchronously on a fake ``clock`` (demo.SimClock) for ``hours`` of
     simulated time (§7.6): each step advances the clock, then runs ``tracker.run_once()``, a few
     backfill and analysis steps, ``tracker.fair_value_step()`` (every 60 simulated s) and
@@ -622,18 +709,32 @@ def run_simulation(runtime: Any, clock: Any, *, hours: float, step_s: float = 30
     Calls ``on_summary(paper summary)`` every ``summary_every_s``; ends the run ("completed") when
     ``end_run``; returns the final summary.
 
-    The first step runs at the clock's current time (the demo start), the last one ``hours`` later."""
+    The first step runs at the clock's current time (the demo start), the last one ``hours`` later.
+
+    ``moves_every_s`` (docs/OUTSIDE_MOVES.md §16, package "wiring"): when the tracker has an outside-move watcher,
+    ``tracker.moves_step(t)`` also runs every ``moves_every_s`` simulated seconds: at each step time after the
+    paper step, then at the sub-ticks strictly between two steps (the clock advances to each sub-tick, so one step
+    still advances it by ``step_s`` in all). None (the default) keeps the loop exactly as before. Without a paper
+    trader, ``on_summary`` then gets the watcher's summary (``tracker.moves_view()``) and so does the return value."""
     from .fairvalue import FV_REFRESH_S
 
     tracker = runtime.tracker
     if step_s <= 0:
         raise ValueError("step_s must be > 0")
+    moves = moves_every_s is not None and getattr(tracker, "moves", None) is not None
+    if moves_every_s is not None and not float(moves_every_s) > 0:
+        raise ValueError("moves_every_s must be > 0")
     steps = max(0, int(round(float(hours) * 3600.0 / float(step_s))))
     next_fv = float(clock())
     next_summary = float(clock()) + float(summary_every_s)
+    step_at = float(clock())  # the current step's time (with sub-ticks the clock sits at the last sub-tick)
     for i in range(steps + 1):
         if i:
-            clock.advance(step_s)
+            if moves:
+                step_at += step_s
+                clock.set(step_at)
+            else:
+                clock.advance(step_s)
         tracker.run_once()
         if backfill_reads_per_step > 0:
             tracker.backfill_step(backfill_reads_per_step)
@@ -645,12 +746,28 @@ def run_simulation(runtime: Any, clock: Any, *, hours: float, step_s: float = 30
             while next_fv <= now + 1e-9:
                 next_fv += FV_REFRESH_S
         tracker.paper_step(now)
+        if moves:
+            tracker.moves_step(now)
         if on_summary is not None and summary_every_s > 0 and now >= next_summary - 1e-9:
             summary = tracker.paper_view()
+            if summary is None and moves:
+                summary = tracker.moves_view()
             if summary is not None:
                 on_summary(summary)
             while next_summary <= now + 1e-9:
                 next_summary += summary_every_s
+        if moves and i < steps:  # the sub-ticks strictly before the next step's time
+            j = 1
+            while True:
+                sub = step_at + j * float(moves_every_s)  # on the step grid, whatever the clock read above
+                if sub >= step_at + float(step_s) - 1e-9:
+                    break
+                clock.set(sub)
+                tracker.moves_step(sub)
+                j += 1
     if end_run:
         tracker.paper_end("completed")
-    return tracker.paper_view() or {}
+    final = tracker.paper_view()
+    if final is None and moves:
+        final = tracker.moves_view()
+    return final or {}

@@ -451,7 +451,7 @@ def test_maker_cancel_after_two_missing_steps_still_fills_until_cancel_at() -> N
     assert eng.orders()[0].status == "resting" and eng.orders()[0].missing_steps == 1
     eng.step(T + 60, mobs(T + 60, quotes=q), [])
     order = eng.orders()[0]
-    assert order.status == "cancelling" and order.cancel_at == T + 60
+    assert order.status == "cancelling" and order.cancel_at == T + 60 + 2.0  # the cancel takes the bot's 2-s latency
     # the next tape read (after cancel_at): a print before cancel_at still fills, one after it does not
     tape = [tr("in", T + 50, 0.60, 30), tr("after", T + 70, 0.60, 30)]
     eng.step(T + 90, mobs(T + 90, quotes=q, trades={"1": tape}), [])
@@ -785,7 +785,7 @@ def test_closed_without_a_ruling_freezes_counts_zero_and_is_named() -> None:
     assert s.equity_liq == pytest.approx(100_000 - 52.0) and s.unvalued == pytest.approx(last)
     assert s.positions_liq == 0.0
     assert s.verdict.unvalued_positions == 1
-    assert s.verdict.sentence.endswith(" 1 position whose market closed without a ruling is left out (last value 50).")
+    assert " 1 position whose market closed without a ruling is left out (last value 50)." in s.verdict.sentence
     assert eng.ideas("bot")[0].frozen is True
     # frozen: no exits even when the target would fire; it unfreezes when the outcome reappears
     eng.step(T + 90, mobs(T + 90, quotes={"1": (0.56, 0.57)}), [])
@@ -1149,7 +1149,7 @@ def test_verdict_counts_open_losers_not_only_closed_winners() -> None:
     assert v.closed_pnl == pytest.approx(1250.0) and v.open_pnl_liq == pytest.approx(-1000.0)
     assert v.win_rate == 1.0 and v.win_rate_low == pytest.approx(P.wilson_interval(5, 5)[0], abs=1e-6)
     assert "Closed: 5 ideas, +1,250 realised; open: 5 ideas, -1,000 at liquidation value" in v.reasons
-    assert ("Win rate 100% over 5 closed trades (90% interval 65% to 100%): closed trades only: biased toward quick "
+    assert ("Win rate 100% over 5 closed ideas (90% interval 65% to 100%): closed trades only: biased toward quick "
             "winners") in v.reasons
 
 
@@ -1377,7 +1377,7 @@ def test_downtime_cancels_resting_orders_at_the_last_step_before_the_gap() -> No
     assert r.gap_s == pytest.approx(36000)
     assert [f.trade_ids for f in eng.fills()] == [["before"]]  # the print from the downtime never fills it
     closed = all_orders(eng)[0]
-    assert closed.status == "cancelled" and closed.cancel_at == T + 30
+    assert closed.status == "cancelled" and closed.cancel_at == T + 30  # D48: at the last step before the gap
     assert closed.close_reason == "The bot was not running: a resting order cannot be managed through downtime"
     s = eng.summary()["run"]
     assert s["hours_run"] == pytest.approx((30 + 90) / 3600, abs=1e-6) and len(s["gaps"]) == 1
@@ -1739,7 +1739,7 @@ def test_summary_json_shape() -> None:
     assert body["table_warning"] == P.TABLE_WARNING.format(n=2) and body["model_label"] == P.FV_MODEL_LABEL
     head = body["headline"]
     assert set(head) == {"portfolio_id", "label", "latency_s", "pnl_liq", "pnl_liq_pct", "pnl_mark", "equity_liq",
-                         "unvalued", "depth_unknown_share", "verdict", "verdict_caveats"}
+                         "unvalued", "depth_unknown_share", "verdict", "verdict_caveats", "untested"}
     assert head["portfolio_id"] == "human:fixed" and head["latency_s"] == HUMAN_LATENCY_S
     assert head["verdict_caveats"] == [P.CAVEATS[i] for i in P.VERDICT_CAVEATS]
     assert [p["portfolio_id"] for p in body["portfolios"]] == ["human:fixed", "bot"]
@@ -1749,9 +1749,11 @@ def test_summary_json_shape() -> None:
     pos = body["positions"][0]
     assert {"unrealized_liq", "exit_note", "age_hours", "depth_state", "liq_value"} <= set(pos)
     (basket_row,) = body["baskets"]
-    assert set(basket_row) == {"portfolio_id", "basket_id", "idea_id", "sets", "cost", "floor_value", "liq_value", "legs"}
+    assert set(basket_row) == {"portfolio_id", "basket_id", "idea_id", "sets", "cost", "floor_value", "liq_value", "legs",
+                               "naked_qty", "legs_total"}
     assert basket_row["sets"] == 300 and basket_row["floor_value"] == pytest.approx(300.0)
-    assert set(basket_row["legs"][0]) == {"exchange_id", "side", "qty", "liq_value"}
+    assert basket_row["naked_qty"] == 0 and basket_row["legs_total"] == 2
+    assert set(basket_row["legs"][0]) == {"exchange_id", "side", "qty", "liq_value", "naked_qty"}
     assert body["signals"] == {"count": 2, "by_kind": {"basket": 1, "value": 1}, "at": T + 60}
     assert body["study"]["can_show"] and body["study"]["cannot_show"]
     assert isinstance(body["equity"]["bot"], list) and body["equity"]["bot"][0] == [T, 100_000.0]
@@ -1878,3 +1880,615 @@ def test_a_basket_stops_asking_for_exit_books_once_the_touch_moved_away() -> Non
     gone = {"1": (0.52, 0.54), "2": (0.53, 0.55)}  # NO bids 0.46 + 0.45 = 0.91 < cost: no exit to check
     eng.step(T + 2030, mobs(T + 2030, quotes=gone), [])
     assert not any(r.priority == 2 for r in eng.wanted_reads(T + 2060, mobs(T + 2060, quotes=gone)).requests)
+
+
+# --------------------------------------------------------------------------- regressions: engine fixes (paper-verify QA)
+
+
+def _exit_150_of_300(eng: P.PaperEngine) -> Any:
+    """Hold 300 YES @0.52; the bid reaches the 0.60 target; the exit (limit 0.595) sells 150 into 0.60x100 + 0.595x50."""
+    plan = ExitPlan(kind="value", target_bid=0.60)
+    eng.step(T, mobs(T), [opp(limit=0.535, plan=plan)])
+    eng.step(T + 30, mobs(T + 30, books=[bk("1", T + 29, bids=[(0.50, 2000)], asks=[(0.52, 1000)])]), [])
+    eng.step(T + 60, mobs(T + 60, quotes={"1": (0.60, 0.61)}), [])
+    (o,) = [o for o in eng.orders() if o.purpose == "exit"]
+    assert o.limit_price == 0.595
+
+    def book(t: float) -> BookObservation:
+        return bk("1", t, bids=[(0.60, 100), (0.595, 50), (0.55, 1000)], asks=[(0.61, 1000)])
+
+    eng.step(T + 90, mobs(T + 90, quotes={"1": (0.60, 0.61)}, books=[book(T + 89)]), [])
+    return book
+
+
+def test_fills_1_marks_never_reuse_bids_this_portfolio_sold_into() -> None:
+    eng, _ = make_engine(policy=FixedPolicy(units=300))
+    book = _exit_150_of_300(eng)
+    assert sum(f.qty for f in eng.fills() if f.action == "sell") == 150
+    (pos,) = eng.positions()
+    # the 150 left can only sell into what we did NOT take: 150 x 0.55 (not 100 x 0.60 + 50 x 0.595)
+    assert pos.qty == 150 and pos.liq_value == pytest.approx(82.5) and pos.depth_state == "fresh"
+    assert eng.portfolios()[0].equity_liq == pytest.approx(100_000 - 300 * 0.52 + 100 * 0.60 + 50 * 0.595 + 82.5)
+    # an identical later book: the exit cannot re-take the consumed bids, and neither can the mark
+    eng.step(T + 120, mobs(T + 120, quotes={"1": (0.60, 0.61)}, books=[book(T + 119)]), [])
+    assert sum(f.qty for f in eng.fills() if f.action == "sell") == 150
+    assert eng.positions()[0].liq_value == pytest.approx(82.5)
+
+
+def test_fills_1_basket_leg_after_its_residue_exit_is_marked_without_reuse() -> None:
+    eng, _ = make_engine(policy=FixedPolicy(units=300))
+    _enter_set(eng, b2_fill=200)  # leg 1 300, leg 2 200: residue exit of 100 on leg 1
+    # the residue sells 60 at NO 0.46 and 40 at NO 0.40 (YES asks 0.54 x 60, 0.60 x 1000)
+    eng.step(T + 60, mobs(T + 60, quotes=NV, books=[bk("1", T + 59, bids=[(0.52, 1)], asks=[(0.54, 60), (0.60, 1000)])]), [])
+    (residue,) = eng.trades()
+    assert residue.proceeds == pytest.approx(60 * 0.46 + 40 * 0.40)
+    leg1 = {p.exchange_id: p for p in eng.positions()}["1"]
+    assert leg1.qty == 200 and leg1.liq_value == pytest.approx(200 * 0.40)  # not 60 x 0.46 + 140 x 0.40 = 83.60
+
+
+def test_fills_1_stale_mark_subtracts_consumption_before_the_shift() -> None:
+    old = bk("1", T - 1800, bids=[(0.60, 100), (0.55, 1000)])
+    q = Quote("1", 0.62, 0.64, None, T)
+
+    def taken(levels: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+        return [(p, qty - 100 if abs(p - 0.60) < 1e-9 else qty) for p, qty in levels if not (abs(p - 0.60) < 1e-9 and qty <= 100)]
+
+    v, state = P.liquidation_value("yes", 150, None, q, last_real_book=old, now=T, config=PaperConfig(), adjust_levels=taken)
+    # shifted by the RAW book's offset (+0.02): the rung we took is gone, the rest sits at 0.57 (never re-inflated to 0.62)
+    assert state == "stale" and v == pytest.approx(150 * 0.57)
+
+
+def test_fills_2_a_human_cancel_takes_its_latency_and_the_sweep_fills_it() -> None:
+    def run(spec: PortfolioSpec) -> Tuple[float, float, float]:
+        eng, _ = make_engine([spec], policy=FixedPolicy(units=100))
+        q = {"1": (0.93, 0.94)}
+        eng.step(T, mobs(T, quotes=q), [hole(limit=0.62)])
+        for k in range(1, 11):  # the idea lives until T + 300
+            eng.step(T + 30 * k, mobs(T + 30 * k, quotes=q), [hole(limit=0.62)])
+        eng.step(T + 330, mobs(T + 330, quotes={"1": (0.80, 0.85)}), [])  # news: the idea disappears ...
+        eng.step(T + 360, mobs(T + 360, quotes={"1": (0.60, 0.70)}), [])  # ... for 2 steps: cancel decided at T + 360
+        cancel_at = eng.orders()[0].cancel_at
+        sweep = [tr("s1", T + 370, 0.55, 60), tr("s2", T + 400, 0.45, 60), tr("s3", T + 420, 0.40, 60)]
+        eng.step(T + 450, mobs(T + 450, quotes={"1": (0.40, 0.42)}, trades={"1": sweep}), [])
+        filled = sum(f.qty for f in eng.fills() if f.action == "buy")
+        return cancel_at, filled, eng.portfolios()[0].pnl_liq
+
+    h_cancel, h_filled, h_pnl = run(human())
+    assert h_cancel == T + 360 + HUMAN_LATENCY_S  # a person needs ~4 minutes to cancel by hand
+    assert h_filled == 100 and h_pnl < -20  # 100 @0.62 with the market at 0.40
+    b_cancel, b_filled, b_pnl = run(bot())
+    assert b_cancel == T + 362 and b_filled == 0 and b_pnl == pytest.approx(0.0)
+
+
+def test_fills_2_a_pending_cancel_is_read_like_a_resting_order_until_it_lands() -> None:
+    eng, _ = make_engine([human()])
+    q = {"1": (0.93, 0.94)}
+    eng.step(T, mobs(T, quotes=q), [hole()])
+    eng.step(T + 30, mobs(T + 30, quotes=q), [])
+    eng.step(T + 60, mobs(T + 60, quotes=q, trades={"1": []}), [])  # cancel decided now, lands at T + 300
+    assert eng.orders()[0].status == "cancelling" and eng.orders()[0].cancel_at == T + 300
+    plan = eng.wanted_reads(T + 90, mobs(T + 90, quotes=q))
+    assert not any(r.kind == "trades" and r.reason == "tape since a cancelled resting order" for r in plan.requests)
+    plan = eng.wanted_reads(T + 300, mobs(T + 300, quotes=q))
+    assert any(r.kind == "trades" and r.reason == "tape since a cancelled resting order" for r in plan.requests)
+    eng.step(T + 300, mobs(T + 300, quotes=q, trades={"1": []}), [])
+    assert eng.orders() == [] and all_orders(eng)[0].status == "cancelled"
+
+
+def test_fills_3_an_empty_open_list_freezes_every_position() -> None:
+    def run(open_ids: List[str]) -> Any:
+        eng, _ = make_engine(policy=FixedPolicy(units=300))
+        eng.step(T, mobs(T), [opp(limit=0.535)])
+        eng.step(T + 30, mobs(T + 30, books=[bk("1", T + 29, bids=[(0.50, 2000)], asks=[(0.52, 1000)])]), [])
+        eng.step(T + 60, mobs(T + 60, quotes={"1": (0.55, 0.57), "2": (0.30, 0.32)},
+                              books=[bk("1", T + 59, bids=[(0.55, 1000)], asks=[(0.57, 1000)])]), [])
+        stale = {"1": (0.55, 0.57, T + 60), "2": (0.30, 0.32, T + 60)}  # the view keeps its last rows
+        eng.step(T + 600, mobs(T + 600, quotes=stale, open_ids=open_ids), [])
+        return eng.positions()[0], eng.portfolios()[0]
+
+    for open_ids in (["2"], []):
+        pos, s = run(open_ids)
+        assert pos.status == "frozen" and "closed_no_ruling" in pos.flags, open_ids
+        assert s.equity_liq == pytest.approx(100_000 - 156.0) and s.unvalued == pytest.approx(165.0)
+        assert " 1 position whose market closed without a ruling is left out (last value 165)." in s.verdict.sentence
+    # a bare observation without an open list still treats every quoted outcome as open
+    assert MarketObservation(now=T, cup_end=CUP).open_ids is None
+
+
+def test_fills_4_a_newer_real_book_beats_a_stale_quote() -> None:
+    eng, _ = make_engine(policy=FixedPolicy(units=300))
+    eng.step(T, mobs(T), [opp(limit=0.535)])
+    eng.step(T + 30, mobs(T + 30, books=[bk("1", T + 29, bids=[(0.50, 2000)], asks=[(0.52, 1000)])]), [])
+    eng.step(T + 300, mobs(T + 300, quotes={"1": (0.60, 0.62)},
+                           books=[bk("1", T + 299, bids=[(0.60, 1000)], asks=[(0.62, 1000)])]), [])
+    assert eng.positions()[0].liq_value == pytest.approx(180.0)
+    t = T + 1500  # the bulk quote is stuck at the T + 300 one; the paper worker's own book read shows the fall
+    eng.step(t, mobs(t, quotes={"1": (0.60, 0.62, T + 300)},
+                     books=[bk("1", t - 1, bids=[(0.45, 300), (0.44, 300)], asks=[(0.47, 300)])]), [])
+    (pos,) = eng.positions()
+    assert pos.liq_value == pytest.approx(135.0) and pos.depth_state == "fresh" and "stale_quote" in pos.flags
+    assert eng.portfolios()[0].pnl_liq == pytest.approx(135.0 - 156.0)
+    # the newer book shows no bids at all: worth 0, not the unknown rule at the stale 0.60 touch
+    t2 = t + 30
+    eng.step(t2, mobs(t2, quotes={"1": (0.60, 0.62, T + 300)}, books=[bk("1", t2 - 1, asks=[(0.05, 5000)])]), [])
+    assert eng.positions()[0].liq_value == pytest.approx(0.0)
+
+
+def test_fills_4_liquidation_value_prefers_the_newer_source() -> None:
+    cfg = PaperConfig()
+    stale_q = Quote("1", 0.60, 0.62, None, T - 1200)
+    fresh = bk("1", T - 5, bids=[(0.45, 300), (0.44, 300)], asks=[(0.47, 300)])
+    assert P.liquidation_value("yes", 300, fresh, stale_q, now=T, config=cfg) == (pytest.approx(135.0), "fresh")
+    # a fresh quote NEWER than the book still judges the book (an out-of-sync book is shifted to the touch)
+    new_q = Quote("1", 0.60, 0.62, None, T)
+    v, state = P.liquidation_value("yes", 300, fresh, new_q, now=T, config=cfg)
+    assert state == "stale" and v == pytest.approx(300 * 0.60)
+    # a book read after a (fresh) quote defines the touch
+    after = bk("1", T, bids=[(0.45, 300)])
+    assert P.liquidation_value("yes", 300, after, Quote("1", 0.60, 0.62, None, T - 10), now=T,
+                               config=cfg) == (pytest.approx(135.0), "fresh")
+
+
+def _depth_unknown_run() -> P.PaperEngine:
+    """40 ideas on 40 races in 10 two-hour blocks x {D, R} (G = 20), 20 covered hours, every idea +5..+6 at
+    liquidation, but marked without a recent book: 27% of equity "unknown" -> the guard makes it inconclusive."""
+    eng, _ = make_engine(policy=FixedPolicy(units=100), start_capital=8_000.0, target_hours=20.0,
+                         max_new_orders_per_step=10, max_open_positions=60, interval_s=600.0)
+    eids = [f"E{k:02d}" for k in range(40)]
+    entry = {e: T + (k // 4) * 7200 + 60 + (k % 4) for k, e in enumerate(eids)}
+    touch = {e: 0.55 + 0.005 * (k % 3) for k, e in enumerate(eids)}
+    times = sorted({T + 1800 * i for i in range(41)} | {entry[e] for e in eids} | {entry[e] + 30 for e in eids})
+    for t in times:
+        quotes = {e: ((0.48, 0.50) if t <= entry[e] + 30 + 1e-6 else (touch[e], touch[e] + 0.02)) for e in eids}
+        books = [bk(e, t - 5, bids=[(0.48, 500)], asks=[(0.50, 500)]) for e in eids if t == entry[e]]
+        books += [bk(e, t - 1, bids=[(0.49, 500)], asks=[(0.50, 500)]) for e in eids if t == entry[e] + 30]
+        signals = [opp(e, limit=0.50, idea=f"value:{e}", race_key=f"race-{e}",
+                       factor_delta=0.01 if k % 2 == 0 else -0.01) for k, e in enumerate(eids) if t == entry[e]]
+        eng.step(t, mobs(t, quotes=quotes, books=books), signals)
+    return eng
+
+
+def test_accounting_1_end_run_keeps_the_verdict_and_the_closed_open_split() -> None:
+    eng = _depth_unknown_run()
+    before = eng.summary()
+    head = before["headline"]["verdict"]
+    assert head["level"] == "inconclusive" and head["depth_unknown_share"] > P.MAX_DEPTH_UNKNOWN_SHARE
+    assert head["n_ideas"] == 40 and head["clusters"] == 20 and head["open_ideas"] == 40
+    port_before = before["portfolios"][0]
+    t_end = eng._now + 30
+    snap = eng.end_run(t_end, "completed")
+    after = eng.summary()
+    assert snap["verdicts"]["bot"]["level"] == "inconclusive"
+    # what `paper --hours N` prints and /api/paper serves once the run has ended: the snapshot taken before the
+    # positions were booked as trades at liquidation value (no "realised" open P&L, the depth guard still applies)
+    same = {k: v for k, v in after["headline"]["verdict"].items() if k != "wall_hours"}
+    assert same == {k: v for k, v in head.items() if k != "wall_hours"}
+    port_after = after["portfolios"][0]
+    for key in ("trades_closed", "positions_open", "wins", "win_rate", "realized_pnl", "pnl_liq", "depth_unknown_share"):
+        assert port_after[key] == port_before[key], key
+    assert after["run"]["end_reason"] == "completed" and after["run"]["final"]["verdicts"]["bot"] == after["headline"]["verdict"]
+    assert eng.verdicts()["bot"].level == "inconclusive" and eng.portfolios()[0].trades_closed == 0
+    # the liquidation trades exist, but they are not closed ideas
+    assert {t.exit_reason for t in eng.trades()} == {"completed"} and len(eng.trades()) == 40
+    assert all(not i.closed for i in eng.ideas("bot"))
+
+
+def _basket_ab(eng: P.PaperEngine) -> float:
+    """A 2-leg YES basket (A 100 @0.45 + B 100 @0.50 = 0.95) converges: exit orders at A 0.52 / B 0.49 at T + 60."""
+    plan = ExitPlan(kind="basket", min_set_profit=0.02)
+    idea = basket(legs=(("A", "yes", 0.46), ("B", "yes", 0.51)), idea="basket:A+B:yy", edge=0.05, plan=plan)
+    q0 = {"A": (0.43, 0.45), "B": (0.48, 0.50)}
+    eng.step(T, mobs(T, quotes=q0, books=[bk("A", T - 10, bids=[(0.43, 500)], asks=[(0.45, 300)]),
+                                          bk("B", T - 10, bids=[(0.48, 500)], asks=[(0.50, 300)])]), [idea])
+    eng.step(T + 30, mobs(T + 30, quotes=q0, books=[bk("A", T + 29, bids=[(0.43, 500)], asks=[(0.45, 300)]),
+                                                    bk("B", T + 29, bids=[(0.48, 500)], asks=[(0.50, 300)])]), [])
+    assert {p.exchange_id: p.qty for p in eng.positions()} == {"A": 100, "B": 100}
+    eng.step(T + 60, mobs(T + 60, quotes={"A": (0.52, 0.54), "B": (0.49, 0.51)},
+                          books=[bk("A", T + 59, bids=[(0.52, 1000)], asks=[(0.54, 300)]),
+                                 bk("B", T + 59, bids=[(0.49, 1000)], asks=[(0.51, 300)])]), [])
+    assert {o.exchange_id: o.limit_price for o in eng.orders()} == {"A": 0.52, "B": 0.49}
+    return T + 60
+
+
+def _step_ab(eng: P.PaperEngine, t: float, a_bids: Sequence[Tuple[float, float]], b_bids: Sequence[Tuple[float, float]]) -> None:
+    qa, qb = a_bids[0][0], b_bids[0][0]
+    eng.step(t, mobs(t, quotes={"A": (qa, qa + 0.02), "B": (qb, qb + 0.02)},
+                     books=[bk("A", t - 1, bids=a_bids, asks=[(qa + 0.02, 300)]),
+                            bk("B", t - 1, bids=b_bids, asks=[(qb + 0.02, 300)])]), [])
+
+
+def test_accounting_2_a_partly_filled_lagging_leg_is_legged_out() -> None:
+    eng, _ = make_engine(policy=FixedPolicy(units=100))
+    t = _basket_ab(eng) + 30
+    _step_ab(eng, t, [(0.52, 1000)], [(0.49, 40), (0.30, 1000)])  # A sells 100, B only 40 of 100
+    assert {p.exchange_id: p.qty for p in eng.positions()} == {"B": 60}
+    for _ in range(8):  # B's bid falls to 0.30; its exit order runs out after 120 s
+        t += 30
+        _step_ab(eng, t, [(0.52, 1000)], [(0.30, 1000)])
+    assert eng.positions() == [] and eng.orders() == []
+    (trade,) = eng.trades()
+    assert trade.exit_reason == "legging" and trade.pnl == pytest.approx(100 * 0.52 + 40 * 0.49 + 60 * 0.30 - 95.0)
+    assert any(o.reason == "Legging out: selling every remaining leg" for o in all_orders(eng))
+
+
+def test_accounting_2_and_6_both_legs_partly_filled() -> None:
+    eng, _ = make_engine(policy=FixedPolicy(units=100))
+    t = _basket_ab(eng) + 30
+    _step_ab(eng, t, [(0.52, 50), (0.40, 1000)], [(0.49, 40), (0.30, 1000)])  # A sells 50, B 40
+    assert {p.exchange_id: p.qty for p in eng.positions()} == {"A": 50, "B": 60}
+    (row,) = eng.summary()["baskets"]
+    # the floor is the matched sets' (50 x 1.00 = 50, below the 52.50 cost); the 10 extra B shares are naked
+    assert row["sets"] == 50 and row["floor_value"] == pytest.approx(50.0) and row["cost"] == pytest.approx(52.5)
+    assert row["naked_qty"] == 10 and {lg["exchange_id"]: lg["naked_qty"] for lg in row["legs"]} == {"A": 0, "B": 10}
+    for _ in range(8):
+        t += 30
+        _step_ab(eng, t, [(0.40, 1000)], [(0.30, 1000)])
+    assert eng.positions() == [] and eng.trades()[0].exit_reason == "legging"
+
+
+def test_accounting_2_equal_partial_fills_stay_a_basket() -> None:
+    eng, _ = make_engine(policy=FixedPolicy(units=100))
+    t = _basket_ab(eng) + 30
+    _step_ab(eng, t, [(0.52, 50), (0.40, 1000)], [(0.49, 50), (0.30, 1000)])  # 50 of each: still 50 whole sets
+    for _ in range(8):
+        t += 30
+        _step_ab(eng, t, [(0.40, 1000)], [(0.30, 1000)])  # the touch moved away: no exit rule fires
+    assert {p.exchange_id: p.qty for p in eng.positions()} == {"A": 50, "B": 50} and eng.orders() == []
+    assert not any(o.reason == "Legging out: selling every remaining leg" for o in all_orders(eng))
+    (row,) = eng.summary()["baskets"]
+    assert row["sets"] == 50 and row["floor_value"] == pytest.approx(50.0) and row["naked_qty"] == 0
+
+
+def test_accounting_6_a_basket_with_a_sold_leg_has_no_floor() -> None:
+    eng, _ = make_engine(policy=FixedPolicy(units=100))
+    t = _basket_ab(eng) + 30
+    _step_ab(eng, t, [(0.52, 1000)], [(0.49, 40), (0.30, 1000)])
+    (row,) = eng.summary()["baskets"]
+    assert row["legs_total"] == 2 and row["sets"] == 0 and row["floor_value"] == 0 and row["naked_qty"] == 60
+
+
+def test_accounting_4_assumed_fills_never_lift_the_verdict() -> None:
+    ideas = []
+    k = 0
+    for blk in range(10):
+        for d in ("D", "R"):
+            for j in range(2):
+                race = "race-BIG" if (blk, d, j) in ((0, "D", 0), (3, "R", 0), (6, "D", 0)) else f"race-{k}"
+                pnl = 20.0 if race == "race-BIG" else 1.0 + 0.1 * (k % 3)
+                ideas.append(P.IdeaOutcome(f"i{k}", "value", race, T + blk * 7200 + 60 * j, d, False, pnl, 50.0))
+                k += 1
+    real = sum(i.pnl for i in ideas)
+    synth = [P.IdeaOutcome(f"s{j}", "value", f"race-s{j}", T + 100, "D", True, 20.0, 50.0, synthetic=True)
+             for j in range(5)]
+    a = _verdict(ideas, pnl_liq=real, hours=20.0, days={})
+    b = _verdict(ideas + synth, pnl_liq=real + 100.0, hours=20.0, days={})
+    assert a.level == b.level == "inconclusive" and b.top_race_share == pytest.approx(a.top_race_share)
+    assert b.pnl_liq == pytest.approx(real) and b.synthetic_pnl == pytest.approx(100.0) and b.synthetic_excluded == 5
+    assert b.sentence == a.sentence and "one race supplies 60%" in b.sentence
+    assert any("their +100 is not in the P&L above" in r for r in b.reasons)
+
+
+def test_accounting_4_engine_states_the_pnl_of_the_ideas_it_counts() -> None:
+    eng, _ = make_engine()
+    q = {"R": (0.48, 0.50), "S": (0.48, 0.50)}
+    eng.step(T, mobs(T, quotes=q), [opp("R", limit=0.50, idea="value:R"), opp("S", limit=0.50, idea="value:S")])
+    eng.step(T + 30, mobs(T + 30, quotes=q, books=[bk("R", T + 29, bids=[(0.48, 500)], asks=[(0.50, 500)]),
+                                                   bk("S", T + 29, bids=[(0.48, 500)], asks=[(0.50, 500)], source="synthetic")]), [])
+    settle = {"S": SettlementInfo("S", "mS", "YES", T + 60, 1.0, False, T + 60)}
+    eng.step(T + 60, mobs(T + 60, quotes={"R": (0.50, 0.52)}, books=[bk("R", T + 59, bids=[(0.50, 500)])],
+                          settlements=settle, open_ids=["R"]), [])
+    s = eng.portfolios()[0]
+    assert s.pnl_liq == pytest.approx(50.0)  # the portfolio: the synthetic fill settled +50
+    v = s.verdict
+    assert v.n_ideas == 1 and v.synthetic_excluded == 1 and v.pnl_liq == pytest.approx(0.0)
+    assert "P&L so far +0 SUSQies" in v.sentence and v.synthetic_pnl == pytest.approx(50.0)
+
+
+def test_accounting_5_equity_does_not_rise_when_an_exit_sells_into_the_only_rung() -> None:
+    eng, _ = make_engine(policy=FixedPolicy(units=2000))
+    plan = ExitPlan(kind="fade", stop_bid=0.45)
+    q = {"X": (0.48, 0.50)}
+    eng.step(T, mobs(T, quotes=q, books=[bk("X", T - 5, bids=[(0.48, 3000)], asks=[(0.50, 3000)])]),
+             [opp("X", limit=0.50, kind="fade", plan=plan)])
+    eng.step(T + 30, mobs(T + 30, quotes=q, books=[bk("X", T + 29, bids=[(0.48, 3000)], asks=[(0.50, 3000)])]), [])
+    equity = []
+    for k in range(1, 8):  # one thin rung of 500 @0.40, re-quoted by the house every step
+        t = T + 30 + 30 * k
+        eng.step(t, mobs(t, quotes={"X": (0.40, 0.42)}, books=[bk("X", t - 1, bids=[(0.40, 500)], asks=[(0.42, 3000)])]), [])
+        equity.append(eng.portfolios()[0].equity_liq)
+    assert sum(f.qty for f in eng.fills() if f.action == "sell") == 500
+    assert eng.positions()[0].qty == 1500 and eng.positions()[0].liq_value == pytest.approx(0.0)
+    assert equity[0] == pytest.approx(100_000 - 1000 + 200) and max(equity) <= equity[0] + 1e-6
+
+
+def test_accounting_7_by_kind_rows_add_up_while_a_basket_is_half_closed() -> None:
+    eng, _ = make_engine(policy=FixedPolicy(units=100))
+    t = _basket_ab(eng) + 30
+    _step_ab(eng, t, [(0.52, 1000)], [(0.49, 40), (0.45, 1000)])  # leg A closed (waiting in closing), B 60 open
+    assert book_of(eng).closing
+    s = eng.portfolios()[0]
+    assert sum(r["pnl_liq"] for r in s.by_kind.values()) == pytest.approx(s.pnl_liq)
+    assert s.by_kind["basket"]["pnl_liq"] == pytest.approx(s.pnl_liq)
+    # a frozen position: realised + unrealised = pnl_liq (its cost is the unrealised loss while it counts 0)
+    eng2, _ = make_engine()
+    _hold(eng2, ExitPlan(kind="value"))
+    eng2.step(T + 60, mobs(T + 60, quotes={}, open_ids=[]), [])
+    s2 = eng2.portfolios()[0]
+    assert s2.realized_pnl + s2.unrealized_pnl_liq == pytest.approx(s2.pnl_liq) == pytest.approx(-52.0)
+    assert s2.by_kind["value"]["pnl_liq"] == pytest.approx(-52.0)
+
+
+def test_strategy_9_a_longshot_exit_target_uses_the_shrunk_fair_value() -> None:
+    plan = ExitPlan(kind="value", dynamic_fv_target=True, exit_buffer=0.005, target_bid=0.70)
+    eng, _ = make_engine()
+    _hold(eng, plan, fair_value=0.13)
+    fv = {"1": FairValue("1", 0.13, "polymarket", usable=True, as_of=T + 55)}
+    _, (o,) = _exit_after(eng, T + 60, {"1": (0.105, 0.11)}, fair_values=fv)
+    # q = 0.13 x 0.9 = 0.117: target floor_tick(0.117 - 0.0025 - 0.005) = 0.105 (the card's), not 0.12
+    assert o.planned_price == 0.105 and o.limit_price == 0.10
+    assert o.reason == "The price converged: selling banks the edge"
+
+
+def test_live_2_steps_without_fresh_quotes_add_no_covered_hours() -> None:
+    eng, _ = make_engine()
+    for k in range(4):
+        eng.step(T + 30 * k, mobs(T + 30 * k), [])
+    covered = eng.summary()["run"]["hours_run"]
+    assert covered == pytest.approx(90 / 3600, abs=1e-6)
+    # an outage: the loop keeps stepping, but every quote is the one from before it (no snapshot succeeded)
+    for k in range(4, 124):
+        t = T + 30 * k
+        eng.step(t, mobs(t, quotes={"1": (0.50, 0.52, T + 90)}), [])
+    run = eng.summary()["run"]
+    assert run["hours_run"] == pytest.approx(covered + 120 / 3600, abs=1e-6)  # only while the quote was <= 120 s old
+    assert run["wall_hours"] == pytest.approx(123 * 30 / 3600)
+    (gap,) = run["gaps"]
+    assert gap["reason"] == P.NO_DATA_GAP and gap["to"] == T + 30 * 123
+    # data again: coverage resumes, the gap stays closed
+    eng.step(T + 30 * 124, mobs(T + 30 * 124), [])
+    assert eng.summary()["run"]["hours_run"] == pytest.approx(covered + 150 / 3600, abs=1e-6)
+    assert len(eng.summary()["run"]["gaps"]) == 1
+    c = P.CoverageClock.from_dict(eng.state()["coverage"])
+    assert c.gaps[0]["reason"] == P.NO_DATA_GAP and c == eng._coverage
+
+
+def test_live_2_coverage_clock_no_data_ticks() -> None:
+    c = P.CoverageClock(interval_s=30.0)
+    c.tick(T)
+    c.tick(T + 30)
+    assert c.tick(T + 60, fresh=False) is None and c.tick(T + 90, fresh=False) is None
+    assert c.covered_s == pytest.approx(30.0) and c.gaps == [{"from": T + 30, "to": T + 90, "reason": P.NO_DATA_GAP}]
+    c.tick(T + 120)
+    assert c.covered_s == pytest.approx(60.0) and c.no_data_open is False
+    c.tick(T + 150, fresh=False)
+    assert len(c.gaps) == 2
+
+
+def _no_fv_basket_run(specs: Sequence[PortfolioSpec]) -> P.PaperEngine:
+    eng, _ = make_engine(list(specs), policy=FixedPolicy(units=300), headline_portfolio=specs[0].portfolio_id)
+    _enter_set(eng)  # basket fills; no outside fair value on any step
+    return eng
+
+
+def test_live_3_untested_value_ideas_are_named_even_with_fills() -> None:
+    eng = _no_fv_basket_run([bot("human:conservative")])
+    s = eng.portfolios()[0]
+    assert s.fills > 0 and s.no_trade_reason is None
+    note = ("Value ideas were not tested: usable outside fair values on 0% of steps (outside prices off, offline or not "
+            "received yet), so this result covers basket, hole, fade, carry and arbitrage ideas only.")
+    assert s.untested == [note] and s.verdict.untested == [note]
+    assert s.verdict.sentence.endswith(" " + note) and note in s.verdict.reasons
+    # a portfolio that never trades value ideas has nothing untested; fair values usable on most steps: no note
+    eng2 = _no_fv_basket_run([bot("kind:basket", kinds=["basket"])])
+    assert eng2.portfolios()[0].untested == []
+    eng3, _ = make_engine(policy=FixedPolicy(units=300))
+    fv = {"1": FairValue("1", 0.5, "polymarket", usable=True, as_of=T)}
+    eng3.step(T, mobs(T, quotes=NV, books=_set_books(T - 1), fair_values=fv), [basket()])
+    assert eng3.portfolios()[0].untested == []
+
+
+def test_ui_3_the_headline_carries_the_untested_note() -> None:
+    eng = _no_fv_basket_run([bot("human:conservative"), bot("kind:value", kinds=["value"])])
+    body = eng.summary()
+    head = body["headline"]
+    assert head["portfolio_id"] == "human:conservative" and len(head["untested"]) == 1
+    assert head["untested"][0].startswith("Value ideas were not tested") and head["untested"] == head["verdict"]["untested"]
+    value_row = [p for p in body["portfolios"] if p["portfolio_id"] == "kind:value"][0]
+    assert value_row["untested"] == ["Value ideas were not tested: usable outside fair values on 0% of steps (outside "
+                                     "prices off, offline or not received yet), so this portfolio could not test its only kind."]
+
+
+def test_ui_6_the_served_equity_series_ends_at_the_current_equity() -> None:
+    eng, _ = make_engine()
+    _hold(eng, ExitPlan(kind="value"))
+    eng.step(T + 60, mobs(T + 60, books=[bk("1", T + 59, bids=[(0.52, 500)])]), [])
+    eng.step(T + 90, mobs(T + 90, quotes={"1": (0.40, 0.42)}, books=[bk("1", T + 89, bids=[(0.40, 500)])]), [])
+    assert eng.equity()["bot"][-1].ts == T + 60  # stored at most once a minute (unchanged)
+    body = eng.summary()
+    last = body["equity"]["bot"][-1]
+    assert last[0] == T + 90 and last[1] == pytest.approx(body["headline"]["equity_liq"])
+    assert last[1] == pytest.approx(100_000 - 52 + 40)
+
+
+def test_ui_7_the_win_rate_counts_closed_ideas_not_legging_fragments() -> None:
+    eng, _ = make_engine(policy=FixedPolicy(units=300))
+    _enter_set(eng, b2_fill=200)
+    eng.step(T + 60, mobs(T + 60, quotes=NV, books=[bk("1", T + 59, bids=[(0.52, 1)], asks=[(0.54, 1000)])]), [])
+    (residue,) = eng.trades()
+    assert residue.exit_reason == "legging"  # a fragment of the basket idea, which is still open
+    s = eng.portfolios()[0]
+    v = s.verdict
+    assert v.closed_trades == 0 and v.open_ideas == 1 and s.trades_closed == 0 and s.win_rate is None
+    assert s.legging_trades == 1 and s.legging_pnl == pytest.approx(-2.0)
+    assert "No closed ideas yet, so no win rate (closed trades only: biased toward quick winners)" in v.reasons
+    assert "1 legging exit of sets still held: -2 (part of those open ideas, not closed ideas)" in v.reasons
+    assert s.by_kind["basket"]["trades_closed"] == 0
+
+
+class BoldPolicy(FixedPolicy):
+    """FixedPolicy whose every decision is the chaser's bold-to-goal bet."""
+
+    def size(self, opp: Opportunity, ctx: Any) -> SizeDecision:
+        d = super().size(opp, ctx)
+        d.bold = True
+        return d
+
+
+def test_strategy_3_a_bold_value_position_is_held_to_settlement() -> None:
+    from supermarket_bot import sizing
+
+    plan = ExitPlan(kind="value", target_bid=0.55, stop_bid=0.45, dynamic_fv_target=True, exit_buffer=0.005,
+                    time_stop_after_fill_s=60.0)
+    idea = opp(plan=plan, fair_value=0.60)
+    eng, _ = make_engine(policy=BoldPolicy(units=100))
+    eng.step(T, mobs(T), [idea])
+    eng.step(T + 30, mobs(T + 30, books=[bk("1", T + 29, bids=[(0.52, 500)], asks=[(0.52, 500)])]), [])
+    (pos,) = eng.positions()
+    assert pos.bold and pos.exit_plan.hold_to_resolution and pos.exit_plan.kind == "settle"
+    assert pos.exit_plan.target_bid is None and pos.exit_plan.stop_bid is None and not pos.exit_plan.dynamic_fv_target
+    assert idea.exit_plan is plan and plan.target_bid == 0.55 and plan.stop_bid == 0.45  # the shared idea is untouched
+    fv = {"1": FairValue("1", 0.60, "polymarket", usable=True, as_of=T + 55)}
+    # past the idea's target, its dynamic fair-value target and its time stop: a bold stake is not sold for cents
+    _, exits = _exit_after(eng, T + 120, {"1": (0.62, 0.63)}, fair_values=fv)
+    assert exits == []
+    _, exits = _exit_after(eng, T + 150, {"1": (0.40, 0.42)})  # through the stop: still held
+    assert exits == []
+    (row,) = eng.summary()["positions"]
+    assert row["exit_note"] == sizing.BOLD_HOLD_NOTE and "bold" in row["flags"]
+    eng.step(T + 180, mobs(T + 180, quotes={}, open_ids=["x"], settlements=_settle(1.0)), [])
+    (trade,) = eng.trades()
+    assert trade.exit_reason == "settled" and trade.pnl == pytest.approx(100 * (1.0 - 0.52))
+    # the same idea sized without bold keeps its own plan and is sold at its target
+    eng2, _ = make_engine()
+    _hold(eng2, plan)
+    _, (o,) = _exit_after(eng2, T + 60, {"1": (0.62, 0.63)})
+    assert o.purpose == "exit" and o.reason != ""
+
+
+def test_strategy_3_a_bold_position_keeps_the_settlement_regime_exit() -> None:
+    plan = ExitPlan(kind="value", target_bid=0.55, exit_before_ts=T + 80)
+    eng, _ = make_engine(policy=BoldPolicy(units=100))
+    eng.step(T, mobs(T), [opp(plan=plan)])
+    eng.step(T + 30, mobs(T + 30, books=[bk("1", T + 29, bids=[(0.52, 500)], asks=[(0.52, 500)])]), [])
+    assert eng.positions()[0].exit_plan.exit_before_ts == T + 80
+    _, exits = _exit_after(eng, T + 60, {"1": (0.60, 0.61)})
+    assert exits == []
+    _, (o,) = _exit_after(eng, T + 90, {"1": (0.60, 0.61)})
+    assert o.reason == "Flat before the Cup's closeout window (settlement rule)" and o.limit_price == 0.005
+
+
+def test_accounting_8_a_frozen_row_shows_what_the_totals_charge() -> None:
+    eng, _ = make_engine()
+    _hold(eng, ExitPlan(kind="value"))
+    eng.step(T + 60, mobs(T + 60, books=[bk("1", T + 59, bids=[(0.50, 500)])]), [])
+    eng.step(T + 90, mobs(T + 90, quotes={}, open_ids=[]), [])  # closed without a ruling
+    s = eng.portfolios()[0]
+    (row,) = eng.summary()["positions"]
+    assert row["status"] == "frozen" and row["unvalued"] is True and "closed_no_ruling" in row["flags"]
+    # the row shows what the totals charge (D45: counted 0), the last mark separately
+    assert row["liq_value"] == 0.0 and row["last_liq_value"] == pytest.approx(50.0)
+    assert row["unrealized_liq"] == pytest.approx(-52.0) == pytest.approx(s.pnl_liq)
+    assert s.realized_pnl + s.unrealized_pnl_liq == pytest.approx(s.pnl_liq) and s.unvalued == pytest.approx(50.0)
+
+
+def _equity_rows(eng: P.PaperEngine, pid: str) -> List[float]:
+    rid = eng.summary()["run"]["run_id"]
+    return [float(r["liq_value"]) for r in eng.persistence.paper_equity(rid, pid)]
+
+
+def test_ui_4_a_default_capital_run_is_rebased_before_any_fill() -> None:
+    eng, pol = make_engine([bot(), human()])
+    eng.step(T, mobs(T), [opp()], StrategyInputs(now=T, cup_end=CUP))  # the account is not known yet
+    run = eng.summary()["run"]
+    assert run["capital_source"] == P.DEFAULT_CAPITAL_SOURCE and len(eng.orders()) == 2
+    account = StrategyInputs(now=T + 30, cup_end=CUP, account_value=60_000.0)
+    eng.step(T + 30, mobs(T + 30, books=[bk("1", T + 29, asks=[(0.52, 500)])]), [opp()], account)
+    run = eng.summary()["run"]
+    assert run["start_capital"] == 60_000.0 and run["capital_source"] == "account value"
+    assert all(p.start_capital == 60_000.0 and p.pnl_liq == 0.0 for p in eng.portfolios())
+    withdrawn = [o for o in all_orders(eng) if o.status == "cancelled"]
+    assert len(withdrawn) == 2 and all(o.close_reason.startswith("Start capital set from your account value (60,000 "
+                                                                 "SUSQies)") for o in withdrawn)
+    # the old orders never fill; the idea is placed again, sized on the account
+    assert eng.fills() == [] and {o.created_at for o in eng.orders()} == {T + 30}
+    assert pol.calls[-1][1].start_capital == 60_000.0 and pol.calls[-1][1].equity == pytest.approx(60_000.0)
+    assert set(_equity_rows(eng, "bot")) == {60_000.0} and set(_equity_rows(eng, "human:fixed")) == {60_000.0}
+    assert all(pt[1] == 60_000.0 for pt in eng.summary()["equity"]["bot"])
+    # persisted: a restart continues the re-based run
+    eng2 = P.PaperEngine(eng.config, persistence=eng.persistence, policies={"fixed": pol}, clock=lambda: T,
+                         code_version="test")
+    assert eng2.summary()["run"]["capital_source"] == "account value"
+    assert {o.status for o in eng2.orders(open_only=False) if o.created_at == T} == {"cancelled"}
+
+
+def test_ui_4_no_rebase_once_anything_filled_or_in_a_replay() -> None:
+    eng, _ = make_engine()
+    none = StrategyInputs(now=T, cup_end=CUP)
+    eng.step(T, mobs(T), [opp()], none)
+    eng.step(T + 30, mobs(T + 30, books=[bk("1", T + 29, asks=[(0.52, 500)])]), [], none)
+    assert len(eng.fills()) == 1
+    eng.step(T + 60, mobs(T + 60), [], StrategyInputs(now=T + 60, cup_end=CUP, account_value=60_000.0))
+    assert eng.summary()["run"]["capital_source"] == P.DEFAULT_CAPITAL_SOURCE  # the run is what it is
+    assert eng.portfolios()[0].start_capital == 100_000.0
+    pol = FixedPolicy()
+    replay = P.PaperEngine(PaperConfig(portfolios=[bot()]), persistence=P.MemoryPaperPersistence(),
+                           policies={"fixed": pol}, clock=lambda: T, rebase_default_capital=False)
+    replay.start(T, P.DEFAULT_START_CAPITAL, P.DEFAULT_CAPITAL_SOURCE)
+    replay.step(T, mobs(T), [opp()], StrategyInputs(now=T, cup_end=CUP, initial_balance=50_000.0))
+    assert replay.summary()["run"]["start_capital"] == 100_000.0
+    # a capital set by you is never replaced
+    mine, _ = make_engine(start_capital=5_000.0)
+    mine.step(T, mobs(T), [opp()], StrategyInputs(now=T, cup_end=CUP, account_value=60_000.0))
+    assert mine.summary()["run"]["capital_source"] == "set by you"
+
+
+def test_accounting_1_the_cli_end_of_run_text_matches_the_previous_run(tmp_path: Any) -> None:
+    import io
+    from pathlib import Path
+
+    from supermarket_bot import cli, pipeline, web
+    from supermarket_bot.demo import SIM_T0, SimClock
+
+    clock = SimClock(SIM_T0)
+    rt = web.build_demo(Path(tmp_path), 30.0, news=False, out=io.StringIO(), clock=clock, seed=7, target_hours=0.75)
+    try:
+        pipeline.run_simulation(rt, clock, hours=0.75, step_s=30.0, summary_every_s=3600.0, on_summary=None,
+                                end_run=True)
+        now_body = rt.app.paper()  # what `paper --hours N` prints (text and --json) after the end
+        prev_body = rt.app.paper(run="previous")  # the dashboard's "previous run": the persisted final snapshot
+        assert now_body["run"]["end_reason"] == "completed" and prev_body["run"]["run_id"] == now_body["run"]["run_id"]
+        keys = ("pnl_liq", "trades_closed", "positions_open", "win_rate", "realized_pnl", "verdict")
+        prev_rows = {p["portfolio_id"]: p for p in prev_body["portfolios"]}
+        for p in now_body["portfolios"]:
+            for k in keys:
+                if k in prev_rows[p["portfolio_id"]]:
+                    assert p[k] == prev_rows[p["portfolio_id"]][k], (p["portfolio_id"], k)
+        assert now_body["headline"]["verdict"] == prev_body["headline"]["verdict"]
+        now_lines = [x for x in cli.paper_final_lines(now_body) if x.startswith("  ") and "verdict" not in x.lower()]
+        verdict_lines = [x for x in cli.paper_final_lines(now_body) if "(headline)" in x or "(exploratory)" in x]
+        prev_verdicts = [x for x in cli.paper_final_lines(prev_body) if "(headline)" in x or "(exploratory)" in x]
+        assert verdict_lines and verdict_lines == prev_verdicts
+        assert now_lines  # the per-portfolio lines exist (closed / open come from the final snapshot)
+    finally:
+        rt.close()
+
+
+def test_fills_2_a_downtime_cancel_stays_at_the_last_step_before_the_gap() -> None:
+    """Gap-cancel (phase 0, D48, binding): unlike a cancel decided while the bot runs (which lands after the
+    portfolio's latency, fills-2), a resting order counts as cancelled at the last step before the gap, for every
+    portfolio, so prints from the downtime never fill it."""
+    def run(spec: PortfolioSpec) -> Tuple[float, float]:
+        eng, _ = make_engine([spec])
+        q = {"1": (0.93, 0.94)}
+        eng.step(T, mobs(T, quotes=q), [hole()])
+        eng.step(T + 300, mobs(T + 300, quotes=q, trades={"1": []}), [hole()])  # live (past 240 s), last step before the gap
+        gap_end = T + 300 + 10 * 3600
+        tape = [tr("soon", T + 400, 0.55, 60), tr("later", T + 3600, 0.40, 500)]
+        eng.step(gap_end, mobs(gap_end, quotes=q, trades={"1": tape}), [hole()])
+        closed = [o for o in all_orders(eng) if o.status == "cancelled"][0]
+        return closed.cancel_at, sum(f.qty for f in eng.fills() if f.action == "buy")
+
+    h_cancel, h_filled = run(human())
+    assert h_cancel == T + 300 and h_filled == 0
+    b_cancel, b_filled = run(bot())
+    assert b_cancel == T + 300 and b_filled == 0

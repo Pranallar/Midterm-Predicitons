@@ -7,7 +7,8 @@
 * :class:`ChaserPolicy`: goal-based sizing for a player who is behind. It estimates the top-3 bar
   (:func:`estimate_bar`, from the LOWER end of its range), computes ``M = bar / own value`` and picks a
   mode with hysteresis: "near" (M <= 1.3), "chase" (1.3 < M <= 10, more than ``SWING_DAYS`` left),
-  "swing" (the last ``SWING_DAYS``: at most ONE bold-to-goal bet whose capped win state reaches the bar),
+  "swing" (the last ``SWING_DAYS``: at most ONE bold-to-goal bet, on a binary contract held to settlement
+  (:func:`bold_exit_plan`), only when the stake the free cash, the total cap and the book can fund wins to the bar),
   "out_of_reach" (M > 10: conservative sizing, aim for Smart Score) or "unknown_bar". In every mode the
   Kelly multiplier is shrunk by edge certainty and correlated same-party ideas are sized as one factor
   bet, not several full-Kelly bets.
@@ -30,6 +31,7 @@ from .models import (
     POLICY_CONSERVATIVE,
     BarEstimate,
     BetShape,
+    ExitPlan,
     LeaderboardSnapshot,
     Opportunity,
     SizeDecision,
@@ -78,6 +80,10 @@ SET_BETS = ("riskless", "bounded")
 
 DEFAULT_EQUITY = 100_000.0
 BOLD_CALLED_MIN = 0.85  # a bold bet needs a market that settles before the Cup end or is likely called by then
+BOLD_BETS = ("binary",)  # ... and a contract held to its 1/0 result: a bracket (fade) exits at its target or stop
+BOLD_HOLD_NOTE = ("Bold bet: hold to settlement (no convergence target, no stop): only a 1/0 win reaches the bar")
+BOLD_HOLD_LINE = ("Hold it to settlement: no convergence target and no stop, because only a 1/0 win reaches the bar "
+                  "(selling at a convergence target would bank a few cents a share on a stake many times Kelly)")
 
 MARKS_CAVEAT = ("Leaderboard values are mid-Cup marks (cash plus positions at current prices), not settled balances; "
                 "thin-market marks can be inflated.")
@@ -293,6 +299,19 @@ def bold_max_cost(bar: float, equity: float, cap_pct: float = SWING_BOLD_CAP_PCT
     return min(1.0, cap_pct * w / denom)
 
 
+def bold_exit_plan(opp: Opportunity) -> ExitPlan:
+    """The exit plan a bold-to-goal position must use (§5.6.4, D13): held to its 1/0 settlement. No target, no
+    dynamic fair-value target, no stop and no time stop; only the idea's regime exit (``exit_before_ts``: flat
+    before a VWAP closeout window) is kept. The bold stake is sized so that a 1/0 WIN reaches the bar, so a
+    convergence or bracket exit would turn a many-times-Kelly stake into a few cents a share."""
+    old = opp.exit_plan
+    before = old.exit_before_ts if old is not None else None
+    note = BOLD_HOLD_NOTE
+    if before is not None:
+        note += "; still sold before the Cup's closeout window, as the settlement regime requires"
+    return ExitPlan(kind="settle", hold_to_resolution=True, exit_before_ts=before, note=note)
+
+
 def markov_ceiling(ev_multiple: float, m: float) -> float:
     """Upper bound on P(final >= m x now) for a non-negative wealth whose expected multiple is
     ``ev_multiple``: ``min(1, ev_multiple / m)``."""
@@ -481,13 +500,14 @@ def _stake_units(amount: float, levels: List[Tuple[float, float]], touch: float)
 
 
 def _swing_units(tilt: float, delta: float, limit: float) -> float:
-    """Most units of a position with ``delta`` per unit before ``|tilt|`` passes ``limit`` (a position that
-    only reduces ``|tilt|`` is always allowed)."""
+    """Most units of a position with ``delta`` per unit before ``|tilt|`` passes ``limit``: ``(limit - s x tilt) /
+    |delta|`` with ``s`` the sign of ``delta``. A position against an over-cap tilt is always allowed to reduce it,
+    through zero, and then only up to ``limit`` on the OTHER side (not to the old ``|tilt|``: a tilt of -9,000 with a
+    3,333 cap may go to +3,333, never to +9,000); a position adding to an over-cap tilt gets 0."""
     if abs(delta) <= 1e-12:
         return float("inf")
-    bound = max(limit, abs(tilt))
     s = 1.0 if delta > 0 else -1.0
-    return max(0.0, (bound - s * tilt) / abs(delta))
+    return max(0.0, (max(0.0, limit) - s * tilt) / abs(delta))
 
 
 def _zero(opp: Opportunity, policy: str, mode: Optional[str], reason: str, capped: str) -> SizeDecision:
@@ -909,10 +929,18 @@ class ChaserPolicy:
                 new_signs[s] = new_signs.get(s, 0) + 1
 
         bold_id: Optional[str] = None
-        bold_plan: Optional[Tuple[int, float, float]] = None
+        bold_plan: Optional[Tuple[int, float, float, bool]] = None
         no_bold_line: Optional[str] = None
         if mode == "swing" and ctx.exposure.bold_idea is None and ctx.bar is not None:
             bold_id, bold_plan, no_bold_line = self._pick_bold(selected, ctx, state)
+        if bold_id is not None and bold_plan is not None:
+            # the bold bet is funded FIRST: it was qualified on the cash and room left now, and better-scored ideas
+            # sized before it must not eat the stake that lets its win reach the bar
+            bold_opp = next(o for o in ordered if _idea_id(o) == bold_id)
+            dec = self._bold_decision(bold_opp, ctx, state, bold_plan, label)
+            _apply(state, bold_opp, dec, ctx)
+            state.directional[bold_id] = float(bold_opp.score or 0.0)
+            out[bold_id] = dec
 
         for opp in ordered:
             key = _idea_id(opp)
@@ -929,8 +957,6 @@ class ChaserPolicy:
                                    lines=[f"{label}: nothing to buy",
                                           f"The {rules.top_k} directional slots are taken by better-scored ideas "
                                           f"({len(held)} held or pending): concentrate on the best edges"])
-            elif key == bold_id and bold_plan is not None:
-                dec = self._bold_decision(opp, ctx, state, bold_plan, label)
             else:
                 sign = _sign(opp.factor_delta)
                 n = None
@@ -941,81 +967,152 @@ class ChaserPolicy:
                 if no_bold_line and tradeable_directional(opp):
                     dec.lines.append(no_bold_line)
             _apply(state, opp, dec, ctx)
-            if dec.bold:
-                state.directional[key] = float(opp.score or 0.0)
             out[key] = dec
-        return out
+        # best score first, as before (the bold bet was only SIZED first)
+        return {_idea_id(o): out[_idea_id(o)] for o in ordered if _idea_id(o) in out}
 
-    def _bold_cost(self, opp: Opportunity, stake: float) -> Tuple[float, int]:
+    @staticmethod
+    def _bold_price(opp: Opportunity, units: int) -> Tuple[float, bool]:
+        """(cost per unit at ``units``, priced at the limit). Known depth: the expected average fill. Unknown depth:
+        the order's limit, the worst fill it accepts, so the win state is not overstated."""
         touch = opp.bet.cost if opp.bet is not None else 0.0
         levels = _clean_levels(opp.levels)
-        c = touch
-        units = _floor(stake / c) if c > 0 else 0
-        if levels and units > 0:
-            for _ in range(3):
-                c = depth.avg_cost(levels, units) or touch
-                units = _floor(stake / c)
-        return c, units
+        if levels:
+            return (depth.avg_cost(levels, units) if units > 0 else None) or touch, False
+        limit = _num(opp.limit_price)
+        if limit is not None and limit > touch + 1e-12:
+            return limit, True
+        return touch, False
+
+    def _bold_goal(self, opp: Opportunity, gap: float) -> Tuple[int, float, bool]:
+        """(units, cost per unit, priced at the limit) of the stake whose 1/0 win adds ``gap``: ``units =
+        floor(gap / (1 - c))`` with ``c`` the cost at that size (iterated on the book's average fill)."""
+        c, at_limit = self._bold_price(opp, 0)
+        if c >= 1.0 - 1e-9:
+            return 0, c, at_limit
+        units = _floor(gap / (1.0 - c))
+        for _ in range(30):
+            c2, at_limit = self._bold_price(opp, units)
+            if c2 >= 1.0 - 1e-9:
+                return 0, c2, at_limit
+            u2 = _floor(gap / (1.0 - c2))
+            c = c2
+            if u2 == units:
+                break
+            units = u2
+        return units, c, at_limit
+
+    def _bold_room(self, opp: Opportunity, ctx: SizingContext, state: _State, units: int) -> Optional[str]:
+        """The first cap a bold stake of ``units`` breaks ("stake_cap", "depth", "total_cap", "cash"), else None."""
+        w = _num(ctx.equity) or 0.0
+        c, _ = self._bold_price(opp, units)
+        touch = opp.bet.cost if opp.bet is not None else 0.0
+        limit = max(_num(opp.limit_price) or touch, c)
+        cost = units * c
+        if cost > SWING_BOLD_CAP_PCT * w + 1e-6:
+            return "stake_cap"
+        max_units = _num(opp.max_units)
+        if max_units is not None and units > max_units + 1e-9:
+            return "depth"
+        if state.gross + cost > float(SWING["total_cap"]) * w + 1e-6:
+            return "total_cap"
+        if units * limit > max(0.0, state.free_cash) + 1e-6:  # the engine reserves cash at the limit
+            return "cash"
+        return None
+
+    def _bold_fundable(self, opp: Opportunity, ctx: SizingContext, state: _State, hi: int) -> int:
+        """The most units (<= ``hi``) a bold stake can fund within every cap."""
+        lo = 0
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if self._bold_room(opp, ctx, state, mid) is None:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo
 
     def _pick_bold(self, selected: Sequence[Opportunity], ctx: SizingContext,
-                   state: _State) -> Tuple[Optional[str], Optional[Tuple[int, float, float]], Optional[str]]:
+                   state: _State) -> Tuple[Optional[str], Optional[Tuple[int, float, float, bool]], Optional[str]]:
+        """The one bold-to-goal bet (D13): the best-scored selected idea that (1) settles before the Cup end or is
+        likely called by then, (2) is a binary contract held to its 1/0 result (``bold_exit_plan``), and (3) whose
+        stake that reaches the bar can actually be FUNDED now: at most 60% of equity, within the free cash (reserved
+        at the limit), the total cap and the book's depth, priced at the expected average fill (the limit when the
+        depth is unknown). Otherwise no bold bet, and a line saying why."""
         w = _num(ctx.equity) or 0.0
         bar = ctx.bar.value if ctx.bar is not None else 0.0
         if w <= 0 or bar <= w:
             return None, None, None
+        gap = bar - w
         cmax = bold_max_cost(bar, w, SWING_BOLD_CAP_PCT)
-        candidates = [o for o in selected if o.settles_before_cup_end is True or (_num(o.called_prob) or 0.0) >= BOLD_CALLED_MIN]
-        if not candidates:
+        timely = [o for o in selected if o.settles_before_cup_end is True or (_num(o.called_prob) or 0.0) >= BOLD_CALLED_MIN]
+        if not timely:
             return None, None, ("No bold bet: no idea settles before the Cup end or is likely to be called by then, so "
                                 "every idea is sized as in chase mode")
+        candidates = [o for o in timely if o.bet is not None and o.bet.kind in BOLD_BETS]
+        if not candidates:
+            return None, None, ("No bold bet: the ideas that settle in time exit before settlement (a fade sells at its "
+                                "target or stop), so a win could not reach the bar; every idea is sized as in chase mode")
         cheapest: Optional[float] = None
+        short: Optional[Tuple[float, str, Opportunity, int]] = None  # (win state, binding cap, idea, fundable units)
         for o in candidates:
-            c0 = o.bet.cost if o.bet is not None else 1.0
-            goal = (bar - w) * c0 / (1.0 - c0) if c0 < 1 else float("inf")
-            stake0 = min(goal, SWING_BOLD_CAP_PCT * w, max(0.0, state.free_cash))
-            c, units = self._bold_cost(o, stake0)
+            if (_num(o.bet.cost if o.bet is not None else None) or 0.0) <= 0 or (_num(o.edge) or 0.0) <= _EPS:
+                continue  # no price or no edge: nothing to size
+            units, c, at_limit = self._bold_goal(o, gap)
             cheapest = c if cheapest is None else min(cheapest, c)
-            if c > cmax + 1e-9 or units <= 0:
+            if units <= 0:
                 continue
-            stake = min((bar - w) * c / (1.0 - c), SWING_BOLD_CAP_PCT * w, max(0.0, state.free_cash))
-            c, units = self._bold_cost(o, stake)
-            max_units = _num(o.max_units)
-            if max_units is not None and units > max_units + 1e-9:
-                continue
-            return _idea_id(o), (units, c, stake), None
+            why = self._bold_room(o, ctx, state, units)
+            if why is None:
+                return _idea_id(o), (units, c, round(units * c, 2), at_limit), None
+            if why == "stake_cap":
+                continue  # too dear: the 60% stake cannot reach the bar at this price
+            fund = self._bold_fundable(o, ctx, state, units)
+            fc, _ = self._bold_price(o, fund)
+            win_to = w + fund * (1.0 - fc)
+            if short is None or win_to > short[0] + 1e-9:
+                short = (win_to, why, o, fund)
+        if short is not None:
+            win_to, why, o, fund = short
+            touch = o.bet.cost if o.bet is not None else 0.0
+            limit = _num(o.limit_price) or touch
+            if why == "cash":
+                text = (f"the free cash ({_money(max(0.0, state.free_cash))} SUSQies, reserved at the {_px(limit)} limit) "
+                        "cannot fund a stake that reaches the bar")
+            elif why == "total_cap":
+                text = (f"the {float(SWING['total_cap']):.0%} total cap leaves room for only "
+                        f"{_money(max(0.0, float(SWING['total_cap']) * w - state.gross))} SUSQies, not a stake that "
+                        "reaches the bar")
+            else:
+                text = (f"the book offers only {_num(o.max_units) or 0:,.0f} {_unit(o)} up to the {_px(limit)} limit, "
+                        "not a stake that reaches the bar")
+            return None, None, (f"No bold bet: {text} (the best candidate would win only to {_money(win_to)}, below the "
+                                f"{_money(bar)} bar), so a swing would waste the variance; every idea is sized as in "
+                                "chase mode")
         c = cheapest if cheapest is not None else 1.0
         win_to = w + SWING_BOLD_CAP_PCT * w * (1.0 - c) / c if c > 0 else w
         return None, None, (f"No bold bet: the cheapest qualifying contract costs {_px(round(c, 4))}; above "
                             f"{_px(round(cmax, 2))} even a {SWING_BOLD_CAP_PCT:.0%} stake cannot reach the bar (it would "
                             f"win to {_money(win_to)}), so a swing would waste the variance")
 
-    def _bold_decision(self, opp: Opportunity, ctx: SizingContext, state: _State, plan: Tuple[int, float, float],
-                       label: str) -> SizeDecision:
-        units, c, stake = plan
+    def _bold_decision(self, opp: Opportunity, ctx: SizingContext, state: _State,
+                       plan: Tuple[int, float, float, bool], label: str) -> SizeDecision:
+        """The bold decision :meth:`_pick_bold` qualified: every cap was checked there, against this state."""
+        units, c, stake, at_limit = plan
         w = _num(ctx.equity) or 0.0
         bar = ctx.bar.value if ctx.bar is not None else 0.0
-        limit = _num(opp.limit_price) or c
-        capped: List[str] = ["goal"]
-        cash_units = _floor(max(0.0, state.free_cash) / limit) if limit > 0 else units
-        total_units = _floor(max(0.0, float(SWING["total_cap"]) * w - state.gross) / c) if c > 0 else units
-        final = min(units, cash_units, total_units)
-        if final < units:
-            capped.append("cash" if cash_units <= total_units else "total_cap")
-        stake_final = round(final * c, 2)
-        lines = [f"{label}: {final:,} {_unit(opp)} for about {_money(stake_final)} SUSQies"]
-        win_to = w + final * (1.0 - c)
-        if final >= units:
-            lines.append(f"Bold bet: if it wins, your value reaches the {_money(bar)} bar; it loses "
-                         f"{_money(stake_final)} otherwise")
-        else:
-            lines.append(f"Bold bet: if it wins, your value rises to {_money(win_to)} (the free cash keeps it below the "
-                         f"{_money(bar)} bar); it loses {_money(stake_final)} otherwise")
+        lines = [f"{label}: {units:,} {_unit(opp)} for about {_money(stake)} SUSQies, as the one bold bet (held to "
+                 "settlement)",
+                 f"Bold bet: if it wins, your value reaches the {_money(bar)} bar; it loses {_money(stake)} otherwise",
+                 BOLD_HOLD_LINE]
+        if at_limit:
+            lines.append(f"Depth unknown: priced at the {_px(round(c, 4))} limit, the worst fill the order accepts, so a "
+                         "win still reaches the bar")
         lines.append(f"One bold bet at most: two would not win together, so their win states are not joint "
                      f"(cost {_px(round(c, 4))}, at most {bold_max_cost(bar, w):.4f} to reach the bar with a "
                      f"{SWING_BOLD_CAP_PCT:.0%} stake)")
         levels = _clean_levels(opp.levels)
-        return SizeDecision(idea_id=_idea_id(opp), policy=self.name, units=final, stake=stake_final, capped_by=capped,
-                            mode="swing", lines=lines, avg_cost=round(c, 6) if levels else None, bold=True)
+        return SizeDecision(idea_id=_idea_id(opp), policy=self.name, units=units, stake=stake, capped_by=["goal"],
+                            mode="swing", lines=lines, avg_cost=round(c, 6) if (levels or at_limit) else None, bold=True)
 
     # ---- explanation
     def explain(self, ctx: SizingContext) -> Dict[str, Any]:
@@ -1043,6 +1140,10 @@ class ChaserPolicy:
         if mode == "out_of_reach":
             lines.append(OUT_OF_REACH_LINE)
         else:
+            if mode == "swing":
+                lines.append("The bold bet goes only on a binary contract that settles (or is likely called) before the "
+                             "Cup end, held to settlement, and only when the free cash, the total cap and the book can "
+                             "fund a stake whose win reaches the bar; it is funded before the other ideas")
             lines.append("Every directional size is shrunk by how certain its edge is, and capped at half-Kelly when "
                          "the order book depth is unknown")
         lines.append(SLATE_LINE)

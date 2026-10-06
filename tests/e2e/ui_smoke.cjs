@@ -5,7 +5,9 @@
  *
  * Without a URL it starts tests/e2e/serve_demo.py itself (python3 on PATH, or $PYTHON).
  * It opens every view (including the Simulation view: the human-speed headline, the table warning,
- * the published demo portfolios and top-3 bar, a simulated fill), sorts, filters, searches, opens and
+ * the published demo portfolios and top-3 bar, a simulated fill; and the Outside moves view: the demo's
+ * scripted New Hampshire Senate (D) lagging alert with its suggested hand trade, which serve_demo.py's
+ * 5-s outside poll raises about 90 s after the start), sorts, filters, searches, opens and
  * closes the detail drawer (button, Esc, backdrop), toggles the theme, re-analyzes a surge, simulates an outage and a fatal
  * tracker error, waits for poll cycles, and fails on any console error, page error, failed
  * request, HTTP error response or unhandled promise rejection.
@@ -30,7 +32,7 @@ const { chromium } = require(PW_MODULE);
 const ROOT = path.resolve(__dirname, '..', '..');
 const SHOTS = path.resolve(process.env.E2E_SCREENSHOT_DIR || path.join(ROOT, 'docs', 'screenshots'));
 const EXTRA = process.env.E2E_EXTRA_SHOTS ? path.resolve(process.env.E2E_EXTRA_SHOTS) : null;
-const VIEWS = ['overview', 'markets', 'surges', 'high', 'strategy', 'sim'];
+const VIEWS = ['overview', 'markets', 'surges', 'moves', 'high', 'strategy', 'sim'];
 // Published demo constants (docs/PAPER_TRADING.md §7.6): portfolio ids in config order, headline first.
 const SIM_PORTFOLIOS = ['human:conservative', 'policy:conservative', 'policy:chaser', 'kind:value', 'kind:basket', 'kind:hole', 'kind:fade',
   'kind:carry', 'kind:arbitrage'];
@@ -125,7 +127,7 @@ async function addRejectionTrap(context) {
 async function shot(page, name, opts) {
   fs.mkdirSync(SHOTS, { recursive: true });
   await page.waitForTimeout(150);
-  await page.screenshot({ path: path.join(SHOTS, name + '.png'), animations: 'disabled' });
+  await page.screenshot({ path: path.join(SHOTS, name + '.png'), animations: 'disabled', fullPage: !!(opts && opts.fullPage) });
   if (EXTRA && !(opts && opts.noExtra)) {
     fs.mkdirSync(EXTRA, { recursive: true });
     await page.screenshot({ path: path.join(EXTRA, name + '-full.png'), fullPage: true, animations: 'disabled' });
@@ -221,9 +223,10 @@ async function markets(page) {
   for (let i = 1; i < titles.length; i++) check(titles[i - 1].localeCompare(titles[i]) <= 0, 'titles sorted A to Z');
 
   // search
-  await page.fill('#market-search', 'ohio');
+  // (both words must match: the outside-moves demo also has an Ohio Senate market)
+  await page.fill('#market-search', 'ohio house');
   await page.waitForFunction(() => document.querySelectorAll('#markets-body tr').length === 1);
-  check(/Ohio/.test(await page.textContent('#markets-body tr')), 'search finds Ohio');
+  check(/Ohio House/.test(await page.textContent('#markets-body tr')), 'search finds Ohio House District 9');
   await page.fill('#market-search', 'zzzz-no-such-market');
   await page.waitForSelector('#markets-empty:not([hidden]) button');
   await page.click('#markets-empty button');
@@ -355,13 +358,16 @@ async function surges(page) {
   const links = await page.$$eval('#surge-cards .headline a', (as) => as.map((a) => [a.target, a.rel, a.protocol]));
   check(links.length > 0, 'news headlines are listed');
   for (const l of links) check(l[0] === '_blank' && l[1] === 'noopener noreferrer' && /^https?:$/.test(l[2]), 'headline link is safe: ' + l.join(' '));
-  const first = page.locator('#surge-cards .surge-card').first();
-  await first.locator('button.reanalyze').click();
-  await page.waitForFunction(() => {
-    const msg = document.querySelector('#surge-cards .surge-card .action-msg');
+  // one card by its surge id: a live surge detected meanwhile goes on top and must not take its place
+  const sid = await page.getAttribute('#surge-cards .surge-card button.reanalyze', 'data-surge-id');
+  const btn = '#surge-cards .surge-card button.reanalyze[data-surge-id="' + sid + '"]';
+  await page.click(btn);
+  await page.waitForFunction((sel) => {
+    const card = document.querySelector(sel) && document.querySelector(sel).closest('.surge-card');
+    const msg = card && card.querySelector('.action-msg');
     return msg && /Queued|Already queued/.test(msg.textContent);
-  });
-  check(/Re-analyze|Sending/.test(await first.locator('button.reanalyze').textContent()), 'Re-analyze button is still there');
+  }, btn);
+  check(/Re-analyze|Sending/.test(await page.textContent(btn)), 'Re-analyze button is still there');
 }
 
 async function high(page) {
@@ -414,6 +420,46 @@ async function simulation(page) {
   await page.waitForFunction(() => !document.getElementById('sim-reset-dialog').open);
 }
 
+/** The real demo (serve_demo.py: moves on, 5-s outside poll): the first alert is the scripted New Hampshire
+ *  Senate (D) move, lagging, with a suggested hand trade (docs/OUTSIDE_MOVES.md §15.2, §19.6). It opens about
+ *  90 s after the server started and stays lagging for a few minutes, so this runs first. */
+async function moves(page) {
+  await gotoView(page, 'moves');
+  check(/Outside moves/.test(await page.textContent('#h-moves')), 'the Outside moves view has its heading');
+  await page.waitForSelector('#moves-body .move-card', { timeout: 200000 });
+  const first = await page.evaluate(() => {
+    const card = document.querySelector('#moves-body .move-card');
+    return {
+      race: card.querySelector('.move-race').textContent.trim(),
+      status: card.querySelector('.move-status').textContent.trim(),
+      trade: card.querySelector('.trade-box:not(.no-trade-box)') ? card.querySelector('.trade-box').textContent.replace(/\s+/g, ' ').trim() : '',
+      href: card.querySelector('.move-title a').getAttribute('href'),
+    };
+  });
+  check(first.race === 'New Hampshire Senate (D)' && first.status === 'Cup lagging', 'the first alert is the New Hampshire Senate (D) lagging alert: ' + JSON.stringify(first));
+  check(/^Suggested hand trade: Buy YES at 0\.\d{3} — /.test(first.trade) && /Suggestion only, not a sure thing/.test(first.trade), 'it has a trade box with the suggestion-only note: ' + first.trade.slice(0, 160));
+  check(first.href === '#exchange/9035', 'the outcome links to its drawer: ' + first.href);
+  await page.waitForFunction(() => /^[1-9]$/.test(document.getElementById('nav-count-moves').textContent), null, { timeout: 15000 });
+  check(/open lagging alert/.test(await page.textContent('#nav-moves-sr')), 'the nav badge has its screen-reader sentence');
+  check(await page.isVisible('#moves-demo-badge'), 'the demo badge is shown on the Outside moves view');
+  const venues = await page.$$eval('#moves-body .venue-list li', (els) => els.map((e) => e.textContent.replace(/\s+/g, ' ').trim()));
+  check(venues.length === 2 && venues.every((v) => /^Demo venue [AB]: answering · 7 matched/.test(v)), 'both demo venues answer: ' + venues.join(' | '));
+  const sentence = (await page.textContent('#moves-body .lag-sentence')).trim();
+  check(/^(Only \d+ outside moves? on \d+ races?|No outside move has been (measured|resolved) yet)/.test(sentence) && /far too few|measured yet/.test(sentence), 'a young demo says its sample is small: ' + sentence);
+  check(!(await page.$('#moves-body .move-card[data-alert-id^="mv-9038-"], #moves-body .move-card[data-alert-id^="mv-9041-"]')), 'nothing alerts for the thin spike or the one-venue move');
+  check((await page.getAttribute('#moves-sound', 'aria-pressed')) === 'false', 'sound is off by default');
+  const caveats = await page.$$eval('#moves-body [data-panel="caveats"] li', (els) => els.map((e) => e.textContent));
+  check(caveats.length >= 7 && caveats.some((c) => /^Demo data: the outside moves and the Cup's reactions are scripted/.test(c)), 'the caveats include the demo caveat');
+  // the drawer opens from the card and closes back to the view
+  await page.click('#moves-body .move-card .move-title a');
+  await waitDrawerOpen(page);
+  check(/New Hampshire Senate/.test(await page.textContent('#drawer-title')), 'the drawer shows the alert\'s outcome');
+  await page.keyboard.press('Escape');
+  await waitDrawerClosed(page);
+  check((await page.evaluate(() => location.hash)) === '#moves', 'closing returns to #moves');
+  await page.evaluate(() => { window.scrollTo(0, 0); if (document.activeElement) document.activeElement.blur(); });
+}
+
 async function themeAndPersistence(page) {
   await page.click('[data-theme-choice="dark"]');
   check((await page.getAttribute('html', 'data-theme')) === 'dark', 'dark theme applied');
@@ -422,11 +468,22 @@ async function themeAndPersistence(page) {
   check(bg === 'rgb(13, 13, 13)', 'dark page background, got ' + bg);
 }
 
+/** Switch views; for the Outside moves view also wait for its own fresh answer (/api/moves loads only while the
+ *  view is shown, so the first render after a switch shows the data from the last visit). */
+async function gotoFresh(page, v) {
+  const fresh = v === 'moves' ? page.waitForResponse((r) => new URL(r.url()).pathname === '/api/moves' && r.ok(), { timeout: 20000 }) : null;
+  await gotoView(page, v);
+  if (fresh) {
+    await fresh;
+    await page.waitForTimeout(300);
+  }
+  await settleView(page, v);
+}
+
 async function darkShots(page) {
   for (const v of VIEWS) {
-    await gotoView(page, v);
-    await settleView(page, v);
-    await shot(page, v + '-dark');
+    await gotoFresh(page, v);
+    await shot(page, v + '-dark', { fullPage: v === 'moves' });
   }
   await gotoView(page, 'markets');
   await page.click('#markets-body tr[data-eid="9001"] a.row-link');
@@ -454,6 +511,7 @@ async function settleView(page, v) {
   if (v === 'markets') await page.waitForSelector('#markets-body tr');
   if (v === 'surges') await page.waitForSelector('#surge-cards .surge-card');
   if (v === 'high') await page.waitForSelector('#high-body tr');
+  if (v === 'moves') await page.waitForSelector('#moves-body .move-card, #moves-body .move-empty:not([hidden])');
   if (v === 'strategy') await page.waitForSelector('#strategy-body .idea');
   if (v === 'sim') {
     await page.waitForSelector('#sim-body [data-panel="headline"] .verdict-sentence', { timeout: 60000 });
@@ -549,6 +607,7 @@ function evilPayloads(now) {
       account: { balance: 'lots', my_rank: null, leader_value: 'x' },
       counts: { outcomes: 3, markets: null, surges: 'many', high_band: -1 },
       features: null, cup_end: 'never', days_left: null, view_error: null,
+      moves: { actionable: 'x', actionable_alerts: [EVIL, null, { alert_id: EVIL, headline: EVIL, body: EVIL }] },
     },
     '/api/markets': {
       total: 'n',
@@ -603,6 +662,24 @@ function evilPayloads(now) {
       book_error: EVIL, book_fetched_at: 'now', high_band: { side: null },
     },
     '/api/exchange/42': {},
+    '/api/moves': {
+      now, enabled: 'yes', available: 1, error: EVIL, demo: EVIL, poll_s: 'x', last_step_at: 'x', steps: 'x', watching: EVIL,
+      venues: [null, 'x', { venue: EVIL, label: EVIL, status: EVIL, last_error: EVIL, next_try_at: 'x', matched: 'x', budget_limit: 'x' },
+        { venue: 'kalshi', status: 'backoff', last_error: EVIL + ' 429', next_try_at: now + 60 }],
+      counts: { open: 'x', lagging: null, suppressed_today: { [EVIL]: 3, thin: 'x' } }, actionable_ids: EVIL,
+      alerts: [null, 'x', { alert_id: EVIL, exchange_id: EVIL, title: EVIL, option: EVIL, race_label: EVIL, status: EVIL, status_label: EVIL, state: EVIL,
+        reason: EVIL, venues: EVIL, venue_moves: [null, { venue: EVIL, base_value: 'x' }], flags: [EVIL, null], linked: EVIL, cup: EVIL, cup_now: 'x',
+        lag: { outcome: 'censored', reason: EVIL, capture_at: 'x' }, trade: EVIL, trade_note: EVIL, detected_at: 'x', window_s: EVIL, direction: EVIL },
+      { alert_id: 'mv-x1-1', exchange_id: 'x1', title: EVIL, status: 'lagging', state: 'open', direction: -1, move: 'x', outside_before: EVIL,
+        trade: { side: EVIL, text: EVIL, limit: 'x', max_limit: null, shares_at_limit: 'x', note: EVIL, book_source: EVIL, uncertainty: EVIL },
+        lag: { outcome: 'pending', t_move: 'x' }, opened_trade: { text: EVIL } },
+      { alert_id: 'mv-x2-1', exchange_id: 'x2', status: 'already_moved', state: 'closed', opened_trade: { text: EVIL, edge_per_share: 'x' },
+        lag: { outcome: 'followed', lag_s: 'x', lag_after_alert_s: -30, capture_at: now - 10, capture_4m: 'x', exit_at: now, exit_30m: null } }],
+      suppressed: [null, { race_label: EVIL, reason: EVIL, reason_label: EVIL, detail: EVIL, at: 'x' }],
+      summary: { sentence: EVIL, small_sample: 'x', followed_within: EVIL, followed_within_n: [1, 2], capture_4m: { n: 'x', mean: EVIL, ci90: [EVIL, 1] },
+        exit_30m: { n: 3, mean: 0.01, ci90: ['a', 'b'] }, lag_quartiles_s: EVIL, window: EVIL, since: 'x' },
+      thresholds: { abs_min: EVIL, min_edge: EVIL, lag_track_s: 'x' }, book_reads: { used: EVIL, limit: 'x' }, caveats: [EVIL, null, 5],
+    },
     '/api/paper': {
       enabled: 'yes', available: 1, demo: EVIL, error: EVIL, has_previous: 'yes', table_warning: EVIL, model_label: EVIL,
       run: { run_id: EVIL, steps: 5, hours_run: 'x', target_hours: -1, gaps: 'x', started_at: 'x', capital_source: EVIL, regime: EVIL,
@@ -662,11 +739,17 @@ async function hostile(browser, url) {
   await page.waitForFunction(() => document.getElementById('tournament-name').textContent.indexOf('<img') !== -1);
   await page.waitForTimeout(600);
   await safeDom('overview');
-  for (const v of ['markets', 'surges', 'high', 'strategy', 'sim']) {
+  for (const v of ['markets', 'surges', 'moves', 'high', 'strategy', 'sim']) {
     await gotoView(page, v);
     await page.waitForTimeout(600);
     await safeDom(v);
   }
+  await gotoView(page, 'moves');
+  for (const f of ['all', 'lagging', 'open', 'all']) await page.click('#moves-body button[data-moves-filter="' + f + '"]');
+  await page.click('#moves-filtered-details > summary');
+  await page.waitForTimeout(300);
+  check((await page.$$('#moves-body .move-card')).length === 3, 'hostile outside-move alerts with an id are listed, junk entries skipped');
+  await safeDom('moves details');
   await gotoView(page, 'sim');
   await page.waitForSelector('#sim-body [data-panel="portfolios"]');
   for (const sum of await page.$$('#sim-body details > summary')) await sum.click().catch(() => {});
@@ -711,11 +794,15 @@ async function mobile(browser, url) {
   const overflow = await page.evaluate(() => document.documentElement.scrollWidth - 390);
   check(overflow <= 1, 'no horizontal page scroll at 390 px (overflow ' + overflow + ' px)');
   await shot(page, 'mobile-390');
-  for (const v of ['markets', 'surges', 'high', 'strategy', 'sim']) {
-    await gotoView(page, v);
-    await settleView(page, v);
+  for (const v of ['markets', 'surges', 'moves', 'high', 'strategy', 'sim']) {
+    await gotoFresh(page, v);
     const o = await page.evaluate(() => document.documentElement.scrollWidth - 390);
     check(o <= 1, v + ': no horizontal page scroll at 390 px (overflow ' + o + ' px)');
+    if (v === 'moves') {
+      // the alerts panel at the top of the phone screen: the controls and the newest alert card
+      await page.evaluate(() => document.querySelector('#moves-body [data-panel="alerts"]').scrollIntoView());
+      await shot(page, 'moves-390');
+    }
     if (EXTRA) await page.screenshot({ path: path.join(EXTRA, 'mobile-390-' + v + '.png'), fullPage: true });
   }
   await gotoView(page, 'markets'); // waits for the hashchange (a click returns before it fires)
@@ -749,6 +836,10 @@ async function run(url) {
     log('opening ' + url);
     await page.goto(url + '/');
 
+    await moves(page);
+    await shot(page, 'moves-light', { fullPage: true });
+    log('outside moves ok');
+    await gotoView(page, 'overview');
     await overview(page);
     await shot(page, 'overview-light');
     log('overview ok');

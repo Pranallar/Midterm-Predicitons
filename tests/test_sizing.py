@@ -15,6 +15,7 @@ from supermarket_bot.models import (
     BarEstimate,
     BetShape,
     ExchangeInfo,
+    ExitPlan,
     ExposureSummary,
     HighBand,
     LeaderboardSnapshot,
@@ -494,3 +495,106 @@ class TestEstimateBar:
         now_values[4] = 199_000.0  # one inflated mark (rank 5 grew 2.2%/day): the median ignores it
         robust = Z.estimate_bar(board(now_values), [board([v / 1.04 for v in TOP], at=NOW - 4 * DAY)], W, 30)
         assert robust.growth_per_day == pytest.approx(0.01, abs=1e-6)
+
+
+# --------------------------------------------------------------------------- strategy fixer regressions
+
+
+def _plain_swing(opp: Opportunity, c: SizingContext) -> int:
+    """What the chaser buys of ``opp`` in swing mode without a bold bet (chase rules, one idea)."""
+    return Z._size_one(opp, c, Z._chaser_rules("swing"), Z._State.of(c), "chaser", n_same=1).units
+
+
+class TestStrategyFixerRegressions:
+    def test_strategy_3_bold_bet_only_on_a_binary_held_to_settlement(self) -> None:
+        pol = Z.ChaserPolicy()
+        c = ctx(b=bar(), days_left=1.0)
+        # a fade (a target/stop bracket) settling before the Cup end: its "win" is the target, +0.065 a share, never
+        # the bar, so it is not a bold candidate and is sized as in chase mode
+        fade = value_idea(entry=0.28, ev=0.015, sigma=0.0, idea_id="fade:x2:no:s7", kind="fade", settles=True,
+                          limit=0.285, side="no")
+        fade.bet = BetShape("bracket", p=0.7, gain=0.065, loss=0.135, cost=0.28)
+        d = pol.size_all([fade], c)[fade.idea_id]
+        assert d.bold is False and d.units == _plain_swing(fade, c) and d.units < 60_000  # the bold stake was 168,750
+        assert any(line.startswith("No bold bet: the ideas that settle in time exit before settlement") for line in d.lines)
+        assert not any(line.startswith("Bold bet") for line in d.lines)
+        # a value idea is a binary contract: bold, and the bold position must be held to its 1/0 result
+        val = value_idea(entry=0.25, ev=0.08, sigma=0.0, idea_id="value:x1:yes", settles=True, limit=0.25)
+        val.exit_plan = ExitPlan(kind="value", target_bid=0.32, dynamic_fv_target=True, exit_buffer=0.005,
+                                 note="Sell when the YES bid reaches 0.320")
+        b = pol.size_all([val], c)[val.idea_id]
+        assert b.bold is True and Z.BOLD_HOLD_LINE in b.lines and "held to settlement" in b.lines[0]
+        plan = Z.bold_exit_plan(val)
+        assert (plan.kind, plan.hold_to_resolution, plan.target_bid, plan.stop_bid, plan.dynamic_fv_target,
+                plan.time_stop_ts, plan.time_stop_after_fill_s, plan.exit_before_ts) == ("settle", True, None, None, False,
+                                                                                         None, None, None)
+        assert plan.note.startswith(Z.BOLD_HOLD_NOTE)
+        assert val.exit_plan.target_bid == 0.32  # the shared idea is not changed
+        # only the settlement regime's exit survives (flat before a VWAP closeout window)
+        val.exit_plan.exit_before_ts = NOW + 5 * H
+        assert Z.bold_exit_plan(val).exit_before_ts == NOW + 5 * H
+
+    def test_strategy_4_no_bold_bet_unless_the_fundable_stake_reaches_the_bar(self) -> None:
+        pol = Z.ChaserPolicy()
+        val = value_idea(entry=0.25, ev=0.08, sigma=0.0, idea_id="value:x1:yes", settles=True, limit=0.285)
+        # depth unknown: priced at the 0.285 limit, so the win reaches the bar even if every share fills there
+        full = pol.size_all([val], ctx(b=bar(), days_left=1.0))[val.idea_id]
+        assert full.bold is True and full.avg_cost == 0.285 and full.units == math.floor(121_500 / 0.715)
+        assert W + full.units * (1 - 0.285) >= 221_500 - 1 and full.stake <= 0.60 * W
+        assert any("priced at the 0.285 limit" in line for line in full.lines)
+        assert "Bold bet: if it wins, your value reaches the 221,500 bar; it loses 48,430 otherwise" in full.lines
+        # 20,000 free cash: no stake it can fund reaches the bar -> no bold bet, plain chase sizing, and why
+        c20 = ctx(b=bar(), days_left=1.0, free=20_000.0)
+        short = pol.size_all([val], c20)[val.idea_id]
+        assert short.bold is False and short.units == _plain_swing(val, c20)
+        assert ("No bold bet: the free cash (20,000 SUSQies, reserved at the 0.285 limit) cannot fund a stake that reaches "
+                "the bar (the best candidate would win only to 150,175, below the 221,500 bar), so a swing would waste "
+                "the variance; every idea is sized as in chase mode") in short.lines
+        assert not any("below the 221,500 bar); it loses" in line for line in short.lines)  # the old shortfall bet
+        # the 95% total cap: 60,000 already committed leaves 35,000, less than the 48,430 the goal needs
+        capped = pol.size_all([val], ctx(b=bar(), days_left=1.0, exposure=ExposureSummary(gross_cost=60_000.0)))
+        assert capped[val.idea_id].bold is False
+        assert any("the 95% total cap leaves room for only 35,000 SUSQies" in line for line in capped[val.idea_id].lines)
+        # the book holds only 50,000 shares up to the limit
+        thin = value_idea(entry=0.25, ev=0.08, sigma=0.0, idea_id="value:x1:yes", settles=True, limit=0.285,
+                          levels=[(0.25, 30_000.0), (0.27, 20_000.0)])
+        d = pol.size_all([thin], ctx(b=bar(), days_left=1.0))[thin.idea_id]
+        assert d.bold is False and any("the book offers only 50,000 shares up to the 0.285 limit" in line for line in d.lines)
+
+    def test_strategy_4_bold_bet_is_funded_before_better_scored_ideas(self) -> None:
+        pol = Z.ChaserPolicy()
+        best = [value_idea(entry=0.5, ev=0.08, sigma=0.0, idea_id=f"value:x{i}:yes", race_key=f"r{i}", score=2.0 - i / 10,
+                           settles=False, called=0.4, limit=0.5) for i in range(1, 4)]
+        bold = value_idea(entry=0.25, ev=0.08, sigma=0.0, idea_id="value:x9:yes", race_key="r9", score=0.5, settles=True,
+                          limit=0.25)
+        ideas = best + [bold]
+        out = pol.size_all(ideas, ctx(b=bar(), days_left=1.0, free=60_000.0))
+        d = out[bold.idea_id]
+        assert d.bold is True and W + d.units * 0.75 >= 221_500 - 1  # not cut by the better-scored ideas' cash
+        assert sum(x.units * (o.limit_price or 0.0) for o, x in zip(ideas, (out[o.idea_id] for o in ideas))) <= 60_000 + 1e-6
+        assert sum(1 for x in out.values() if x.bold) == 1
+        assert list(out) == [o.idea_id for o in sorted(ideas, key=lambda o: -o.score)]  # still best score first
+
+    def test_strategy_7_swing_cap_never_flips_an_over_cap_tilt_to_the_same_size(self) -> None:
+        cap = 0.10 * W / 3.0  # 3,333: a 3-point swing may cost at most 10% of equity
+        # the helper: against an over-cap tilt of -9,000, a D position may go through zero and up to +cap, not +9,000
+        u = Z._swing_units(-9_000.0, 0.057, cap)
+        assert -9_000.0 + u * 0.057 == pytest.approx(cap)
+        assert Z._swing_units(-9_000.0, -0.057, cap) == 0.0  # adding to the over-cap side: nothing
+        assert -2_000.0 + Z._swing_units(-2_000.0, 0.057, cap) * 0.057 == pytest.approx(cap)  # under the cap: unchanged
+        assert Z._swing_units(2_000.0, 0.057, cap) * 0.057 == pytest.approx(cap - 2_000.0)
+        # through the policy: a cheap contract far below fair value (ask 0.02, fair 0.32) on a -9,000 tilt used to buy
+        # 352,340 shares and move the tilt to +9,000 (a 3-point swing toward R costing 27% of equity, cap 10%); the
+        # chaser without a bar (unknown_bar mode) has a 30% swing cap: a 10,000 tilt
+        cases = [(Z.ConservativePolicy(), cap, -9_000.0), (Z.ConservativePolicy(), cap, -3_400.0),
+                 (Z.ChaserPolicy(), 0.30 * W / 3.0, -27_000.0)]
+        for pol, limit, tilt in cases:
+            idea = value_idea(entry=0.02, ev=0.30, sigma=0.0, limit=0.02, delta=0.057, idea_id="value:x7:yes",
+                              race_key="2026:SENATE:PA", levels=[(0.02, 10_000_000.0)])
+            d = pol.size_all([idea], ctx(exposure=ExposureSummary(national_tilt_d=tilt)))[idea.idea_id]
+            after = tilt + d.units * 0.057
+            assert d.units > 0 and after > 0 and after <= limit + 0.06, (pol.name, tilt, d.units, after)
+            assert ("tilt_cap" if pol.name == "conservative" else "swing_cap") in d.capped_by
+            swing_line = next(line for line in d.lines if line.startswith("A 3-point national swing"))
+            loss = float(swing_line.split("cost this portfolio ")[1].split(" SUSQies")[0].replace(",", ""))
+            assert loss <= 3 * limit + 1  # the line's own number is within the cap it states

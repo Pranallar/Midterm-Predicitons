@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 /* Regression checks for the dashboard UI bugs found in QA round 1, and the Simulation view's states
- * (docs/PAPER_TRADING.md §8.4, "sim-*" checks on page.route() fixtures from sim_fixtures.cjs) (CommonJS, Playwright).
+ * (docs/PAPER_TRADING.md §8.4, "sim-*" checks on page.route() fixtures from sim_fixtures.cjs), and the Outside moves
+ * view (docs/OUTSIDE_MOVES.md §19.6, "moves-*" checks on fixtures from moves_fixtures.cjs) (CommonJS, Playwright).
  *
  *   node tests/e2e/regressions.cjs [URL] [--only id,id]
  *
@@ -16,6 +17,7 @@
 
 const { launch, startServer, stopServer, check } = require('./lib.cjs');
 const SF = require('./sim_fixtures.cjs');
+const MF = require('./moves_fixtures.cjs');
 
 const args = process.argv.slice(2);
 let URL_ARG = null;
@@ -712,10 +714,12 @@ async function desktopChecks(browser) {
     let ns = 'unavailable';
     await patch(page, '**/api/surges', (j) => { const a = j.surges[0] && j.surges[0].attribution; if (a) { a.articles = []; a.news_status = ns; } });
     await open(page, '#surges');
-    await page.waitForFunction(() => /News search unavailable/.test(document.querySelector('#surge-cards .surge-card').textContent), null, { timeout: 15000 });
+    // the demo's first surge can take a while on a loaded machine: wait for a card before reading it
+    await page.waitForSelector('#surge-cards .surge-card', { timeout: 60000 });
+    await page.waitForFunction(() => /News search unavailable/.test((document.querySelector('#surge-cards .surge-card') || {}).textContent || ''), null, { timeout: 15000 });
     check(!/No matching headlines/.test(await text(page, '#surge-cards .surge-card')), 'an outage is not reported as "no matching headlines"');
     ns = 'disabled';
-    await page.waitForFunction(() => /News search off/.test(document.querySelector('#surge-cards .surge-card').textContent), null, { timeout: 15000 });
+    await page.waitForFunction(() => /News search off/.test((document.querySelector('#surge-cards .surge-card') || {}).textContent || ''), null, { timeout: 15000 });
   });
 
   await run('contract-detection', page, async () => {
@@ -1090,6 +1094,217 @@ async function simChecks(browser) {
     await page.click('#sim-previous-btn');
   });
 
+  // ui-1: the ended run's verdict (where a reset, a "settings changed" end or a finished 24-h test leaves it, D60) carries
+  // its verdict caveats directly under it (D54), the best-of-9 table warning (D4) and the demo caveat; so does the
+  // backtest's portfolio table (TABLE_WARNING with n = its rows when the report has no table_warning of its own).
+  await run('ui-1', page, async () => {
+    let demo = true;
+    await simRoutes(page, { previous: (now) => Object.assign(SF.previous(now), demo ? {} : { demo: false, caveats: SF.CAVEATS.slice() }) });
+    await openSim(page);
+    await page.waitForSelector('#sim-previous-btn:not([hidden])');
+    await page.click('#sim-previous-btn');
+    await page.waitForSelector('#sim-previous .verdict-sentence');
+    const r = await page.evaluate(() => {
+      const p = document.getElementById('sim-previous');
+      const verdict = p.querySelector('.sim-verdict');
+      const cav = p.querySelector('.verdict-caveats');
+      const warn = p.querySelector('.table-warning');
+      const table = p.querySelector('table');
+      const after = (a, b) => !!(a && b && (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING));
+      return {
+        caveats: cav ? Array.from(cav.querySelectorAll('li')).map((li) => li.textContent) : [],
+        underVerdict: !!cav && verdict.nextElementSibling === cav, warning: warn ? warn.textContent.trim() : null,
+        warningAboveTable: after(warn, table), demo: (p.querySelector('.demo-caveat') || {}).textContent || '', text: p.textContent,
+      };
+    });
+    check(JSON.stringify(r.caveats) === JSON.stringify(SF.CAVEATS.slice(0, 4)), 'the previous run shows headline.verdict_caveats: ' + JSON.stringify(r.caveats));
+    check(r.underVerdict, 'the verdict caveats sit directly under the previous verdict');
+    check(r.warning === SF.TABLE_WARNING && r.warningAboveTable, 'the table warning sits above the previous run\'s portfolio table: ' + r.warning);
+    check(r.demo.trim() === SF.DEMO_CAVEAT, 'the demo caveat is shown with the previous run: ' + r.demo);
+    // a real-data previous run carries no demo caveat
+    demo = false;
+    await page.click('#sim-previous-btn');
+    await page.click('#sim-previous-btn');
+    await page.waitForFunction(() => { const p = document.getElementById('sim-previous'); return p && p.isConnected && p.querySelector('.verdict-sentence') && !p.querySelector('.demo-caveat'); });
+    check((await text(page, '#sim-previous')).indexOf('Demo data') === -1 && !!(await page.$('#sim-previous .table-warning')), 'no demo caveat for a real run, the table warning stays');
+    await page.click('#sim-previous-btn');
+    // the backtest's "Portfolios in the replay" table
+    await page.waitForSelector('#sim-body [data-panel="backtest"] .bt-table');
+    const bt = await page.evaluate(() => {
+      const p = document.querySelector('#sim-body [data-panel="backtest"]');
+      const warn = p.querySelector('.table-warning');
+      const table = p.querySelector('.bt-table');
+      return { warning: warn ? warn.textContent.trim() : null, above: !!(warn && (warn.compareDocumentPosition(table) & Node.DOCUMENT_POSITION_FOLLOWING)), rows: table.querySelectorAll('tbody tr').length };
+    });
+    check(bt.rows === 9 && bt.warning === SF.TABLE_WARNING && bt.above, 'the backtest portfolio table carries the table warning (n = 9 rows): ' + JSON.stringify(bt));
+  });
+
+  // ui-8: right after a reset the new run has 0 steps ("waiting"); Previous run still opens its panel, after the clock
+  await run('ui-8', page, async () => {
+    const gets = [];
+    await simRoutes(page, { gets, paper: (now) => SF.paper(now, { empty: true }) });
+    await openSim(page);
+    await waitText(page, '#sim-body [data-panel="clock"]', /Waiting for the first simulated step/);
+    await page.waitForSelector('#sim-previous-btn:not([hidden])');
+    await page.click('#sim-previous-btn');
+    await page.waitForSelector('#sim-body [data-panel="previous"] .verdict-sentence', { timeout: 15000 });
+    const r = await page.evaluate(() => {
+      const panels = Array.from(document.querySelectorAll('#sim-body > [data-panel]')).map((p) => p.dataset.panel);
+      return { panels, expanded: document.getElementById('sim-previous-btn').getAttribute('aria-expanded'), rows: document.querySelectorAll('#sim-previous tbody tr').length };
+    });
+    check(r.expanded === 'true' && r.rows === 9, 'the previous run renders while the new run waits: ' + JSON.stringify(r));
+    check(r.panels.indexOf('previous') === r.panels.indexOf('clock') + 1, 'the previous run sits right after the clock: ' + r.panels.join(','));
+    check(gets.filter((q) => /run=previous/.test(q)).length === 1, 'loaded once');
+    await page.click('#sim-previous-btn');
+    await page.waitForFunction(() => !document.getElementById('sim-previous') || !document.getElementById('sim-previous').isConnected);
+    check((await page.getAttribute('#sim-previous-btn', 'aria-expanded')) === 'false', 'collapsing it says so');
+  });
+
+  // ui-10: a P&L under one SUSQie keeps its sign and marker (a -27% legging loss of -0.42 is not a neutral "● 0")
+  await run('ui-10', page, async () => {
+    await simRoutes(page, { paper: (now) => {
+      const d = SF.paper(now, {});
+      const t0 = d.trades[0];
+      d.trades = [
+        Object.assign({}, t0, { trade_id: 'kind:basket:t9', pnl: -0.42, return_pct: -0.274, cost: 1.53, proceeds: 1.11, exit_reason: 'legging' }),
+        Object.assign({}, t0, { trade_id: 'kind:basket:t8', pnl: 0.3, return_pct: 0.02 }),
+        Object.assign({}, t0, { trade_id: 'kind:basket:t7', pnl: 0.001, return_pct: 0.0001 }),
+        Object.assign({}, t0, { trade_id: 'kind:basket:t6', pnl: -412.4, return_pct: -0.05 }),
+      ];
+      d.headline.pnl_liq = -0.42;
+      d.headline.pnl_liq_pct = -0.0000042;
+      return d;
+    } });
+    await openSim(page);
+    await page.waitForSelector('#sim-body .trades-table tbody tr');
+    const cells = await page.$$eval('#sim-body .trades-table tbody tr td.num .pnl', (els) => els.map((e) => e.className.replace('pnl delta ', '') + ' ' + e.textContent));
+    check(cells.join(' | ') === 'down ▼−0.42 | up ▲+0.30 | flat ●0 | down ▼−412', 'small P&Ls keep their sign and marker: ' + cells.join(' | '));
+    const head = await text(page, '#sim-body [data-panel="headline"] .sim-pnl');
+    check(head === '▼−0.42 SUSQies loss', 'a headline loss under one SUSQie reads as a loss: ' + head);
+  });
+
+  // ui-12: no "would show — now" when the missed signals cannot be valued (holes), and a period before "It retries"
+  await run('ui-12', page, async () => {
+    await simRoutes(page, {
+      paper: (now) => {
+        const d = SF.paper(now, {});
+        d.portfolios[5].execution = { hole: { entries: 6, filled: 0, fill_rate: 0, avg_slippage: null, unfilled: 4, unfilled_pnl_now: null, exits: 0, avg_exit_slippage: null } };
+        return d;
+      },
+      backtest: (now) => SF.backtest(now, 'error'),
+    });
+    await openSim(page);
+    await page.click('#sim-body .portfolios-table tr[data-pid="kind:hole"] details summary');
+    const hole = await text(page, '#sim-body .portfolios-table tr[data-pid="kind:hole"] .exec-lines');
+    check(hole === 'Hole: 6 entries, 0 filled (0%); 4 signals did not fill', 'an unvalued miss is just counted: ' + hole);
+    await page.click('#sim-body .portfolios-table tr[data-pid="kind:value"] details summary');
+    const value = await text(page, '#sim-body .portfolios-table tr[data-pid="kind:value"] .exec-lines');
+    check(/; 2 signals that did not fill would show \+32 now;/.test(value), 'a valued miss keeps its clause: ' + value);
+    await waitText(page, '#sim-body [data-panel="backtest"] .bt-status', /failed/);
+    const bt = await text(page, '#sim-body [data-panel="backtest"] .bt-status');
+    check(bt === 'The backtest failed: database is locked. It retries in a minute.', 'the error is a sentence before "It retries": ' + bt);
+  });
+
+  // ui-13: the equity chart's y axis spans at least ±0.5% of the start capital, so +30 on 100,000 is a near-flat line
+  await run('ui-13', page, async () => {
+    let move = 30;
+    await simRoutes(page, { paper: (now) => {
+      const d = SF.paper(now, {});
+      for (const [pid, pts] of Object.entries(d.equity)) d.equity[pid] = pts.map(([t], k) => [t, 100000 + (pid.indexOf('human:') === 0 ? move : move / 6) * k / (pts.length - 1)]);
+      d.headline.pnl_liq = move;
+      d.headline.pnl_liq_pct = move / 100000;
+      d.portfolios[0].pnl_liq = move;
+      return d;
+    } });
+    const measure = () => page.evaluate(() => {
+      const path = document.querySelector('#sim-body .sim-chart path.eq-line[data-pid^="human:"]');
+      const hit = document.querySelector('#sim-body .sim-chart rect.hit');
+      const ticks = Array.from(document.querySelectorAll('#sim-body .sim-chart text.tick')).map((t) => Number(t.textContent.replace(/,/g, ''))).filter((v) => v > 1000);
+      return { share: path.getBBox().height / Number(hit.getAttribute('height')), lo: Math.min.apply(null, ticks), hi: Math.max.apply(null, ticks),
+        summary: document.querySelector('#sim-body [data-panel="equity"] .chart-summary').textContent };
+    });
+    await openSim(page);
+    await page.waitForSelector('#sim-body .sim-chart path.eq-line');
+    const small = await measure();
+    check(small.share < 0.1 && small.lo <= 99500 && small.hi >= 100500, '+0.03% stays a near-flat line on a ±0.5% axis: ' + JSON.stringify(small));
+    check(/\(\+0\.03% of the start capital\)/.test(small.summary), 'the summary says how big the move is: ' + small.summary);
+    move = 5000; // a +5% move still uses most of the plot
+    await openSim(page);
+    await page.waitForSelector('#sim-body .sim-chart path.eq-line');
+    const big = await measure();
+    check(big.share > 0.5 && big.hi >= 105000, 'a +5% move fills the plot: ' + JSON.stringify(big));
+  });
+
+  // Integration round (round 3): what the engine now publishes is shown where the number it qualifies is.
+  // accounting-8 (a frozen row shows what the totals charge), accounting-6 (naked basket shares have no floor),
+  // ui-3 (untested value ideas next to the "all ideas" label), ui-7 (legging exits apart from the win rate),
+  // ui-4 (a run on the default capital says so), ui-6 (the chart's end label is the headline's P&L).
+  await run('round3-sim-panels', page, async () => {
+    const UNTESTED = 'Value ideas were not tested: usable outside fair values on 0% of steps (outside prices off, offline or not received yet), so this result covers basket, hole, fade, carry and arbitrage ideas only.';
+    await simRoutes(page, { paper: (now) => {
+      const d = SF.paper(now, {});
+      d.headline.untested = [UNTESTED];
+      d.headline.verdict = Object.assign({}, d.headline.verdict, { untested: [UNTESTED] });
+      d.portfolios[0].legging_trades = 2;
+      d.portfolios[0].legging_pnl = -3.2;
+      const bk = d.baskets[0];
+      bk.legs[0].qty = 400; bk.legs[0].naked_qty = 100; bk.naked_qty = 100;
+      return d;
+    } });
+    await openSim(page);
+    await page.waitForSelector('#sim-body [data-panel="headline"] .verdict-sentence');
+    const label = await page.$eval('#sim-body [data-panel="headline"] .sim-label', (e) => e.nextElementSibling && e.nextElementSibling.textContent.trim());
+    check(label === 'Value ideas were not tested (see the verdict below), so this is not all ideas.', 'ui-3: the untested kinds sit right under the "all ideas" label: ' + label);
+    const row = await text(page, '#sim-body .portfolios-table tr[data-pid="human:conservative"]');
+    check(/2 legging exits −3, not counted/.test(row) && /3 of 5/.test(row), 'ui-7: legging exits listed apart from the closed-ideas win rate: ' + row.slice(-200));
+    const clock = await text(page, '#sim-body [data-panel="clock"]');
+    check(/Your account value was not known when this run started, so every portfolio started with the default 100,000 SUSQies/.test(clock), 'ui-4: a default-capital run says so: ' + clock.slice(0, 400));
+    const endLabel = await page.$eval('#sim-body .sim-chart .end-label', (e) => e.textContent);
+    check(/^You, by hand \+412$/.test(endLabel), 'ui-6: the chart end label is the headline P&L: ' + endLabel);
+    await page.selectOption('#sim-pos-filter', '');
+    await page.waitForFunction(() => document.querySelectorAll('#sim-body .positions-table tbody tr').length > 1);
+    const frozen = await page.$$eval('#sim-body .positions-table tbody tr[data-eid="9034"] td', (tds) => tds.map((t) => t.textContent.replace(/\s+/g, ' ').trim()));
+    check(frozen[4] === 'unvalued(last 640.00)' && /−688/.test(frozen[5]), 'accounting-8: the frozen row is unvalued (its last value aside) and charged at −cost: ' + JSON.stringify(frozen));
+    const basket = await text(page, '#sim-body .baskets-table tbody tr');
+    check(/100 naked, no floor/.test(basket) && /100 naked shares beyond the sets: no floor/.test(basket), 'accounting-6: naked basket shares are named: ' + basket);
+  });
+
+  // accounting-4: the backtest's "P&L at liquidation" includes assumed fills; the figure the verdict states is beside it
+  await run('round3-backtest-assumed', page, async () => {
+    await simRoutes(page, { backtest: (now) => {
+      const b = SF.backtest(now);
+      const v = b.report.verdicts['human:conservative'];
+      b.report.verdicts['human:conservative'] = Object.assign({}, v, { synthetic_pnl: 25, pnl_liq: 387.4 });
+      b.report.sweep[0] = Object.assign({}, b.report.sweep[0], { synthetic_pnl: 10, verdict_pnl: 200 });
+      return b;
+    } });
+    await openSim(page);
+    await page.waitForSelector('#sim-body .bt-table');
+    const cell = await page.$eval('#sim-body .bt-table tbody tr:first-child td', (e) => e.textContent.replace(/\s+/g, ' ').trim());
+    check(/▲\+412 ?\+387 without assumed fills/.test(cell), 'the replay row names its P&L without assumed fills: ' + cell);
+    const others = await page.$$eval('#sim-body .bt-table tbody tr .assumed-sub', (els) => els.length);
+    check(others === 1, 'only rows with assumed fills carry the note: ' + others);
+    const sw = await page.$eval('#sim-body .sweep-table tbody tr:first-child td', (e) => e.textContent.replace(/\s+/g, ' ').trim());
+    check(/\+200 without assumed fills/.test(sw), 'the sweep row too: ' + sw);
+  });
+
+  // live-4: a venue never asked is "not asked yet" (neutral), an offline one that never answered says so
+  await run('round3-providers', page, async () => {
+    await simRoutes(page, { fairvalue: (now) => {
+      const f = SF.fairvalue(now);
+      f.providers.push({ name: 'manual', status: 'pending', last_ok_at: null, last_error: null, requests: 0, matched: null, quoted: null, next_try_at: null });
+      return f;
+    } });
+    await openSim(page);
+    await page.waitForSelector('#sim-body .provider-list li');
+    const lines = await page.$$eval('#sim-body .provider-list li', (els) => els.map((e) => e.textContent.replace(/\s+/g, ' ').trim()));
+    check(/^Polymarket: offline from this machine · 0 matched, 0 quoted · never answered · next try/.test(lines[0]) && /unreachable from this machine/.test(lines[0]), 'an offline venue: ' + lines[0]);
+    check(!/last answer/.test(lines[0]) && /Kalshi: answering .* last answer/.test(lines[1]), 'only a venue that answered shows a last answer: ' + lines[1]);
+    check(/^Your fair-value file: not asked yet/.test(lines[2]) && !/never answered/.test(lines[2]), 'a pending provider: ' + lines[2]);
+    const cls = await page.$eval('#sim-body .provider-list li:nth-child(3)', (e) => e.className);
+    check(/provider-pending/.test(cls), 'pending has its own class: ' + cls);
+  });
+
   await run('strategy-new-kinds', page, async () => {
     await patch(page, '**/api/strategy', (j, now) => {
       j.opportunities = SF.strategyIdeas(now).concat(j.opportunities || []);
@@ -1125,6 +1340,102 @@ async function simChecks(browser) {
     check(/^#strategy\//.test(hrefs[1]) && hrefs[0] === '#exchange/9026', 'a basket links to its card, a value idea to its outcome: ' + hrefs.slice(0, 3).join(' '));
   });
 
+  /** The Strategy view on the fixture ideas only (value, basket, hole) with the fixture sizing block; fn(ideas) edits them. */
+  async function strategyFixture(fn) {
+    await patch(page, '**/api/strategy', (j, now) => {
+      const ideas = SF.strategyIdeas(now);
+      if (fn) fn(ideas);
+      j.opportunities = ideas;
+      j.sizing = SF.strategySizing();
+      j.settlement_regime = 'unknown';
+    });
+    await open(page, '#strategy', { noWait: true });
+    await page.waitForSelector('#strategy-body .idea');
+  }
+
+  function cardFacts(sel) {
+    return page.$eval(sel, (card) => {
+      const out = {};
+      for (const div of card.querySelectorAll('.idea-main > .facts > div')) out[div.querySelector('dt').textContent] = div.querySelector('dd').textContent.replace(/\s+/g, ' ').trim();
+      return out;
+    });
+  }
+
+  // ui-2: a sized taker idea states its edge and return at the expected average fill of the suggested size (what its
+  // cost is priced at, and how the simulator fills), with the best-price (touch) figures only beside them
+  await run('ui-2', page, async () => {
+    await strategyFixture((ideas) => {
+      // the Texas value idea: touch 0.540, q 0.580 (edge +0.040, 7.4%); 2,400 shares walk the book to an average 0.550
+      Object.assign(ideas[0], { edge: 0.04, expected_return: 0.0741, fill_price: 0.55 });
+      ideas[2].fill_price = 0.695; // a resting hole order: its fill price is its limit, nothing to restate
+    });
+    const v = await cardFacts('#strategy-body .idea[data-key^="value:x9026"]');
+    check(v['Edge per share'] === '+0.030 (+0.040 at the best price)', 'the edge is stated at the expected average fill: ' + v['Edge per share']);
+    check(v['Expected return'] === '5.5% (7.4% at the best price)', 'the return is stated at the expected average fill: ' + v['Expected return']);
+    check(v['Expected average fill'] === '0.550 per share for 2,400 shares (best price 0.540)', 'the expected average fill is shown: ' + v['Expected average fill']);
+    const ho = await cardFacts('#strategy-body .idea[data-key^="hole:x9033"]');
+    check(!('Expected average fill' in ho) && ho['Edge per share'] === '+0.004', 'a resting order keeps its own edge: ' + JSON.stringify(ho));
+    const b = await cardFacts('#strategy-body .idea[data-key^="basket:"]');
+    check(b['Edge per set'] === '+0.050' && !('Expected average fill' in b), 'without a fill price the edge is unchanged: ' + b['Edge per set']);
+    await gotoView(page, 'overview');
+    await page.waitForSelector('#look-ideas li a[href="#exchange/9026"]');
+    const side = await page.$eval('#look-ideas li a[href="#exchange/9026"] .look-side', (e) => e.textContent.replace(/\s+/g, ' ').trim());
+    check(/Edge \+0\.030\/share$/.test(side), 'the Overview shows the same edge as the card: ' + side);
+  });
+
+  // ui-5: a hole's prob_win is the chance its resting order fills (hole_fill_prob), not the chance the outcome wins
+  await run('ui-5', page, async () => {
+    await strategyFixture();
+    const ho = await cardFacts('#strategy-body .idea[data-key^="hole:x9033"]');
+    check(ho['Chance it fills'] === '2%' && !('Win probability' in ho), 'the hole card says "Chance it fills": ' + JSON.stringify(ho));
+    const tip = await page.$eval('#strategy-body .idea[data-key^="hole:x9033"] .facts > div:first-child dd', (e) => e.title);
+    check(/not the chance the outcome wins/.test(tip), 'the tooltip says what it is not: ' + tip);
+    const v = await cardFacts('#strategy-body .idea[data-key^="value:x9026"]');
+    check(v['Win probability'] === '58%', 'other kinds keep "Win probability": ' + v['Win probability']);
+    await gotoView(page, 'overview');
+    await page.waitForSelector('#look-ideas li a[href="#exchange/9033"]');
+    const side = await page.$eval('#look-ideas li a[href="#exchange/9033"] .look-side', (e) => e.textContent.replace(/\s+/g, ' ').trim());
+    check(/^Fill chance 2%/.test(side) && !/Win/.test(side), 'the Overview item says "Fill chance": ' + side);
+  });
+
+  // strategy-9: a longshot value idea is priced on its shrunk fair value: the card says so next to the outside value
+  await run('strategy-9', page, async () => {
+    await strategyFixture((ideas) => { Object.assign(ideas[0], { fair_value: 0.13, prob_win: 0.117, entry_price: 0.035 }); });
+    const v = await cardFacts('#strategy-body .idea[data-key^="value:x9026"]');
+    check(/^0\.130 \(.*\); valued at 0\.117 as a longshot$/.test(v['Fair value'] || ''), 'the shrunk value is shown: ' + v['Fair value']);
+    await strategyFixture();
+    const plain = await cardFacts('#strategy-body .idea[data-key^="value:x9026"]');
+    check(!/longshot/.test(plain['Fair value'] || ''), 'a non-longshot keeps the plain fair value: ' + plain['Fair value']);
+  });
+
+  // ui-9: the Markov ceiling is a bound ("at most"), and the Markov sentence is shown for every policy (the conservative
+  // policy's own lines leave it out), once
+  await run('ui-9', page, async () => {
+    await strategyFixture();
+    const sel = '#strategy-body section[aria-labelledby="h-sizing"]';
+    const r = await page.$eval(sel, (p) => {
+      const tiles = {};
+      for (const d of p.querySelectorAll(':scope > .facts > div')) tiles[d.querySelector('dt').textContent] = d.querySelector('dd').textContent.trim();
+      const alt = p.querySelector('.alt-sizing');
+      return {
+        tiles, lines: Array.from(p.querySelectorAll(':scope > .sizing-lines li')).map((li) => li.textContent),
+        altLines: Array.from(alt.querySelectorAll('.sizing-lines li')).map((li) => li.textContent),
+        altTile: Array.from(alt.querySelectorAll('.facts > div')).map((d) => d.querySelector('dt').textContent + ': ' + d.querySelector('dd').textContent.trim()),
+      };
+    });
+    check(r.tiles['Chance of reaching the bar'] === 'at most 45%' && !('Chance ceiling' in r.tiles), 'the tile is worded as a bound: ' + JSON.stringify(r.tiles));
+    check(r.lines[0] === 'A strategy whose expected multiple is 1.00x reaches 2.2x with probability at most 45%; with no edge (fair prices) the bound is 1/M = 45%.',
+      'the conservative panel states the Markov sentence: ' + r.lines[0]);
+    check(r.altLines.filter((t) => /with probability at most/.test(t)).length === 1, 'the chaser\'s own Markov sentence is not repeated: ' + r.altLines.join(' | '));
+    check(r.altTile.indexOf('Chance of reaching the bar: at most 46%') !== -1, 'the chaser tile too: ' + r.altTile.join(' | '));
+    // the Simulation view's chaser panel uses the same tile
+    await simRoutes(page);
+    await openSim(page);
+    await page.waitForSelector('#sim-body [data-panel="chaser"] .facts');
+    const ch = await text(page, '#sim-body [data-panel="chaser"]');
+    check(/Chance of reaching the bar\s*at most 46%/.test(ch) && (ch.match(/with probability at most/g) || []).length === 1, 'the Simulation chaser panel: ' + ch.slice(0, 300));
+  });
+
   await page.context().close();
 
   // phone: the Simulation view never scrolls the page sideways; wide tables scroll in their own box
@@ -1142,6 +1453,616 @@ async function simChecks(browser) {
     check(r.page <= 1 && r.table && r.chart, 'no sideways page scroll at 390 px; tables scroll in their box: ' + JSON.stringify(r));
   });
   await phone.context().close();
+}
+
+// ------------------------------------------------------------------ outside moves (docs/OUTSIDE_MOVES.md §19.6)
+
+/** Serve /api/moves from a fixture: body(now, url) -> a body, or {__status, body}. `status` (optional) is a function
+ *  returning the alerts whose actionable ones /api/status lists under "moves" (the badge, sound and notifications). */
+async function movesRoutes(page, opts) {
+  opts = opts || {};
+  const reply = (route, out) => {
+    const res = out && out.__status ? out : { __status: 200, body: out };
+    return route.fulfill({ status: res.__status, headers: JSON_HEADERS, body: JSON.stringify(res.body) });
+  };
+  if (opts.body !== false) {
+    await page.route((u) => u.pathname === '/api/moves', (route) => {
+      if (opts.gets) opts.gets.push(route.request().method() + ' ' + new URL(route.request().url()).search);
+      return reply(route, (opts.body || ((now) => MF.body(now)))(Date.now() / 1000, route.request().url()));
+    });
+  }
+  if (opts.status) {
+    await patch(page, '**/api/status', (j, now) => {
+      const alerts = opts.status(now);
+      j.moves = alerts === null ? null : MF.statusMoves(now, alerts);
+    });
+  }
+}
+
+/** A page that records every console error and CSP violation (the moves checks fail on either). */
+async function movesPage(browser, opts) {
+  const page = await newPage(browser, opts);
+  page.__console = [];
+  page.on('console', (msg) => { if (msg.type() === 'error') page.__console.push(msg.text()); });
+  await page.context().addInitScript(() => {
+    window.__csp = [];
+    document.addEventListener('securitypolicyviolation', (e) => window.__csp.push(e.violatedDirective + ' ' + e.blockedURI));
+  });
+  return page;
+}
+
+async function cleanPage(page, where) {
+  const r = await page.evaluate(() => ({
+    csp: window.__csp || [],
+    styled: document.querySelectorAll('#view-moves [style], #moves-body [style]').length,
+    scripts: document.querySelectorAll('script').length,
+  }));
+  check(!r.csp.length, where + ': no CSP violations: ' + r.csp.join(' | '));
+  check(r.styled === 0, where + ': no inline style attributes in the moves view (' + r.styled + ')');
+  check(r.scripts === 1, where + ': no injected scripts');
+  check(!page.__console.length, where + ': no console errors: ' + page.__console.join(' | '));
+}
+
+async function openMoves(page, sel) {
+  await open(page, '#moves', { noWait: true });
+  await page.waitForSelector(sel || '#moves-body .move-card', { timeout: 20000 });
+}
+
+async function setMovesFilter(page, f) {
+  await page.click('#moves-body button[data-moves-filter="' + f + '"]');
+  await page.waitForFunction((x) => document.querySelector('#moves-body button[data-moves-filter="' + x + '"]').getAttribute('aria-pressed') === 'true', f);
+}
+
+async function cardText(page, id) {
+  return page.$eval('#moves-body .move-card[data-alert-id="' + id + '"]', (el) => el.textContent.replace(/\s+/g, ' ').trim());
+}
+
+/** The card text a sighted user reads: the screen-reader-only separators left out. */
+async function visibleCardText(page, id) {
+  return page.$eval('#moves-body .move-card[data-alert-id="' + id + '"]', (el) => {
+    const c = el.cloneNode(true);
+    for (const s of c.querySelectorAll('.sr-only')) s.remove();
+    return c.textContent.replace(/\s+/g, ' ').trim();
+  });
+}
+
+/** An AudioContext stub that records every oscillator start (window.__starts) and every construction (window.__ctx). */
+function audioStub() {
+  window.__starts = [];
+  window.__ctx = 0;
+  window.AudioContext = class {
+    constructor() { window.__ctx += 1; this.state = 'running'; this.currentTime = 1; this.destination = {}; }
+    resume() { this.state = 'running'; return Promise.resolve(); }
+    createOscillator() {
+      return { type: '', frequency: { value: 0 }, connect() {}, start(t) { window.__starts.push({ t, f: this.frequency.value, type: this.type }); }, stop() {} };
+    }
+    createGain() { return { gain: { value: 0 }, connect() {} }; }
+  };
+}
+
+/** A Notification stub: window.__perm is the permission, window.__answer what requestPermission() answers. */
+function notificationStub(perm) {
+  window.__notes = [];
+  window.__asked = 0;
+  window.__perm = perm;
+  window.Notification = class {
+    constructor(title, options) {
+      this.title = title;
+      this.options = options || {};
+      this.onclick = null;
+      window.__notes.push({ title, body: this.options.body, tag: this.options.tag });
+      window.__lastNote = this;
+    }
+    static get permission() { return window.__perm; }
+    static requestPermission(cb) {
+      window.__asked += 1;
+      window.__perm = window.__answer || 'granted';
+      if (cb) cb(window.__perm);
+      return Promise.resolve(window.__perm);
+    }
+    close() {}
+  };
+}
+
+/** run() for the moves checks: each starts with an empty console log (cleanPage fails on any error). */
+async function mrun(name, page, fn) {
+  return run(name, page, async (p) => {
+    p.__console.length = 0;
+    await fn(p);
+  });
+}
+
+async function movesChecks(browser) {
+  const page = await movesPage(browser);
+  const now0 = () => Date.now() / 1000;
+
+  await mrun('moves-statuses', page, async () => {
+    await movesRoutes(page);
+    await openMoves(page);
+    await setMovesFilter(page, 'all');
+    const fx = MF.allAlerts(now0());
+    const cards = await page.$$eval('#moves-body .move-card', (els) => els.map((el) => ({
+      id: el.dataset.alertId,
+      badge: el.querySelector('.move-status').textContent.trim(),
+      icon: !!el.querySelector('.move-status svg.icon'),
+      closed: !!el.querySelector('.status-closed'),
+      race: el.querySelector('.move-race').textContent.trim(),
+      href: el.querySelector('.move-title a') ? el.querySelector('.move-title a').getAttribute('href') : null,
+    })));
+    check(cards.map((c) => c.id).join(',') === fx.map((a) => a.alert_id).join(','), 'every alert is shown, in the server order: ' + cards.map((c) => c.id).join(','));
+    fx.forEach((a, i) => {
+      const c = cards[i];
+      check(c.badge === MF.STATUS_LABELS[a.status] && c.icon, a.alert_id + ': the badge has an icon and the status text (' + c.badge + ')');
+      check(c.closed === (a.state === 'closed'), a.alert_id + ': a closed alert says "closed"');
+      check(c.race === a.race_label, a.alert_id + ': the race label leads the card (' + c.race + ')');
+      check(c.href === '#exchange/' + a.exchange_id, a.alert_id + ': the outcome links to the drawer (' + c.href + ')');
+    });
+    const icons = await page.$$eval('#moves-body .move-card .move-status svg', (els) => new Set(els.map((s) => s.innerHTML)).size);
+    check(icons === 4, 'the four statuses have four different icons (' + icons + ')');
+    const L = fx[0];
+    const t = await visibleCardText(page, L.alert_id);
+    check(/Detected 2 min ago · moved in 5 min/.test(t), 'age and window: ' + t.slice(0, 200));
+    check(/Outside 0\.517 → 0\.573 \(\+5\.5 pts\) · Polymarket 0\.520 → 0\.580 · Kalshi 0\.515 → 0\.565/.test(t), 'the outside line per venue: ' + t.slice(0, 300));
+    check(/Cup now 0\.512 \(bid 0\.505 \/ ask 0\.520\), moved 0\.0 pts since the outside move began · lag gap 5\.5 pts/.test(t), 'the Cup line and the lag gap: ' + t);
+    // (integration) the gap between the prices now, when it differs from the peak-based lag gap by half a point
+    check(/lag gap 5\.5 pts · the outside price is now 6\.0 pts above the Cup/.test(t), 'the current level gap is said next to the lag gap: ' + t.slice(0, 400));
+    check(!/the outside price is now/.test(await visibleCardText(page, fx[1].alert_id)), 'no level note when it equals the lag gap');
+    check(t.indexOf(L.reason) !== -1, 'the reason sentence is verbatim');
+    check(/Waiting for the Cup: 2 of 60 min\./.test(t), 'a pending lag counts the minutes: ' + t.slice(-200));
+    const followed = await visibleCardText(page, fx[6].alert_id);
+    check(/The Cup followed 4\.3 min after the outside move \(1\.8 min after this alert\)\./.test(followed), 'a followed lag line: ' + followed);
+    check(/Measured: 4 min after the alert: \+0\.00[78] a share left; bought then and sold 30 min later: \+0\.005 a share/.test(followed), 'captures when known: ' + followed);
+    const nf = await visibleCardText(page, fx[7].alert_id);
+    check(/The Cup did not follow within 60 min; the gap is 6\.0 pts now\./.test(nf) && /Never followed within the hour/.test(nf) && /−0\.010 a share/.test(nf), 'not followed: ' + nf);
+    const cens = await visibleCardText(page, fx[8].alert_id);
+    check(/Not counted in the lag study: the bot was not running for 25 min while this was measured\./.test(cens), 'censored: ' + cens);
+    const first = await visibleCardText(page, fx[5].alert_id);
+    check(/the outside followed the Cup, not a lag/.test(first) && /The Cup moved first, about 11\.2 min earlier\./.test(first), 'Cup moved first: ' + first);
+    // (integration) a move the Cup made first has no "lag gap" to show (it is not a lag)
+    check(/no lag gap: the Cup moved first/.test(first) && !/lag gap \d/.test(first), 'Cup moved first shows no lag gap: ' + first.slice(0, 400));
+    const rev = await visibleCardText(page, fx[4].alert_id);
+    check(/came back 3\.5 of its 5\.5 pts/.test(rev) && /Never followed: the outside price came back first\./.test(rev) && /−0\.005 a share left/.test(rev), 'reverted: ' + rev);
+    check(!/sure thing/i.test((await text(page, '#moves-body')).replace(/not a sure thing/gi, '')), 'nothing calls an alert a sure thing');
+    await page.unrouteAll({ behavior: 'ignoreErrors' });
+    await movesRoutes(page, { body: (now) => MF.body(now, { alerts: [MF.alertAlready(now, { lag_gap_now: -0.01 })] }) });
+    await openMoves(page);
+    check(/lag gap closed \(the Cup moved 1\.0 pts further than the outside price\)/.test(await visibleCardText(page, MF.alertAlready(0).alert_id)), 'an overshooting Cup: the gap is closed, not negative');
+    // (integration) a converging move (the outside price moved to where the Cup already was) is not a lag either
+    await page.unrouteAll({ behavior: 'ignoreErrors' });
+    await movesRoutes(page, { body: (now) => {
+      const a = MF.alertAlready(now, { lag_gap: 0.054, lag_gap_now: 0.054, level_gap_now: 0.0 });
+      a.lag = Object.assign({}, a.lag, { eligible: false, outcome: 'excluded', excluded_reason: 'converging: the outside moved to the Cup\'s price' });
+      return MF.body(now, { alerts: [a] });
+    } });
+    await openMoves(page);
+    const conv = await visibleCardText(page, MF.alertAlready(0).alert_id);
+    check(/no lag gap: the outside price moved to the Cup’s price/.test(conv) && !/lag gap 5\.4/.test(conv) && /the outside price is level with the Cup now/.test(conv), 'a converging move shows no lag gap: ' + conv.slice(0, 400));
+    await cleanPage(page, 'moves-statuses');
+  });
+
+  await mrun('moves-trade-box', page, async () => {
+    await movesRoutes(page);
+    await openMoves(page);
+    const fx = MF.allAlerts(now0());
+    const box = await page.$eval('#moves-body .move-card[data-alert-id="' + fx[0].alert_id + '"] .trade-box', (el) => el.textContent.replace(/\s+/g, ' ').trim());
+    check(/^Suggested hand trade: Buy YES at 0\.520 — 300 shares at that price \(book read (just now|\d+ s ago)\); up to 0\.525 still keeps 1 cent a share: 750 shares\./.test(box), 'limit, shares at the limit and up to the max limit: ' + box);
+    check(/\+0\.037 per share net of the spread \(\+0\.018 after the outside price’s ±2\.0-cent uncertainty\) if the Cup catches up to 0\.565; \+0\.045 at resolution if the outside price is right\./.test(box), 'edges net of spread, after uncertainty and at resolution: ' + box);
+    check(box.indexOf(MF.TRADE_NOTE) !== -1, 'the "suggestion only" note is verbatim');
+    const no = await page.$eval('#moves-body .move-card[data-alert-id="' + fx[1].alert_id + '"] .trade-box', (el) => el.textContent.replace(/\s+/g, ' ').trim());
+    check(/^Suggested hand trade: Buy NO at 0\.430 — shares at that price unknown \(no recent Cup order book\); up to 0\.450 still keeps 1 cent a share\./.test(no), 'without a book the depth is unknown: ' + no);
+    check(/if the Cup’s NO price catches up to 0\.475 \(YES 0\.525\)/.test(no) && no.indexOf(MF.TRADE_NOTE) !== -1, 'a NO trade names the NO price: ' + no);
+    const nt = await cardText(page, fx[2].alert_id);
+    check(nt.indexOf('No trade suggested: ' + fx[2].trade_note) !== -1 && !/Suggested hand trade/.test(nt), 'a lagging card without a trade shows its trade_note: ' + nt);
+    check(/one venue only/.test(nt), 'a one-venue move says so');
+    const am = await cardText(page, fx[3].alert_id);
+    check(!/Suggested hand trade|No trade suggested/.test(am), 'an already-moved card has no trade box');
+    await setMovesFilter(page, 'all');
+    const fl = await cardText(page, fx[6].alert_id);
+    check(/When it opened, the suggestion was: Buy YES at 0\.520 \(\+0\.037 per share net of the spread\)\. It was a suggestion only\./.test(fl) && !/Suggested hand trade/.test(fl),
+      'a closed card keeps what it suggested when it opened, not a live trade: ' + fl);
+    check(!(await page.$('#moves-body .trade-stale')), 'a fresh suggestion carries no staleness warning');
+    const actionable = await page.$$eval('#moves-body .move-card.is-actionable', (els) => els.map((e) => e.dataset.alertId));
+    check(actionable.join(',') === [fx[0].alert_id, fx[1].alert_id].join(','), 'only the actionable alerts are marked: ' + actionable.join(','));
+    await cleanPage(page, 'moves-trade-box');
+  });
+
+  await mrun('moves-trade-stale', page, async () => {
+    // the watcher stopped re-pricing (a stall): the suggestion says how old it is
+    await movesRoutes(page, { body: (now) => MF.body(now, { alerts: [MF.alertL(now, { trade: Object.assign(MF.alertL(now).trade, { computed_at: now - 300, book_age_s: 2 }) })] }) });
+    await openMoves(page);
+    const st = await text(page, '#moves-body .trade-box .trade-stale');
+    check(/^Worked out 5 min ago: the Cup and the outside price may have moved since\. Check the Cup’s order book before acting\.$/.test(st), 'a stale suggestion says so: ' + st);
+    await cleanPage(page, 'moves-trade-stale');
+  });
+
+  await mrun('moves-filters', page, async () => {
+    await movesRoutes(page);
+    await openMoves(page);
+    const fx = MF.allAlerts(now0());
+    const ids = () => page.$$eval('#moves-body .move-card', (els) => els.map((e) => e.dataset.alertId).join(','));
+    const pressed = () => page.$$eval('#moves-body button[data-moves-filter]', (bs) => bs.map((b) => b.dataset.movesFilter + '=' + b.getAttribute('aria-pressed')).join(' '));
+    check((await pressed()) === 'open=true lagging=false all=false', 'Open is the default filter: ' + (await pressed()));
+    check((await ids()) === fx.filter((a) => a.state === 'open').map((a) => a.alert_id).join(','), 'Open shows the open alerts: ' + (await ids()));
+    check((await text(page, '#moves-count')) === '5 open, 3 lagging', 'the count: ' + (await text(page, '#moves-count')));
+    await setMovesFilter(page, 'lagging');
+    check((await ids()) === [fx[0], fx[1], fx[2]].map((a) => a.alert_id).join(','), 'Lagging only: ' + (await ids()));
+    check((await pressed()) === 'open=false lagging=true all=false', 'aria-pressed follows the filter');
+    await setMovesFilter(page, 'all');
+    check((await ids()) === fx.map((a) => a.alert_id).join(','), 'All shows every alert: ' + (await ids()));
+    await waitStatusPolls(page, 1);
+    await page.waitForTimeout(400);
+    check((await pressed()) === 'open=false lagging=false all=true', 'the filter survives a poll');
+    // keyboard: the filter buttons are reachable and keep focus across a poll
+    await page.focus('#moves-body button[data-moves-filter="open"]');
+    await page.keyboard.press('Enter');
+    await waitStatusPolls(page, 1);
+    await page.waitForTimeout(400);
+    check(await page.evaluate(() => document.activeElement && document.activeElement.dataset.movesFilter === 'open'), 'focus stays on the filter after a poll');
+    // only the closed alerts left: the Open filter says where they are
+    await page.unrouteAll({ behavior: 'ignoreErrors' });
+    await movesRoutes(page, { body: (now) => MF.body(now, { alerts: MF.allAlerts(now).filter((a) => a.state === 'closed') }) });
+    await openMoves(page, '#moves-body .move-empty:not([hidden])');
+    check((await text(page, '#moves-body .move-empty')) === 'No open alerts right now. 4 closed alerts are under All.', 'empty Open filter: ' + (await text(page, '#moves-body .move-empty')));
+    await cleanPage(page, 'moves-filters');
+  });
+
+  await mrun('moves-empty-disabled', page, async () => {
+    await movesRoutes(page, { body: (now) => MF.empty(now) });
+    await openMoves(page, '#moves-body .move-empty:not([hidden])');
+    check((await text(page, '#moves-body .move-empty')) === 'No outside move yet. Alerts appear here when Polymarket or Kalshi moves by at least 3 points in a minute (more over longer windows, and more for outcomes that are usually volatile).',
+      'the empty state: ' + (await text(page, '#moves-body .move-empty')));
+    check((await text(page, '#moves-body .lag-sentence')) === MF.NO_DATA_SENTENCE, 'the lag study says there is no data');
+    check(/Nothing was filtered out today/.test(await text(page, '#moves-body [data-panel="filtered"]')), 'nothing filtered');
+    await page.unrouteAll({ behavior: 'ignoreErrors' });
+    await movesRoutes(page, { body: (now) => MF.disabled(now) });
+    await openMoves(page, '#moves-body .moves-note .empty');
+    check((await text(page, '#moves-body')) === MF.OFF_ERROR, 'disabled: the error sentence only (' + (await text(page, '#moves-body')) + ')');
+    check(!(await page.$('#moves-body [data-panel]')), 'disabled: no panels');
+    await page.unrouteAll({ behavior: 'ignoreErrors' });
+    await movesRoutes(page, { body: (now) => Object.assign(MF.body(now, { alerts: [], suppressed: [], summary: 'empty', venuesList: [] }), { available: false, steps: 0, last_step_at: null }) });
+    await openMoves(page, '#moves-body .move-empty:not([hidden])');
+    check((await text(page, '#moves-body .move-empty')) === 'Waiting for the first outside check (every 15 s).', 'not stepped yet: ' + (await text(page, '#moves-body .move-empty')));
+    check(/No outside venue has been polled yet\./.test(await text(page, '#moves-body [data-panel="venues"]')) && /no check yet/.test(await text(page, '#moves-body [data-panel="venues"]')), 'no venue yet');
+    await page.unrouteAll({ behavior: 'ignoreErrors' });
+    await movesRoutes(page, { body: (now) => Object.assign(MF.body(now, { alerts: [] }), { available: false, error: 'The outside watcher crashed: KeyError.' }) });
+    await openMoves(page, '#moves-body .moves-note .inline-error');
+    check(/The outside watcher is not running: The outside watcher crashed: KeyError\./.test(await text(page, '#moves-body .moves-note')), 'a watcher error is shown inline');
+    await cleanPage(page, 'moves-empty-disabled');
+  });
+
+  await mrun('moves-venues', page, async () => {
+    await movesRoutes(page);
+    await openMoves(page);
+    const lines = () => page.$$eval('#moves-body .venue-list li', (els) => els.map((e) => [e.dataset.venue, e.className, !!e.querySelector('svg'), e.textContent.replace(/\s+/g, ' ').trim()]));
+    let l = await lines();
+    check(l.length === 2 && l.every((x) => x[2]), 'one line per venue, each with an icon');
+    check(/^Polymarket: answering · 231 matched · last read \d+ s ago · 25 of 45 reads a minute$/.test(l[0][3]), 'an answering venue: ' + l[0][3]);
+    check(/^Kalshi: offline from this machine — Kalshi is unreachable from this machine \(could not connect\)/.test(l[1][3]) && /venue-offline/.test(l[1][1]), 'an offline venue: ' + l[1][3]);
+    const facts = await text(page, '#moves-body .venue-facts');
+    check(/Watching 237 outcomes \(231 matched to an outside market\) · last check \d+ s ago/.test(facts) || /last check just now/.test(facts), 'watching counts: ' + facts);
+    check(/Cup order books: 1 of 4 reads a minute/.test(facts), 'the Cup book reads: ' + facts);
+    for (const kind of ['backoff', 'busy', 'pending']) {
+      await page.unrouteAll({ behavior: 'ignoreErrors' });
+      await movesRoutes(page, { body: (now) => MF.body(now, { venues: kind }) });
+      await openMoves(page);
+      l = await lines();
+      if (kind === 'backoff') check(/^Kalshi: waiting \(HTTP 429\) until \d/.test(l[1][3]) && /429/.test(l[1][3]), 'a rate-limited venue: ' + l[1][3]);
+      if (kind === 'busy') check(l[0][3] === 'Polymarket: reading (the fair-value refresh is using it)', 'a busy venue: ' + l[0][3]);
+      if (kind === 'pending') check(l.every((x) => /: waiting for the first fair-value refresh to validate matches$/.test(x[3])), 'pending venues: ' + l.map((x) => x[3]).join(' | '));
+    }
+    await page.unrouteAll({ behavior: 'ignoreErrors' });
+    await movesRoutes(page, { body: (now) => MF.body(now, { book_reads: { used: 0, limit: 0, room: 0 }, last_step_at: now - 600 }) });
+    await openMoves(page);
+    const v = await text(page, '#moves-body [data-panel="venues"]');
+    check(/Cup order books: off/.test(v), 'book reads off: ' + v);
+    check(/The outside watcher has not run since .+ \(10 min ago\): these alerts may be out of date\./.test(v), 'a stalled watcher is flagged: ' + v);
+    await cleanPage(page, 'moves-venues');
+  });
+
+  await mrun('moves-venues-fresh', page, async () => {
+    // every answer has the venue read 6 s and the step 3 s before it: the shown ages follow the newest answer
+    await movesRoutes(page);
+    await openMoves(page);
+    await waitStatusPolls(page, 3);
+    await page.waitForTimeout(500);
+    const ages = await page.evaluate(() => Array.from(document.querySelectorAll('#moves-body .venue-list time, #moves-body .venue-facts time'))
+      .map((t) => t.textContent));
+    const secs = ages.map((a) => (a === 'just now' ? 0 : /^(\d+) s ago$/.test(a) ? Number(a.match(/^(\d+)/)[1]) : 999));
+    check(ages.length === 2 && secs.every((x) => x <= 13), 'the last-read and last-check ages are fresh after three polls: ' + ages.join(', '));
+    await cleanPage(page, 'moves-venues-fresh');
+  });
+
+  await mrun('moves-lag-table', page, async () => {
+    await movesRoutes(page);
+    await openMoves(page);
+    const rows = () => page.$$eval('#moves-body .lag-table tbody tr', (trs) => trs.map((tr) => [tr.querySelector('th').textContent.trim(), tr.querySelector('td').textContent.replace(/\s+/g, ' ').trim()]));
+    check((await text(page, '#moves-body .lag-sentence')) === MF.SMALL_SENTENCE, 'the small-sample sentence is verbatim');
+    check(/Small sample/.test(await text(page, '#moves-body [data-panel="summary"] .lag-badges')), 'a small-sample badge');
+    let r = await rows();
+    const labels = r.map((x) => x[0]);
+    check(labels.join(' | ') === ['Followed within 1 min', 'Followed within 5 min', 'Followed within 15 min', 'Followed within 60 min',
+      'Never followed (came back / did not follow)', 'Cup moved first', 'Median lag (after the outside move / after the alert)',
+      'Left 4 min after the alert (per share, net of spread)', 'Bought then, sold 30 min later (per share)'].join(' | '), 'the table rows: ' + labels.join(' | '));
+    check(r[1][1] === '25%(n = 1 of 4)', 'followed within 5 min: ' + r[1][1]);
+    check(/^50%\(n = 2 of 4\): came back 25% \(n = 1\) \/ did not follow 25% \(n = 1\)$/.test(r[4][1]), 'never followed: ' + r[4][1]);
+    check(r[5][1] === '20%(n = 1 of 5)', 'Cup moved first: ' + r[5][1]);
+    check(/^4\.3 min \/ 1\.8 min/.test(r[6][1]) && /\(n = 2 followed\)/.test(r[6][1]), 'medians: ' + r[6][1]);
+    check(/^\+0\.018 on average/.test(r[7][1]) && /no interval yet/.test(r[7][1]) && /\(n = 3\)/.test(r[7][1]), 'capture: ' + r[7][1]);
+    check(r[8][1] === 'n/a(n = 0)', 'a null exit reads n/a with its n: ' + r[8][1]);
+    check(/Excluded: 1 converging \(or without a Cup price\), 1 censored/.test(await text(page, '#moves-body .lag-excluded')), 'the excluded counts');
+    await page.unrouteAll({ behavior: 'ignoreErrors' });
+    await movesRoutes(page, { body: (now) => MF.body(now, { summary: 'large' }) });
+    await openMoves(page);
+    await page.waitForFunction((s) => document.querySelector('#moves-body .lag-sentence').textContent === s, MF.LARGE_SENTENCE);
+    check(!(await page.$('#moves-body [data-panel="summary"] .small-sample')), 'no small-sample badge on a large sample');
+    r = await rows();
+    check(r[1][1] === '41%(n = 19 of 46)' && r[3][1] === '72%(n = 33 of 46)', 'large-sample shares: ' + r[1][1] + ' / ' + r[3][1]);
+    check(/^\+0\.004 on average/.test(r[7][1]) && /90% interval −0\.001 to \+0\.009 \(over per-race means\)/.test(r[7][1]) && /\(n = 40\)/.test(r[7][1]), 'capture with its interval: ' + r[7][1]);
+    check(/^−0\.002 on average/.test(r[8][1]) && /\(n = 37\)/.test(r[8][1]), 'a negative exit keeps its sign: ' + r[8][1]);
+    await page.unrouteAll({ behavior: 'ignoreErrors' });
+    await movesRoutes(page, { body: (now) => MF.body(now, { summary: 'empty' }) });
+    await openMoves(page);
+    await page.waitForFunction((s) => document.querySelector('#moves-body .lag-sentence').textContent === s, MF.NO_DATA_SENTENCE);
+    r = await rows();
+    check(r.slice(0, 6).every((x) => /^n\/a\(n = 0/.test(x[1])), 'null shares read n/a: ' + r.map((x) => x[1]).join(' | '));
+    await cleanPage(page, 'moves-lag-table');
+  });
+
+  await mrun('moves-filtered', page, async () => {
+    await movesRoutes(page);
+    await openMoves(page);
+    const det = '#moves-body #moves-filtered-details';
+    check(!(await page.$eval(det, (d) => d.open)), 'the Filtered out details start closed');
+    check((await text(page, det + ' > summary')) === '3 moves were filtered out today', 'its summary counts: ' + (await text(page, det + ' > summary')));
+    await page.click(det + ' > summary');
+    const counts = await page.$$eval(det + ' .filtered-counts li', (els) => els.map((e) => e.textContent.trim()));
+    check(counts.join(' | ') === '1 thin or wide outside book | 1 a single print that did not hold | 1 the other venue did not move', 'per-reason counts in plain words: ' + counts.join(' | '));
+    const items = await page.$$eval(det + ' .suppressed-list li', (els) => els.map((e) => e.textContent.replace(/\s+/g, ' ').trim()));
+    check(items.length === 3 && /^Michigan Governor \(D\) — the other venue did not move: Polymarket \+6\.0 pts, Kalshi \+1\.0 pt: the venues disagree\. \((\d+ (s|min) ago|just now)\)$/.test(items[0]), 'the latest items: ' + items[0]);
+    await waitStatusPolls(page, 1);
+    await page.waitForTimeout(400);
+    check(await page.$eval(det, (d) => d.open), 'it stays open across a poll');
+    await cleanPage(page, 'moves-filtered');
+  });
+
+  await mrun('moves-badge', page, async () => {
+    let alerts = [];
+    await movesRoutes(page, { status: (now) => alerts.map((f) => f(now)) });
+    alerts = [MF.alertL, MF.alertNoBook];
+    await open(page, '#overview', { noWait: true });
+    await page.waitForFunction(() => document.getElementById('nav-count-moves').textContent === '2');
+    check((await page.getAttribute('#nav-count-moves', 'aria-hidden')) === 'true', 'the badge number is hidden from screen readers');
+    check((await text(page, '#nav-moves-sr')) === ', 2 open lagging alerts', 'its sentence: ' + (await text(page, '#nav-moves-sr')));
+    const name = await page.$eval('.app-nav a[data-view="moves"]', (a) => a.textContent.replace(/\s+/g, ' ').trim());
+    check(/^Outside moves 2, 2 open lagging alerts$/.test(name), 'the nav link: ' + name);
+    const order = await page.$$eval('.app-nav a[data-view]', (as) => as.map((a) => a.dataset.view).join(','));
+    check(order === 'overview,markets,surges,moves,high,strategy,sim', 'Outside moves comes after Surges: ' + order);
+    alerts = [MF.alertL];
+    await page.waitForFunction(() => document.getElementById('nav-count-moves').textContent === '1');
+    check((await text(page, '#nav-moves-sr')) === ', 1 open lagging alert', 'singular');
+    alerts = [];
+    await page.waitForFunction(() => document.getElementById('nav-count-moves').textContent === '');
+    check(!(await page.isVisible('#nav-count-moves')) && (await text(page, '#nav-moves-sr')) === '', 'no badge without open lagging alerts');
+    await page.unrouteAll({ behavior: 'ignoreErrors' });
+    await movesRoutes(page, { status: () => null });
+    await open(page, '#overview', { noWait: true });
+    await waitStatusPolls(page, 1);
+    check((await text(page, '#nav-count-moves')) === '', 'status.moves null: no badge');
+    await cleanPage(page, 'moves-badge');
+  });
+
+  await mrun('moves-inline-error', page, async () => {
+    let fail = true;
+    await movesRoutes(page, { body: (now) => (fail ? { __status: 500, body: { error: "Internal error; see the dashboard's log." } } : MF.body(now)) });
+    await open(page, '#moves', { noWait: true });
+    await page.waitForSelector('#view-errors-moves:not([hidden]) .inline-error');
+    check(/Could not load the outside moves: Internal error; see the dashboard's log\. Retrying every 5 s\./.test(await text(page, '#view-errors-moves')), 'an inline error: ' + (await text(page, '#view-errors-moves')));
+    check((await text(page, '#live-label')) !== 'Offline' && (await page.isHidden('#offline-banner')), 'the page is not Offline');
+    check(/Could not load the outside moves\. Retrying every 5 s\./.test(await text(page, '#moves-body')), 'the view says it could not load');
+    fail = false;
+    await page.waitForSelector('#moves-body .move-card', { timeout: 15000 });
+    await page.waitForSelector('#view-errors-moves', { state: 'hidden' });
+    fail = true;
+    await page.waitForSelector('#view-errors-moves:not([hidden]) .inline-error', { timeout: 15000 });
+    check(/Could not refresh the outside moves/.test(await text(page, '#view-errors-moves')) && (await page.$$('#moves-body .move-card')).length > 0, 'a refresh error keeps the cards');
+    page.__console.length = 0; // the 500 answers are logged by the browser on purpose
+  });
+
+  await mrun('moves-annotations', page, async () => {
+    await patch(page, '**/api/strategy', (j, now) => { j.opportunities = [MF.annotatedIdea(now)].concat(j.opportunities || []); });
+    await open(page, '#strategy', { noWait: true });
+    await page.waitForSelector('#strategy-body .idea .move-fact-link');
+    const fact = await page.$eval('#strategy-body .idea .move-fact-link', (a) => [a.getAttribute('href'), a.textContent.replace(/\s+/g, ' ').trim(),
+      a.closest('div').querySelector('dt').textContent]);
+    check(fact[0] === '#moves' && fact[1] === 'Cup lagging, +5.5 pts (2 min ago)' && fact[2] === 'Outside move', 'the idea fact links to #moves: ' + fact.join(' / '));
+    await page.click('#strategy-body .idea .move-fact-link');
+    await page.waitForFunction(() => location.hash === '#moves' && !document.getElementById('view-moves').hidden);
+    await page.unrouteAll({ behavior: 'ignoreErrors' });
+    await simRoutes(page, { fairvalue: (now) => {
+      const f = SF.fairvalue(now);
+      f.rows[0].move = { alert_id: 'mv-x', status: 'lagging', status_label: 'Cup lagging', state: 'open', direction: 1, move: 0.06, lag_gap_now: 0.06, detected_at: now - 60, actionable: true };
+      for (const r of f.rows.slice(1)) r.move = null;
+      return f;
+    } });
+    await openSim(page);
+    await page.waitForSelector('#sim-body .fv-table .flag-move');
+    const badges = await page.$$eval('#sim-body .fv-table .flag-move', (els) => els.map((e) => [e.textContent.trim(), e.getAttribute('href'), !!e.querySelector('svg')]));
+    check(badges.length === 1 && badges[0][0] === 'moved: Cup lagging' && badges[0][1] === '#moves' && badges[0][2], 'one "moved" badge with the status label: ' + JSON.stringify(badges));
+    await cleanPage(page, 'moves-annotations');
+  });
+
+  await page.context().close();
+
+  // ---- sound (an AudioContext stub records every oscillator start)
+  const sp = await movesPage(browser);
+  await sp.context().addInitScript(audioStub);
+  await mrun('moves-sound', sp, async () => {
+    let alerts = [MF.alertL];
+    await movesRoutes(sp, { status: (now) => alerts.map((f) => f(now)) });
+    await openMoves(sp);
+    const starts = () => sp.evaluate(() => window.__starts.length);
+    check((await sp.getAttribute('#moves-sound', 'aria-pressed')) === 'false' && /Sound off/.test(await text(sp, '#moves-sound')), 'Sound is off by default');
+    check((await sp.evaluate(() => window.__ctx)) === 0, 'no AudioContext before the click');
+    await sp.click('#moves-sound');
+    check((await sp.getAttribute('#moves-sound', 'aria-pressed')) === 'true' && /Sound on/.test(await text(sp, '#moves-sound')), 'the toggle turns on');
+    check((await sp.evaluate(() => window.__ctx)) === 1, 'one AudioContext, created in the click');
+    check((await sp.evaluate(() => localStorage.getItem('supermarket-dashboard:moves-sound'))) === 'on', 'the choice is saved');
+    await waitStatusPolls(sp, 2);
+    check((await starts()) === 0, 'an alert open before the page loaded never beeps (' + (await starts()) + ')');
+    alerts = [MF.alertNoBook, MF.alertL];
+    await waitStatusPolls(sp, 2);
+    const s = await sp.evaluate(() => window.__starts);
+    check(s.length === 2 && s.every((x) => x.f === 880 && x.type === 'sine') && Math.abs(s[1].t - s[0].t - 0.2) < 1e-6, 'one new id: two 880 Hz beeps 0.2 s apart: ' + JSON.stringify(s));
+    await waitStatusPolls(sp, 1);
+    check((await starts()) === 2, 'the same id does not beep again');
+    await sp.click('#moves-sound');
+    check((await sp.getAttribute('#moves-sound', 'aria-pressed')) === 'false', 'the toggle turns off');
+    alerts = [(now) => MF.alertL(now, { alert_id: 'mv-third-1', race_label: 'Third (D)' }), MF.alertNoBook, MF.alertL];
+    await waitStatusPolls(sp, 2);
+    check((await starts()) === 2, 'no beep while Sound is off (' + (await starts()) + ')');
+    // a saved "on": nothing plays before a gesture, and the first poll still only records
+    alerts = [MF.alertL];
+    await openMoves(sp);
+    check((await sp.getAttribute('#moves-sound', 'aria-pressed')) === 'false', 'still off after a reload (it was turned off)');
+    await sp.evaluate(() => localStorage.setItem('supermarket-dashboard:moves-sound', 'on'));
+    await openMoves(sp);
+    check((await sp.getAttribute('#moves-sound', 'aria-pressed')) === 'true', 'a saved "on" is restored');
+    check((await sp.evaluate(() => window.__ctx)) === 0 && /starts after your first click or key press/.test(await text(sp, '#moves-alert-note')), 'it waits for a gesture: ' + (await text(sp, '#moves-alert-note')));
+    await sp.click('#h-moves');
+    check((await sp.evaluate(() => window.__ctx)) === 1, 'a click anywhere creates the AudioContext');
+    alerts = [MF.alertNoBook, MF.alertL];
+    await waitStatusPolls(sp, 2);
+    check((await starts()) === 2, 'then a new id beeps (' + (await starts()) + ')');
+    await cleanPage(sp, 'moves-sound');
+  });
+  await sp.context().close();
+
+  const silent = await movesPage(browser);
+  await silent.context().addInitScript(() => { delete window.AudioContext; delete window.webkitAudioContext; });
+  await mrun('moves-sound-unsupported', silent, async () => {
+    await movesRoutes(silent);
+    await openMoves(silent);
+    check(await silent.$eval('#moves-sound', (b) => b.disabled), 'the Sound toggle is disabled');
+    check(/Sound is not supported in this browser\./.test(await text(silent, '#moves-alert-note')), 'and says why');
+    await cleanPage(silent, 'moves-sound-unsupported');
+  });
+  await silent.context().close();
+
+  // ---- desktop notifications (a Notification stub records every notification)
+  const np = await movesPage(browser);
+  await np.context().addInitScript(notificationStub, 'default');
+  await mrun('moves-notifications', np, async () => {
+    let alerts = [MF.alertL];
+    await movesRoutes(np, { status: (now) => alerts.map((f) => f(now)) });
+    await openMoves(np);
+    check((await text(np, '#moves-notify')) === 'Turn on desktop notifications' && (await np.getAttribute('#moves-notify', 'aria-pressed')) === null, 'permission default: ' + (await text(np, '#moves-notify')));
+    await np.click('#moves-notify');
+    await np.waitForFunction(() => document.getElementById('moves-notify').getAttribute('aria-pressed') === 'true');
+    check((await np.evaluate(() => window.__asked)) === 1, 'the click asks for permission once');
+    check((await text(np, '#moves-notify')) === 'Desktop notifications on', 'granted: the toggle is on: ' + (await text(np, '#moves-notify')));
+    check((await np.evaluate(() => localStorage.getItem('supermarket-dashboard:moves-notify'))) === 'on', 'saved');
+    await waitStatusPolls(np, 1);
+    check((await np.evaluate(() => window.__notes.length)) === 0, 'no notification for an alert open before the page loaded');
+    alerts = [MF.alertNoBook, MF.alertL];
+    await np.waitForFunction(() => window.__notes.length === 1, null, { timeout: 15000 });
+    const n = await np.evaluate(() => window.__notes[0]);
+    const want = MF.notificationText(MF.alertNoBook(Date.now() / 1000));
+    check(n.title === 'Cup lagging: Ohio Senate (R)' && n.title === want.headline, 'the headline: ' + n.title);
+    check(n.body === want.body && /Suggestion: Buy NO at 0\.430\. Not a sure thing\.$/.test(n.body), 'the body: ' + n.body);
+    check(n.tag === MF.alertNoBook(Date.now() / 1000).alert_id, 'tagged with the alert id: ' + n.tag);
+    await np.waitForFunction(() => document.getElementById('moves-announcer').textContent === 'Cup lagging: Ohio Senate (R).');
+    await waitStatusPolls(np, 2);
+    check((await np.evaluate(() => window.__notes.length)) === 1, 'one notification per new id');
+    await np.evaluate(() => { location.hash = '#overview'; });
+    await np.waitForFunction(() => !document.getElementById('view-overview').hidden);
+    await np.evaluate(() => window.__lastNote.onclick());
+    await np.waitForFunction(() => location.hash === '#moves' && !document.getElementById('view-moves').hidden);
+    await np.click('#moves-notify');
+    check((await text(np, '#moves-notify')) === 'Desktop notifications off' && (await np.getAttribute('#moves-notify', 'aria-pressed')) === 'false', 'the toggle turns off');
+    alerts = [(now) => MF.alertL(now, { alert_id: 'mv-third-2', race_label: 'Third (D)' }), MF.alertNoBook, MF.alertL];
+    await waitStatusPolls(np, 2);
+    check((await np.evaluate(() => window.__notes.length)) === 1, 'none while off');
+    await cleanPage(np, 'moves-notifications');
+  });
+  await np.context().close();
+
+  // notifications on: the status poll goes on while the tab is hidden (the case notifications are for)
+  const bp = await movesPage(browser);
+  await bp.context().addInitScript(notificationStub, 'granted');
+  await bp.context().addInitScript(() => { try { localStorage.setItem('supermarket-dashboard:moves-notify', 'on'); } catch (e) { /* about:blank */ } });
+  await mrun('moves-background', bp, async () => {
+    let alerts = [MF.alertL];
+    await movesRoutes(bp, { status: (now) => alerts.map((f) => f(now)) });
+    // the saved choice applies on any view: this page never opens the Outside moves view
+    await open(bp, '#overview', { noWait: true });
+    await waitStatusPolls(bp, 1);
+    await bp.evaluate(() => {
+      Object.defineProperty(document, 'hidden', { configurable: true, get: () => true });
+      Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'hidden' });
+      document.dispatchEvent(new Event('visibilitychange'));
+    });
+    alerts = [MF.alertNoBook, MF.alertL];
+    await waitStatusPolls(bp, 2, 20000);
+    await bp.waitForFunction(() => window.__notes.length === 1, null, { timeout: 10000 });
+    check((await bp.evaluate(() => window.__notes[0].title)) === 'Cup lagging: Ohio Senate (R)', 'the notification fires while the tab is hidden');
+    await bp.evaluate(() => {
+      delete document.hidden;
+      delete document.visibilityState;
+      document.dispatchEvent(new Event('visibilitychange'));
+    });
+    await gotoView(bp, 'moves');
+    await bp.waitForSelector('#moves-body .move-card');
+    check((await text(bp, '#moves-notify')) === 'Desktop notifications on', 'the saved "on" shows on the toggle: ' + (await text(bp, '#moves-notify')));
+    await cleanPage(bp, 'moves-background');
+  });
+  await bp.context().close();
+
+  const dp = await movesPage(browser);
+  await dp.context().addInitScript(notificationStub, 'denied');
+  await mrun('moves-notifications-denied', dp, async () => {
+    let alerts = [MF.alertL];
+    await movesRoutes(dp, { status: (now) => alerts.map((f) => f(now)) });
+    await openMoves(dp);
+    check((await text(dp, '#moves-notify')) === 'Notifications are blocked in this browser’s settings' && (await dp.$eval('#moves-notify', (b) => b.disabled)), 'denied: ' + (await text(dp, '#moves-notify')));
+    alerts = [MF.alertNoBook, MF.alertL];
+    await waitStatusPolls(dp, 2);
+    check((await dp.evaluate(() => window.__notes.length)) === 0 && (await dp.evaluate(() => window.__asked)) === 0, 'no notification and no prompt when denied');
+    await cleanPage(dp, 'moves-notifications-denied');
+  });
+  await dp.context().close();
+
+  const up = await movesPage(browser);
+  await up.context().addInitScript(() => { delete window.Notification; });
+  await mrun('moves-notifications-unsupported', up, async () => {
+    await movesRoutes(up);
+    await openMoves(up);
+    check((await text(up, '#moves-notify')) === 'Desktop notifications: not supported in this browser' && (await up.$eval('#moves-notify', (b) => b.disabled)), 'unsupported: ' + (await text(up, '#moves-notify')));
+    await cleanPage(up, 'moves-notifications-unsupported');
+  });
+  await up.context().close();
+
+  // ---- 390 px, light and dark
+  for (const scheme of ['light', 'dark']) {
+    const pp = await movesPage(browser, { viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, deviceScaleFactor: 2, colorScheme: scheme });
+    await mrun('moves-phone-' + scheme, pp, async () => {
+      await movesRoutes(pp, { body: (now) => MF.body(now, { summary: 'large' }) });
+      for (const w of [390, 360, 320]) {
+        await pp.setViewportSize({ width: w, height: 800 });
+        await openMoves(pp);
+        await setMovesFilter(pp, 'all');
+        await pp.click('#moves-filtered-details > summary');
+        await pp.waitForTimeout(200);
+        const r = await pp.evaluate(() => ({
+          over: document.documentElement.scrollWidth - innerWidth,
+          wide: Array.from(document.querySelectorAll('#moves-body .move-card, #moves-body .trade-box, #moves-body .moves-controls button')).filter((el) => el.getBoundingClientRect().right > innerWidth + 1).length,
+        }));
+        check(r.over <= 1, 'no horizontal page scroll at ' + w + ' px (overflow ' + r.over + ' px)');
+        check(r.wide === 0, 'cards, trade boxes and buttons fit at ' + w + ' px (' + r.wide + ' too wide)');
+      }
+      await cleanPage(pp, 'moves-phone-' + scheme);
+    });
+    await pp.context().close();
+  }
 }
 
 // ------------------------------------------------------------------ phone checks (touch)
@@ -1338,6 +2259,7 @@ async function main() {
   try {
     await desktopChecks(browser);
     await simChecks(browser);
+    await movesChecks(browser);
     await phoneChecks(browser);
     await forcedColorChecks(browser);
     await timerChecks(browser);

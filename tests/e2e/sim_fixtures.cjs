@@ -69,6 +69,7 @@ function verdict(pid, level, pnl, exploratory, hours) {
     caveats: CAVEATS.slice(), exploratory, n_ideas: 12, open_ideas: 7, closed_pnl: 210, open_pnl_liq: 202, clusters_race: 8, clusters_time: 6, df: 5,
     return_mean: 0.01, return_ci_low: null, return_ci_high: null, days_covered: 0, wall_hours: hours + 0.4, unvalued_positions: pid === 'human:conservative' ? 1 : 0,
     unvalued_value: pid === 'human:conservative' ? 118.5 : 0, depth_unknown_share: 0.08, swing_share: 0.02, top_race_share: 0.3, synthetic_excluded: 0,
+    synthetic_pnl: 0, untested: [],
   };
 }
 
@@ -124,6 +125,7 @@ function portfolioSummaries(now, opts) {
       verdict: verdict(pid, lv, pnl, !headline, headline && lv === 'positive' ? 50 : 6),
       last_step_at: now - 4, headline, exploratory: !headline, latency_s: lat, unvalued: headline ? 118.5 : 0,
       depth_unknown_share: headline ? 0.08 : 0, depth_stale_share: 0.05, swing_risk: 1200, execution: i === 6 || i === 8 ? {} : execution(),
+      untested: [], legging_trades: 0, legging_pnl: 0,
       no_trade_reason: i === 6 ? 'No fade signals in 6.0 h: the market offered no such setup (that is not evidence of no edge).'
         : i === 8 ? 'No value trades yet: usable outside fair values on 0% of steps (see the fair-value status).' : null,
     };
@@ -138,7 +140,8 @@ function equity(now, n) {
     for (let k = 0; k < n; k++) {
       const t = start + (k * 6 * 3600) / (n - 1);
       const f = k / (n - 1);
-      const wobble = Math.sin(k / 5 + i) * 60 * (i % 3 + 1);
+      // the last point is the current equity (the server appends equity_liq, ui-6), so it matches the headline
+      const wobble = k === n - 1 ? 0 : Math.sin(k / 5 + i) * 60 * (i % 3 + 1);
       pts.push([t, Math.round((100000 + PNL[i] * f + wobble * f) * 100) / 100]);
     }
     out[p[0]] = pts;
@@ -159,6 +162,7 @@ function position(now, pid, eid, title, option, side, qty, avg, liq, flags, extr
     first_fill_at: now - 4980, updated_at: now - 30, liq_value: liq, mark_value: liq + 6, fv_value: liq + 20, last_marked_at: now - 30, title, option,
     depth_state: 'fresh', factor_delta: 0.057, score: 0.25, bold: false, floor_per_unit: null, synthetic: false, entered_at: now - 5010,
     unrealized_liq: liq - qty * avg, exit_note: 'Sell when the YES bid reaches 0.565, or hold to resolution', age_hours: 1.4,
+    unvalued: false, last_liq_value: null,
   }, extra || {});
 }
 
@@ -181,19 +185,21 @@ function paper(now, opts) {
     headline: empty ? null : {
       portfolio_id: hl.portfolio_id, label: hl.label, latency_s: 240, pnl_liq: hl.pnl_liq, pnl_liq_pct: hl.pnl_liq_pct, pnl_mark: hl.pnl_mark,
       equity_liq: hl.equity_liq, unvalued: 118.5, depth_unknown_share: 0.08, verdict: hl.verdict, verdict_caveats: CAVEATS.slice(0, 4),
+      untested: [],
     },
     table_warning: TABLE_WARNING, model_label: FV_MODEL_LABEL, portfolios: empty ? [] : ports, equity: empty ? {} : equity(now, opts.points || 120),
     positions: empty ? [] : [
       position(now, 'human:conservative', '9026', 'Will the Democratic Party win the Texas Senate?', 'YES', 'yes', 3000, 0.535, 1665, []),
       position(now, 'human:conservative', '9028', 'Will the Democratic Party win the Iowa Senate?', 'YES', 'yes', 1500, 0.40, 496, ['depth_stale'], { depth_state: 'stale' }),
-      position(now, 'policy:conservative', '9034', 'Will the Maine Senate candidates debate before October 7?', 'YES', 'yes', 800, 0.86, 0, ['closed_no_ruling'], { status: 'frozen', depth_state: 'unknown' }),
+      position(now, 'policy:conservative', '9034', 'Will the Maine Senate candidates debate before October 7?', 'YES', 'yes', 800, 0.86, 0, ['closed_no_ruling'], { status: 'frozen', depth_state: 'unknown', unvalued: true, last_liq_value: 640 }),
       position(now, 'policy:chaser', '9003', 'Will Democrats win the Michigan Senate race?', 'NO', 'no', 21000, 0.31, 4200, ['depth_unknown', 'stale_quote'], { depth_state: 'unknown', bold: true }),
       position(now, 'kind:hole', '9033', 'Will the Republican Party win the Wyoming Governor?', 'YES', 'yes', 100, 0.70, 92.5, ['post_cup'], { kind: 'hole' }),
       position(now, 'kind:basket', '9024', 'Will the Democratic Party win the Nevada Governor?', 'NO', 'no', 300, 0.47, 138, [], { kind: 'basket', basket_id: 'kind:basket:b1', idea_id: 'basket:set:9024+9025:nn' }),
       position(now, 'kind:basket', '9025', 'Will the Republican Party win the Nevada Governor?', 'NO', 'no', 300, 0.48, 141, [], { kind: 'basket', basket_id: 'kind:basket:b1', idea_id: 'basket:set:9024+9025:nn' }),
     ],
     baskets: empty ? [] : [{ portfolio_id: 'kind:basket', basket_id: 'kind:basket:b1', idea_id: 'basket:set:9024+9025:nn', sets: 300, cost: 285, floor_value: 300,
-      liq_value: 279, legs: [{ exchange_id: '9024', side: 'no', qty: 300, liq_value: 138 }, { exchange_id: '9025', side: 'no', qty: 300, liq_value: 141 }] }],
+      liq_value: 279, naked_qty: 0, legs_total: 2,
+      legs: [{ exchange_id: '9024', side: 'no', qty: 300, liq_value: 138, naked_qty: 0 }, { exchange_id: '9025', side: 'no', qty: 300, liq_value: 141, naked_qty: 0 }] }],
     orders: [],
     fills: empty ? [] : [
       { fill_id: 'human:conservative:f3', order_id: 'human:conservative:o3', portfolio_id: 'human:conservative', exchange_id: '9026', market_id: '318', side: 'yes',
@@ -311,7 +317,7 @@ function fairvalue(now) {
   return {
     now, enabled: true, mode: 'auto', last_refresh_at: now - 40,
     providers: [
-      { name: 'polymarket', status: 'offline', last_ok_at: null, last_error: 'ConnectError: [Errno -3] Temporary failure in name resolution (GET https://gamma-api.polymarket.com/markets)', requests: 1, matched: 0, quoted: 0, next_try_at: now + 240 },
+      { name: 'polymarket', status: 'offline', last_ok_at: null, last_error: 'Polymarket is unreachable from this machine (name resolution failed: [Errno -3] Temporary failure in name resolution): no outside fair value from Polymarket.', requests: 0, matched: 0, quoted: 0, next_try_at: now + 240 },
       { name: 'kalshi', status: 'ok', last_ok_at: now - 40, last_error: null, requests: 3, matched: 12, quoted: 11, next_try_at: null },
     ],
     manual: { path: '/home/user/.supermarket/2026-midterms/fair_values.json', exists: true, entries: 2, errors: ['line 4: probability 1.4 is not between 0 and 1'] },
@@ -349,7 +355,7 @@ function backtest(now, status) {
       sweep: [{ params: { latency_s: 30 }, label: 'latency_s=30', pnl_liq: 210, trades_closed: 9, verdict_level: 'insufficient', max_drawdown: 0.004 },
         { params: { latency_s: 300 }, label: 'latency_s=300', pnl_liq: -40, trades_closed: 6, verdict_level: 'insufficient', max_drawdown: 0.006 }],
       warnings: ['Only 9 hours of data',
-        '6.0 h of this window were also seen by the live paper run: a backtest over the same data is not an independent check, so agreement between the two is not evidence.',
+        '6.0 h of this window were also seen by a paper run (the current one, or one that ended or was reset): a backtest over the same data is not an independent check, so agreement between the two is not evidence.',
         'The best of 2 settings is an optimistic estimate (it was picked after seeing the results); prefer settings whose neighbours also do well, and confirm them on data recorded later.'],
       testability: {
         value: { status: 'not_testable', hours: 0, sentence: 'value: not testable yet (0 h of outside prices recorded or imported in this window); run `fairvalue --import-history` or let the bot record for a day' },

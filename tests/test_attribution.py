@@ -978,3 +978,16 @@ def test_functional_1_flow_reads_only_the_trades_that_made_the_move(fake: Any, c
     Attributor(client, CTX, FakeStore(INFO), FakeNews(), clock=lambda: late, flow_fn=flow_fn).analyze(surge)
     assert [r.trade_id for r in seen[0]] == ["t2", "t3"]
     assert attr_mod.flow_until(make_surge()) == pytest.approx(T0 + attr_mod.FLOW_SLACK_S)  # a fresh surge: up to its end
+
+
+def test_lookahead_3_analyze_stamps_the_completion_time(fake: Any, client: Any) -> None:
+    """lookahead-3: the attribution exists only once its reads, news search and judge returned, so analyzed_at is the
+    clock when analyze() returns (a replay's analyzed_at <= t rule must not see it earlier); the news window still
+    ends at the start."""
+    route_spike(fake)
+    times = iter([NOW, NOW + 59.0])
+    news = FakeNews()
+    attributor = Attributor(client, CTX, FakeStore(INFO), news, clock=lambda: next(times), flow_fn=simple_flow)
+    result = attributor.analyze(make_surge())
+    assert result.analyzed_at == NOW + 59.0
+    assert news.calls and news.calls[0][3] == NOW

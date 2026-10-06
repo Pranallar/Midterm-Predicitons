@@ -72,6 +72,7 @@ log = logging.getLogger("supermarket_bot")
 
 TICK = _depth.TICK
 DEFAULT_START_CAPITAL = 100_000.0
+DEFAULT_CAPITAL_SOURCE = "default 100,000"  # the last-resort start capital (§6.1): no setting, no account value yet
 STATE_VERSION = 2
 
 # verdict (§6.9)
@@ -124,6 +125,9 @@ TABLE_WARNING = (
 FV_MODEL_LABEL = "The model's own opinion of these positions (valued at the outside fair value that generated them): not evidence of profit."
 
 TARGET_REACHED = "target reached"  # reason of the snapshot written when covered hours first reach target_hours
+NO_DATA_GAP = "no data"  # CoverageClock gap reason: steps ran but saw no fresh quote (an outage)
+# trades the END of a run creates at liquidation value (end_run): never realised, never closed ideas
+END_REASONS = frozenset({"completed", "reset", "settings changed"})
 
 _EPS = 1e-9
 _PROPAGATE_NAMES = ("_Stopping", "SimClockStall", "ReadOnlyViolation", "AuthenticationError", "FatalKeyError")
@@ -568,48 +572,87 @@ def config_fingerprint(config: PaperConfig, code_version: str) -> str:
     return hashlib.sha256((text + "|" + str(code_version or "")).encode("utf-8")).hexdigest()
 
 
+LevelsAdjust = Callable[[List[Tuple[float, float]]], List[Tuple[float, float]]]
+
+
+def _shift_by(levels: Sequence[Tuple[float, float]], shift: float) -> List[Tuple[float, float]]:
+    """``levels`` moved by ``shift`` (prices clipped to (0, 1)), like depth.shift_levels but by a given offset."""
+    out: List[Tuple[float, float]] = []
+    for p, q in levels:
+        moved = round(p + shift, 6)
+        if 0.0 < moved < 1.0 and q > _EPS:
+            out.append((moved, q))
+    return out
+
+
 def liquidation_value(side: str, qty: float, book: Optional[BookObservation], quote: Optional[Quote], *,
                       last_real_book: Optional[BookObservation] = None, now: Optional[float] = None,
-                      config: Optional[PaperConfig] = None) -> Tuple[float, str]:
+                      config: Optional[PaperConfig] = None,
+                      adjust_levels: Optional[LevelsAdjust] = None) -> Tuple[float, str]:
     """(value, depth_state) of selling ``qty`` of ``side`` now (§6.7):
 
-    * "fresh": ``book`` (real, at most mark_book_max_age_s old, best level within one tick of the touch)
-      walked with depth.liquidation_proceeds; shares beyond its depth are worth 0;
+    * "fresh": ``book`` (real, at most mark_book_max_age_s old) walked with depth.liquidation_proceeds; shares
+      beyond its depth are worth 0. When the quote is at least as new as the book, the book must be consistent
+      with it (its best level within one tick of the touch); a book read AFTER the quote, or while the quote is
+      older than stale_quote_s, defines the touch itself (an old quote never overrules a newer book, and a newer
+      book with no bids is worth 0);
     * "stale": else ``last_real_book`` at most mark_depth_max_age_s old, its sell-side levels shifted to the
-      current touch (depth.shift_levels) and walked the same way;
+      current touch (depth.shift_levels) and walked the same way (unshifted when that book is newer than the
+      quote);
     * "unknown": else, with a touch bid: min(qty, depth_unknown_full_shares) x touch + the rest x touch x
       (1 - depth_unknown_haircut);
     * no touch at all: (0.0, "unknown").
-    Synthetic books (backtest) are never used for marks."""
+
+    ``adjust_levels`` (the engine: the portfolio's own consumed liquidity, §6.3/D35) is applied to the contract
+    sell levels before they are walked, so a mark never counts bids the same portfolio already sold into. The
+    consistency check and the stale shift use the RAW levels (the touch is still where the book shows it; only
+    our share of it is gone). Synthetic books (backtest) are never used for marks."""
     cfg = config or PaperConfig()
+    adj: LevelsAdjust = adjust_levels if adjust_levels is not None else (lambda lv: lv)
     qty = max(0.0, float(qty or 0.0))
     if qty <= _EPS:
         return 0.0, "fresh"
     touch = _contract_bid(quote, side)
-    if quote is not None and touch is None:
-        return 0.0, "unknown"  # the quote shows no bid at all: no book can be called consistent with it
     if now is None:
         stamps = [b.observed_at for b in (book, last_real_book) if b is not None]
         if quote is not None:
             stamps.append(quote.ts)
         now = max(stamps) if stamps else 0.0
-    if _is_real(book) and now - book.observed_at <= cfg.mark_book_max_age_s + _EPS:  # type: ignore[union-attr]
-        levels = contract_levels(book, side, "sell")
+    quote_ts = _num(quote.ts) if quote is not None else None
+    quote_stale = quote is not None and (quote_ts is None or now - quote_ts > float(cfg.stale_quote_s) + _EPS)
+
+    def newer_than_quote(bk: BookObservation) -> bool:
+        return quote is None or quote_stale or quote_ts is None or bk.observed_at > quote_ts + _EPS
+
+    def walk_levels(levels: List[Tuple[float, float]]) -> float:
+        proceeds, _ = _depth.liquidation_proceeds(adj(list(levels)), qty)
+        return proceeds
+
+    fresh_book = book if _is_real(book) and now - book.observed_at <= cfg.mark_book_max_age_s + _EPS else None  # type: ignore[union-attr]
+    if fresh_book is not None and newer_than_quote(fresh_book):
+        # the book was read after the quote (or the quote stopped updating): the book itself says where the bids are
+        return walk_levels(contract_levels(fresh_book, side, "sell")), "fresh"
+    if quote is not None and touch is None:
+        return 0.0, "unknown"  # the (current) quote shows no bid at all: no book can be called consistent with it
+    if fresh_book is not None:
+        levels = contract_levels(fresh_book, side, "sell")
         if levels and (touch is None or abs(levels[0][0] - touch) <= TICK + _EPS):
-            proceeds, _ = _depth.liquidation_proceeds(levels, qty)
-            return proceeds, "fresh"
+            return walk_levels(levels), "fresh"
     if touch is not None:
         candidates = [b for b in (book, last_real_book) if _is_real(b)]
         candidates = [b for b in candidates if now - b.observed_at <= cfg.mark_depth_max_age_s + _EPS]
         candidates.sort(key=lambda b: -b.observed_at)
         for old in candidates:
-            levels = contract_levels(old, side, "sell")
-            if not levels:
+            raw = contract_levels(old, side, "sell")
+            if not raw:
                 continue
-            shifted = _depth.shift_levels(levels, touch)
-            if shifted:
-                proceeds, _ = _depth.liquidation_proceeds(shifted, qty)
-                return proceeds, "stale"
+            # our consumption is keyed by the prices of the book we sold into: subtract it BEFORE the shift, and
+            # shift by the raw book's offset (shifting the reduced best up to the touch would re-inflate it)
+            shift = 0.0 if newer_than_quote(old) else touch - raw[0][0]
+            if not _shift_by(raw, shift):
+                continue  # every level would leave the price range
+            proceeds, _ = _depth.liquidation_proceeds(_shift_by(adj(list(raw)), shift), qty)
+            return proceeds, "stale"
         full = max(0.0, float(cfg.depth_unknown_full_shares))
         value = min(qty, full) * touch + max(0.0, qty - full) * touch * (1.0 - cfg.depth_unknown_haircut)
         return value, "unknown"
@@ -886,11 +929,20 @@ def compute_verdict(portfolio_id: str, ideas: Sequence[IdeaOutcome], *, pnl_liq:
                     wall_hours: Optional[float], day_hours: Mapping[str, float], max_drawdown: Optional[float],
                     closed_trades: Sequence[PaperTrade], exploratory: bool, n_portfolios: int,
                     depth_unknown_share: Optional[float], swing_share: Optional[float],
-                    unvalued_positions: int, unvalued_value: float, demo: bool = False) -> Verdict:
+                    unvalued_positions: int, unvalued_value: float, demo: bool = False,
+                    untested: Sequence[str] = ()) -> Verdict:
     """The level, sentence and reasons of §6.9 (exact templates there). ``ideas`` excludes nothing: the
-    function drops synthetic and frozen ones itself and counts them in the result."""
+    function drops synthetic and frozen ones itself and counts them in the result.
+
+    ``pnl_liq`` is the portfolio's P&L at liquidation value; the P&L of the synthetic ideas (assumed candle /
+    synthetic-book fills, replays) is taken OUT of it before it is stated, tested (> 0) or used by the guards
+    (pnl_ex_best, top_race_share), so assumed fills can never lift a verdict; frozen ideas stay charged in it
+    (their positions count 0). The win rate is over the closed ideas counted (``closed_trades`` only names the
+    legging exits of sets still held). ``untested``: sentences naming kinds the run could not test (appended)."""
     counted = [i for i in ideas if not i.synthetic and not i.frozen]
     synthetic_excluded = sum(1 for i in ideas if i.synthetic)
+    synthetic_pnl = math.fsum(i.pnl for i in ideas if i.synthetic and not i.frozen)
+    pnl_liq = float(pnl_liq) - synthetic_pnl  # what the counted ideas (and the frozen ones, at 0) made
     n = len(counted)
     closed = [i for i in counted if i.closed]
     c, o = len(closed), n - len(closed)
@@ -919,10 +971,14 @@ def compute_verdict(portfolio_id: str, ideas: Sequence[IdeaOutcome], *, pnl_liq:
     best = max(pnls) if pnls else None
     pnl_ex_best = pnl_liq - best if best is not None else pnl_liq
     mean = math.fsum(pnls) / n if n else None
-    trades_ok = [t for t in closed_trades if not getattr(t, "synthetic", False)]
-    wins = sum(1 for t in trades_ok if t.pnl > _EPS)
-    wr = wins / len(trades_ok) if trades_ok else None
-    wil = wilson_interval(wins, len(trades_ok))
+    # one notion of "closed": the closed IDEAS counted (a legging-residue exit of a set still held is a fragment of
+    # an open idea, not a closed trade of its own)
+    wins = sum(1 for i in closed if i.pnl > _EPS)
+    wr = wins / c if c else None
+    wil = wilson_interval(wins, c)
+    open_keys = {(i.idea_id, round(float(i.entered_at), 3)) for i in counted if not i.closed}
+    legging_open = [t for t in closed_trades if getattr(t, "exit_reason", None) == "legging"
+                    and (t.idea_id, round(float(t.entered_at if t.entered_at is not None else t.opened_at), 3)) in open_keys]
     qualified = sorted(d for d, h in (day_hours or {}).items() if h >= DAY_MIN_HOURS - 1e-9)
     days_covered = len(qualified)
     race_pnl: Dict[str, float] = {}
@@ -1036,19 +1092,27 @@ def compute_verdict(portfolio_id: str, ideas: Sequence[IdeaOutcome], *, pnl_liq:
     if u > 0:
         sentence += (f" {u} {_plural(u, 'position')} whose market closed without a ruling {'is' if u == 1 else 'are'} "
                      f"left out (last value {unvalued_value:,.0f}).")
+    untested = [str(x) for x in (untested or ()) if x]
+    for line in untested:
+        sentence += " " + line
     if exploratory:
         sentence = (f"Exploratory (one of {int(n_portfolios)} portfolios, judged at the stricter {lv}% level): "
                     + sentence)
+    reasons.extend(untested)
     reasons.append(f"Closed: {c} {_plural(c, 'idea')}, {_f_pnl(closed_pnl)} realised; open: {o} {_plural(o, 'idea')}, "
                    f"{_f_pnl(open_pnl)} at liquidation value")
-    if trades_ok and wr is not None and wil is not None:
-        reasons.append(f"Win rate {wr:.0%} over {len(trades_ok)} closed {_plural(len(trades_ok), 'trade')} (90% "
+    if c and wr is not None and wil is not None:
+        reasons.append(f"Win rate {wr:.0%} over {c} closed {_plural(c, 'idea')} (90% "
                        f"interval {wil[0]:.0%} to {wil[1]:.0%}): closed trades only: biased toward quick winners")
     else:
-        reasons.append("No closed trades yet, so no win rate (closed trades only: biased toward quick winners)")
+        reasons.append("No closed ideas yet, so no win rate (closed trades only: biased toward quick winners)")
+    if legging_open:
+        k_l = len(legging_open)
+        reasons.append(f"{k_l} legging {_plural(k_l, 'exit')} of sets still held: "
+                       f"{_f_pnl(math.fsum(t.pnl for t in legging_open))} (part of those open ideas, not closed ideas)")
     if synthetic_excluded:
         reasons.append(f"{synthetic_excluded} {_plural(synthetic_excluded, 'idea')} with candle or synthetic-book fills "
-                       "left out (assumed fills)")
+                       f"left out (assumed fills; their {_f_pnl(synthetic_pnl)} is not in the P&L above)")
     caveats = list(CAVEATS) + ([DEMO_CAVEAT] if demo else [])
     return Verdict(
         portfolio_id=portfolio_id, level=level, sentence=sentence, hours_run=round(covered_hours, 6), closed_trades=c,
@@ -1065,6 +1129,7 @@ def compute_verdict(portfolio_id: str, ideas: Sequence[IdeaOutcome], *, pnl_liq:
         days_covered=days_covered, wall_hours=_r6(wall_hours), unvalued_positions=u,
         unvalued_value=round(float(unvalued_value or 0.0), 6), depth_unknown_share=_r6(depth_unknown_share),
         swing_share=_r6(swing_share), top_race_share=_r6(top_race_share), synthetic_excluded=synthetic_excluded,
+        synthetic_pnl=round(synthetic_pnl, 6), untested=list(untested),
     )
 
 
@@ -1094,32 +1159,47 @@ def downsample_equity(points: Sequence[Tuple[float, float]], max_points: int = E
 
 @dataclass
 class CoverageClock(_Serializable):
-    """Covered vs wall-clock time of a run (§6.11): each step adds min(gap since the previous step,
-    3 x interval) to ``covered_s``; a longer gap is recorded in ``gaps`` (at most GAPS_MAX, newest kept)."""
+    """Covered vs wall-clock time of a run (§6.11): each step that saw the market adds min(gap since the previous
+    step, 3 x interval) to ``covered_s``; a longer gap is recorded in ``gaps`` (at most GAPS_MAX, newest kept). A
+    step WITHOUT data (``fresh=False``: an outage while the process keeps running) adds nothing and opens or
+    extends a ``{"from", "to", "reason": "no data"}`` gap, so hours with zero observations never count as
+    evidence."""
 
     interval_s: float = 30.0
     started_at: Optional[float] = None
     last_step_at: Optional[float] = None
     covered_s: float = 0.0
     day_covered_s: Dict[str, float] = field(default_factory=dict)  # UTC date -> covered seconds
-    gaps: List[Dict[str, float]] = field(default_factory=list)  # [{"from", "to"}]
+    gaps: List[Dict[str, Any]] = field(default_factory=list)  # [{"from", "to"(, "reason")}]
+    no_data_open: bool = False  # the newest gap is a "no data" stretch still going on
 
-    def tick(self, now: float) -> Optional[float]:
+    def tick(self, now: float, fresh: bool = True) -> Optional[float]:
         """Record a step at ``now``; returns the gap length when it exceeded 3 x interval, else None."""
         now = float(now)
         if self.started_at is None:
             self.started_at = now
         if self.last_step_at is None:
-            self.last_step_at = now
+            self.last_step_at = now  # the first step covers nothing either way
             return None
         gap = now - self.last_step_at
         if gap <= 0:
             return None
         cap = 3.0 * float(self.interval_s)
+        out: Optional[float] = None
+        if not fresh:
+            if self.no_data_open and self.gaps and self.gaps[-1].get("reason") == NO_DATA_GAP:
+                self.gaps[-1]["to"] = now
+            else:
+                self.gaps.append({"from": self.last_step_at, "to": now, "reason": NO_DATA_GAP})
+                self.no_data_open = True
+            if len(self.gaps) > GAPS_MAX:
+                self.gaps = self.gaps[-GAPS_MAX:]
+            self.last_step_at = now
+            return gap if gap > cap + 1e-9 else None
+        self.no_data_open = False
         add = min(gap, cap)
         self.covered_s += add
         self._add_days(now - add, now)
-        out: Optional[float] = None
         if gap > cap + 1e-9:
             self.gaps.append({"from": self.last_step_at, "to": now})
             if len(self.gaps) > GAPS_MAX:
@@ -1152,10 +1232,16 @@ class CoverageClock(_Serializable):
     @classmethod
     def from_dict(cls, data: Optional[Mapping[str, Any]]) -> "CoverageClock":
         d = dict(data or {})
+        gaps: List[Dict[str, Any]] = []
+        for g in d.get("gaps") or []:
+            row: Dict[str, Any] = {"from": float(g["from"]), "to": float(g["to"])}
+            if g.get("reason"):
+                row["reason"] = str(g["reason"])
+            gaps.append(row)
         return cls(interval_s=float(d.get("interval_s", 30.0)), started_at=_num(d.get("started_at")),
                    last_step_at=_num(d.get("last_step_at")), covered_s=float(d.get("covered_s") or 0.0),
                    day_covered_s={str(k): float(v) for k, v in (d.get("day_covered_s") or {}).items()},
-                   gaps=[{"from": float(g["from"]), "to": float(g["to"])} for g in (d.get("gaps") or [])])
+                   gaps=gaps, no_data_open=bool(d.get("no_data_open", False)))
 
 
 # --------------------------------------------------------------------------- (de)serialisation helpers
@@ -1225,6 +1311,14 @@ def paper_config_from_dict(data: Mapping[str, Any]) -> PaperConfig:
     if isinstance(params, Mapping):
         cfg.params = _from_dict(StrategyParams, params)
     return cfg
+
+
+def _bold_hold_plan(opp: Opportunity) -> ExitPlan:
+    """The exit plan of a bold entry: held to its 1/0 settlement (sizing.bold_exit_plan; the shared ``opp`` is
+    never mutated). Only the idea's regime exit (``exit_before_ts``) is kept."""
+    from .sizing import bold_exit_plan
+
+    return bold_exit_plan(opp)
 
 
 def _plan_from(data: Any) -> Optional[ExitPlan]:
@@ -1346,12 +1440,16 @@ class PaperEngine:
     (``config_fingerprint(config, code_version)``); otherwise it is ended with reason "settings changed"
     (final snapshot written) and a run starts at the first step. ``study`` defaults to a
     study.SignalStudy (the signal-level event study, §6.14). Not thread-safe: PaperRunner serialises.
+    ``rebase_default_capital`` (default True; the backtest turns it off, its capital is fixed): a live run that
+    had to start on the default 100,000 is re-based to the account value once the inputs carry one, as long as
+    nothing has filled yet (ui-4, §6.1).
     """
 
     def __init__(self, config: Optional[PaperConfig] = None, *, persistence: Optional[PaperPersistence] = None,
                  policies: Optional[Mapping[str, SizingPolicy]] = None, clock: Callable[[], float] = time.time,
-                 code_version: str = "", study: Any = None) -> None:
+                 code_version: str = "", study: Any = None, rebase_default_capital: bool = True) -> None:
         self._config = config if config is not None else PaperConfig()
+        self._rebase_capital = bool(rebase_default_capital)
         self._persistence: Any = persistence if persistence is not None else MemoryPaperPersistence()
         self._policies: Dict[str, Any] = dict(policies or {})
         self._clock = clock
@@ -1397,6 +1495,7 @@ class PaperEngine:
         self._step_report = StepReport(now=0.0, step=0)
         self._ending = False
         self._ended_run: Optional[Dict[str, Any]] = None
+        self._final_summaries: Optional[List[PortfolioSummary]] = None  # the ended run's pre-liquidation summaries
 
     def _policy(self, name: str) -> Any:
         pol = self._policies.get(name)
@@ -1534,7 +1633,53 @@ class PaperEngine:
                     return v, label
         if self._last_capital[0] is not None:
             return float(self._last_capital[0]), self._last_capital[1]
-        return DEFAULT_START_CAPITAL, "default 100,000"
+        return DEFAULT_START_CAPITAL, DEFAULT_CAPITAL_SOURCE
+
+    def _rebase_default_capital(self, now: float, inputs: Optional[StrategyInputs]) -> bool:
+        """ui-4 (§6.1): a run that had to start on the last-resort default 100,000 (the account context was not
+        known yet, e.g. the first paper step of a fresh start runs before the first balance refresh) is re-based
+        to the account value as soon as the inputs carry one -- provided nothing has filled yet in any portfolio
+        (no fill, position or trade: the P&L so far is exactly 0 at any capital). Orders already placed were sized
+        on the default: they are withdrawn (recorded as cancelled, with the reason) and the ideas are sized again
+        from the account in this same step. The stored equity points are rewritten at the new capital (no fill:
+        equity was the start capital at every point). Coverage, the event study and the fair-value diagnostics
+        are about the market, not the capital, and are kept. Returns whether the run was re-based."""
+        run = self._run
+        if (not self._rebase_capital or run is None or run.get("capital_source") != DEFAULT_CAPITAL_SOURCE
+                or self._final is not None):
+            return False
+        capital, source = self._capital_from(inputs)
+        if source == DEFAULT_CAPITAL_SOURCE or not capital or capital <= 0:
+            return False
+        if any(b.fills > 0 or b.positions or b.trades or b.closing for b in self._books.values()):
+            return False  # something has filled: the run is what it is (the UI names its capital source)
+        capital = float(capital)
+        why = (f"Start capital set from your {source} ({capital:,.0f} SUSQies): this order was sized on the default "
+               "100,000 and is placed again at the new size")
+        run["start_capital"], run["capital_source"] = capital, source
+        for spec in self._config.portfolios:
+            old = self._books.get(spec.portfolio_id)
+            nb = _Book(spec, self._config, capital)
+            if old is not None:
+                if spec.start_capital is not None:
+                    continue  # this portfolio has its own capital: nothing was sized on the default
+                for order in sorted(old.orders.values(), key=lambda o: o.order_id):
+                    order.status, order.close_reason, order.closed_at = "cancelled", why, float(now)
+                    order.reserved_cash = 0.0
+                    self._dirty_orders[order.order_id] = order
+                nb.counters = dict(old.counters)  # order / fill ids stay unique within the run
+                nb.diagnostics = copy.deepcopy(old.diagnostics)
+                nb.equity = [dataclasses.replace(p, cash=round(nb.start_capital, 6), reserved_cash=0.0,
+                                                 liq_value=round(nb.start_capital, 6),
+                                                 mark_value=round(nb.start_capital, 6),
+                                                 fv_value=round(nb.start_capital, 6) if p.fv_value is not None else None,
+                                                 open_positions=0)
+                             for p in old.equity]
+                self._new_equity.extend(nb.equity)
+            self._books[spec.portfolio_id] = nb
+        log.info("paper: run %s re-based from the default 100,000 to the %s (%.2f) before any fill",
+                 run.get("run_id"), source, capital)
+        return True
 
     def _new_run_id(self, now: float) -> str:
         base = f"run-{int(now)}"
@@ -1584,7 +1729,13 @@ class PaperEngine:
         if self._run is None:
             return None
         now = float(now)
-        snapshot = self._snapshot(now, reason)
+        summaries = self._summaries(now)
+        snapshot = self._snapshot(now, reason, summaries)
+        # what the run showed BEFORE its positions were turned into trades at liquidation value: summary(),
+        # portfolios() and verdicts() serve these once the run has ended, so the end of a run never turns open
+        # P&L into "realised", never adds closed trades to the win rate and never switches off the depth and
+        # swing guards (their exposure is gone after the liquidation)
+        frozen = copy.deepcopy(summaries)
         self._ending = True
         try:
             for b in self._books.values():
@@ -1611,6 +1762,7 @@ class PaperEngine:
             log.warning("paper: could not end run %s: %s", self._run["run_id"], exc)
         self._has_previous = True
         self._ended_run = dict(self._run, ended_at=now, end_reason=reason)
+        self._final_summaries = frozen
         self._run = None
         return snapshot
 
@@ -1737,7 +1889,8 @@ class PaperEngine:
         urgent, regular = [], []
         for eid, row in tape_rows.items():
             last = self._tape_read_at.get(eid)
-            if row["cancel"] and (last is None or last < row["cancel_at"] - _EPS):
+            # a cancel still on its way (cancel_at = decision + latency, in the future) is read like a resting order
+            if row["cancel"] and now >= row["cancel_at"] - _EPS and (last is None or last < row["cancel_at"] - _EPS):
                 urgent.append((row["cancel_at"], eid, row))
             elif last is None or now - last >= cfg.trade_poll_s - _EPS:
                 regular.append((last if last is not None else -1.0, eid, row))
@@ -2321,10 +2474,15 @@ class PaperEngine:
                 else:
                     order.missing_steps += 1
                 if order.expires_at is not None and now >= order.expires_at - _EPS:
+                    # the person sets the expiry when placing the order (OrderInput.expirationDate), so the
+                    # exchange removes it on time at any speed
                     order.status, order.cancel_at = "cancelling", float(order.expires_at)
                     meta["cause"] = "expired"
                 elif order.missing_steps >= int(cfg.maker_cancel_after_missing_steps):
-                    order.status, order.cancel_at = "cancelling", float(now)
+                    # a cancel takes this portfolio's latency to reach the market, exactly like the placement: a
+                    # person needs ~4 minutes to cancel by hand, so the prints of a news sweep in those minutes still
+                    # fill the order (prints up to cancel_at count, §6.4)
+                    order.status, order.cancel_at = "cancelling", float(now) + b.latency
                     meta["cause"] = "cancelled"
                 self._dirty_orders[order.order_id] = order
             tape = obs.trades.get(eid) if obs.trades else None
@@ -2385,8 +2543,14 @@ class PaperEngine:
             if q is None or now - float(q.ts) > cfg.stale_quote_s + _EPS:
                 flags.append("stale_quote")
             book = obs.books.get(pos.exchange_id)
+
+            def minus_ours(levels: List[Tuple[float, float]], p: PaperPosition = pos) -> List[Tuple[float, float]]:
+                # the bids this portfolio already sold into are not there for it again (§6.3, D35): marks and
+                # fills agree on depth
+                return self._minus_consumed(b, p.exchange_id, p.side, "sell", levels, now)
+
             value, state = liquidation_value(pos.side, pos.qty, book, q, last_real_book=self._last_real_books.get(pos.exchange_id),
-                                             now=now, config=cfg)
+                                             now=now, config=cfg, adjust_levels=minus_ours)
             pos.liq_value = value
             pos.depth_state = state
             if state == "stale":
@@ -2414,6 +2578,13 @@ class PaperEngine:
         if as_of is not None and now - as_of > max_age + _EPS:
             return None
         return v if side == "yes" else 1.0 - v
+
+    def _fv_for_exit(self, fv_c: float) -> float:
+        """The contract fair value an exit target is built on: strategy.value_opportunity's longshot rule (a contract
+        whose fair value is below 0.15 is valued at fv x (1 - longshot_shrink))."""
+        params = self._config.params or StrategyParams()
+        shrink = float(getattr(params, "longshot_shrink", 0.0) or 0.0)
+        return fv_c * (1.0 - shrink) if fv_c < 0.15 else fv_c
 
     def _exits(self, b: _Book, obs: MarketObservation, open_ids: Set[str], now: float) -> None:
         if now >= float(obs.cup_end) - _EPS:
@@ -2456,7 +2627,9 @@ class PaperEngine:
                     fv_c = self._fv_contract((obs.fair_values or {}).get(pos.exchange_id), pos.side, now)
                     if fv_c is not None and q is not None and q.bid is not None and q.ask is not None:
                         half = (float(q.ask) - float(q.bid)) / 2.0
-                        target = _depth.floor_tick(fv_c - half - float(plan.exit_buffer or 0.0))
+                        # the same contract fair value the idea used: a longshot (< 0.15) is shrunk as in
+                        # strategy.value_opportunity, so the simulated exit is the one the card tells you to follow
+                        target = _depth.floor_tick(self._fv_for_exit(fv_c) - half - float(plan.exit_buffer or 0.0))
                         fv_entry = _num((b.ledger.get(pos.position_id) or {}).get("fv_entry"))
                         moved = fv_entry is not None and abs(fv_c - fv_entry) >= TICK - _EPS
                         why = "fair_value" if moved else "converged"
@@ -2508,24 +2681,28 @@ class PaperEngine:
         if rec is not None:
             start = rec.get("start") or {}
             sold_any = any(float(start.get(p.exchange_id, p.qty)) - p.qty > _EPS for p in legs) or len(legs) < len(start)
-            stuck = False
-            for p in legs:
-                if float(start.get(p.exchange_id, p.qty)) - p.qty > _EPS:
-                    continue
-                order = next((o for o in pending if o.exchange_id == p.exchange_id), None)
-                if order is None or now >= float(rec.get("created_at", now)) + b.max_delay - _EPS:
-                    stuck = True
-            if sold_any and stuck:
-                for o in pending:
-                    self._close_order(b, o, "cancelled", "Legging out: selling every remaining leg", now)
-                    report.orders_cancelled += 1
-                self._start_basket_exit(b, basket_id, legs, "legging", {p.exchange_id: _depth.MIN_PRICE for p in legs},
-                                        obs, now, exiting)
-                return
+            qtys = [p.qty for p in legs]
+            unmatched = len(legs) < len(start) or (max(qtys) - min(qtys) > _EPS if qtys else False)
+            # a set with one leg (wholly or partly) sold is a naked position, not a basket (§6.5, D29): once the exit
+            # left the legs unmatched -- or it is already a legging exit -- the rest is sold as soon as any leg has no
+            # live order (it expired) or the group is past its fill delay, partly filled or not
+            broken = rec.get("reason") == "legging" or (sold_any and unmatched)
+            if broken:
+                past = now >= float(rec.get("created_at", now)) + b.max_delay - _EPS
+                stuck = past or any(not any(o.exchange_id == p.exchange_id for o in pending) for p in legs)
+                if stuck:
+                    for o in pending:
+                        self._close_order(b, o, "cancelled", "Legging out: selling every remaining leg", now)
+                        report.orders_cancelled += 1
+                    self._start_basket_exit(b, basket_id, legs, "legging",
+                                            {p.exchange_id: _depth.MIN_PRICE for p in legs}, obs, now, exiting)
+                    return
             if pending:
                 exiting.update(o.exchange_id for o in pending)
                 return
-            b.exits.pop(basket_id, None)  # the exit orders expired without a fill: evaluate again
+            # the exit orders expired with every leg still matched (nothing sold, or the same quantity of every leg):
+            # the rest is still a whole set; evaluate it again
+            b.exits.pop(basket_id, None)
         elif pending:
             exiting.update(o.exchange_id for o in pending)
             return
@@ -2853,9 +3030,13 @@ class PaperEngine:
         directional = bool(opp.bet is not None and opp.bet.kind in ("binary", "bracket"))
         entry_id = basket_id or f"{b.pid}:e{b.counters.get('o', 0) + 1}"
         dec_reason = (opp.rationale[0] if opp.rationale else f"{opp.kind} idea")
+        # a bold-to-goal stake (§5.6.4, D13) is sized so that a 1/0 WIN reaches the bar: it is held to settlement
+        # (sizing.bold_exit_plan: no convergence target, no stop, only the regime exit), never sold at the idea's
+        # own target for a few cents a share -- the simulator tests the bet the Strategy card tells you to place
+        plan = _bold_hold_plan(opp) if bold and not is_set else opp.exit_plan
         entry = {
             "entry_id": entry_id, "idea_id": idea, "kind": opp.kind, "basket_id": basket_id, "set": is_set,
-            "legs": legs_meta, "exit_plan": opp.exit_plan.to_dict() if opp.exit_plan is not None else None,
+            "legs": legs_meta, "exit_plan": plan.to_dict() if plan is not None else None,
             "edge_per_unit": edge_per_unit, "race_key": opp.race_key, "score": float(opp.score or 0.0),
             "bold": bool(bold),
             "floor_per_unit": floor_per_unit, "entered_at": float(now),
@@ -2915,6 +3096,7 @@ class PaperEngine:
             if pos.status == "frozen":
                 unvalued += float(pos.liq_value or 0.0)
                 unvalued_n += 1
+                cost_open += float(pos.cost)  # counted at 0 (D45): its whole cost is an unrealised loss for now
                 continue
             lv = float(pos.liq_value) if pos.liq_value is not None else 0.0
             liq += lv
@@ -2968,6 +3150,17 @@ class PaperEngine:
             self._new_equity.append(point)
 
     # ------------------------------------------------------------------ the step
+    def _observed(self, obs: MarketObservation, now: float) -> bool:
+        """Whether this step actually saw the market: its newest bulk quote is at most max(stale_quote_s, 3 x interval)
+        old. A step during an outage (the process runs, every read fails) adds nothing to the covered hours (D48:
+        "observed" means observed)."""
+        stamps = [_num(q.ts) for q in (obs.quotes or {}).values() if q is not None]
+        stamps = [s for s in stamps if s is not None]
+        if not stamps:
+            return False
+        window = max(float(self._config.stale_quote_s), 3.0 * float(self._config.interval_s))
+        return float(now) - max(stamps) <= window + _EPS
+
     def observe_books(self, books: Mapping[str, BookObservation]) -> None:
         """Remember real books (the newest per exchange) for stale-depth marks and read planning."""
         for eid, bk in books.items():
@@ -2985,8 +3178,9 @@ class PaperEngine:
         now = float(now)
         if inputs is not None:
             cap = self._capital_from(inputs)
-            if cap[1] not in ("default 100,000",):
+            if cap[1] not in (DEFAULT_CAPITAL_SOURCE,):
                 self._last_capital = cap
+            self._rebase_default_capital(now, inputs)
         if self._run is None:
             capital, source = self._capital_from(inputs)
             self.start(now, capital, source)
@@ -2995,7 +3189,8 @@ class PaperEngine:
         self._last_obs = obs
         cfg = self._config
         signals = list(signals or ())
-        open_ids = set(obs.open_ids) if obs.open_ids else set(obs.quotes)
+        # an EMPTY open list means no outcome is open (every position freezes); only a missing one falls back
+        open_ids = set(obs.open_ids) if obs.open_ids is not None else set(obs.quotes)
         self.observe_books(obs.books or {})
         for eid in (obs.trades or {}):
             self._tape_read_at[str(eid)] = float(obs.now)
@@ -3003,7 +3198,7 @@ class PaperEngine:
         report.tape_gaps = len(truncated)
         # 0: coverage and downtime
         prev_step = self._coverage.last_step_at
-        gap = self._coverage.tick(now)
+        gap = self._coverage.tick(now, fresh=self._observed(obs, now))
         if gap is not None:
             report.gap_s = round(gap, 3)
         raw_gap = (now - prev_step) if prev_step is not None else 0.0
@@ -3011,6 +3206,8 @@ class PaperEngine:
             for b in self._books.values():
                 for o in b.orders.values():
                     if o.status == "resting":
+                        # D48 (binding): counts as cancelled at the last step before the gap, so prints from the
+                        # downtime never fill it (a cancel decided while the bot runs takes the portfolio's latency)
                         o.status, o.cancel_at = "cancelling", float(prev_step)
                         b.order_meta.setdefault(o.order_id, {})["cause"] = "cancelled"
                         b.order_meta[o.order_id]["why"] = ("The bot was not running: a resting order cannot be managed "
@@ -3129,14 +3326,19 @@ class PaperEngine:
             if b is None:
                 continue
             val = self._valuation(b)
-            trades = b.trades
-            wins = sum(1 for t in trades if t.pnl > _EPS)
-            losses = sum(1 for t in trades if t.pnl < -_EPS)
-            verdict = self._verdict(b, val, now, spec.portfolio_id != head, n_port)
+            ideas = self._ideas_of(b)
+            untested = self._untested(b)
+            verdict = self._verdict(b, val, now, spec.portfolio_id != head, n_port, ideas=ideas, untested=untested)
+            # one notion of "closed" everywhere (ui-7): closed IDEAS, as the verdict counts them; legging-residue
+            # exits of sets still held are fragments of open ideas, reported separately
+            closed_ideas = [i for i in ideas if i.closed and not i.synthetic and not i.frozen]
+            wins = sum(1 for i in closed_ideas if i.pnl > _EPS)
+            losses = sum(1 for i in closed_ideas if i.pnl < -_EPS)
+            legging = self._open_legging_trades(b, ideas)
             exp = self._exposure(b)
             params = cfg.params or StrategyParams()
             swing = abs(exp.national_tilt_d) * float(params.national_swing_sd_pts)
-            by_kind = self._by_kind(b)
+            by_kind = self._by_kind(b, ideas)
             sizing_expl = None
             try:
                 ctx = b.last_ctx if b.last_ctx is not None else (self._sizing_ctx(b, obs, None, now) if obs is not None else None)
@@ -3155,17 +3357,59 @@ class PaperEngine:
                 pnl_liq=round(pnl_liq, 6), pnl_liq_pct=round(pnl_liq / b.start_capital, 8) if b.start_capital else 0.0,
                 pnl_mark=round(val["equity_mark"] - b.start_capital, 6), max_drawdown=round(b.max_drawdown, 8),
                 max_drawdown_abs=round(b.max_drawdown_abs, 6), fills=b.fills, orders_open=len(b.orders),
-                positions_open=sum(1 for p in b.positions.values() if p.status != "closed"), trades_closed=len(trades),
-                wins=wins, losses=losses, win_rate=_r6(wins / len(trades)) if trades else None, by_kind=by_kind,
+                positions_open=sum(1 for p in b.positions.values() if p.status != "closed"),
+                trades_closed=len(closed_ideas), wins=wins, losses=losses,
+                win_rate=_r6(wins / len(closed_ideas)) if closed_ideas else None, by_kind=by_kind,
                 exposure=exp, sizing=sizing_expl, verdict=verdict, last_step_at=self._coverage.last_step_at,
                 headline=spec.portfolio_id == head, exploratory=spec.portfolio_id != head, latency_s=b.latency,
                 unvalued=round(val["unvalued"], 6), depth_unknown_share=_r6(val["depth_unknown_share"]),
                 depth_stale_share=_r6(val["depth_stale_share"]), swing_risk=round(swing, 6),
-                execution=self._execution(b), no_trade_reason=self._no_trade_reason(b),
+                execution=self._execution(b), no_trade_reason=self._no_trade_reason(b), untested=list(untested),
+                legging_trades=len(legging), legging_pnl=round(math.fsum(t.pnl for t in legging), 6),
             ))
         return out
 
-    def _by_kind(self, b: _Book) -> Dict[str, Dict[str, Any]]:
+    @staticmethod
+    def _idea_key(t: PaperTrade) -> Tuple[str, float]:
+        entered = float(t.entered_at if t.entered_at is not None else t.opened_at)
+        return (t.idea_id, round(entered, 3))
+
+    def _open_legging_trades(self, b: _Book, ideas: Sequence[IdeaOutcome]) -> List[PaperTrade]:
+        """Legging-residue trades that belong to an idea still open (a set still held)."""
+        open_keys = {(i.idea_id, round(float(i.entered_at), 3)) for i in ideas if not i.closed}
+        return [t for t in b.trades if t.exit_reason == "legging" and self._idea_key(t) in open_keys]
+
+    def _untested(self, b: _Book) -> List[str]:
+        """One sentence per kind this portfolio trades that the run could not test (live-3, ui-3, D62): value ideas
+        need usable outside fair values; when those were missing on most steps the result covers the other kinds
+        only, whether or not the portfolio has fills."""
+        kinds = list(b.spec.kinds) if b.spec.kinds is not None else list(TRADE_KINDS)
+        if "value" not in kinds:
+            return []
+        diag = b.diagnostics or {}
+        steps = int(diag.get("steps", 0))
+        if steps <= 0:
+            return []
+        share = float(diag.get("fv_steps", 0)) / steps
+        if share >= 0.5:
+            return []
+        others = [k for k in kinds if k != "value"]
+        names = (others[0] if len(others) == 1 else ", ".join(others[:-1]) + " and " + others[-1]) if others else ""
+        if share <= _EPS:
+            covers = (f"so this result covers {names} ideas only" if others
+                      else "so this portfolio could not test its only kind")
+            # the run cannot tell "off or offline" from "not received yet" (the first refresh of a fresh run)
+            return [f"Value ideas were not tested: usable outside fair values on 0% of steps (outside prices off, "
+                    f"offline or not received yet), {covers}."]
+        covers = (f"so this result mostly covers {names} ideas" if others
+                  else "so this portfolio tested its only kind on part of the run")
+        return [f"Value ideas were tested on only part of the run: usable outside fair values on {share:.0%} of steps, "
+                f"{covers}."]
+
+    def _by_kind(self, b: _Book, ideas: Optional[Sequence[IdeaOutcome]] = None) -> Dict[str, Dict[str, Any]]:
+        """Per-kind P&L rows that add up to the portfolio's pnl_liq (trades + open positions + basket legs already
+        sold while the basket's last leg is still open); closed counts and wins are over closed ideas, like the
+        portfolio's."""
         out: Dict[str, Dict[str, Any]] = {}
 
         def row(kind: str) -> Dict[str, Any]:
@@ -3173,11 +3417,17 @@ class PaperEngine:
                                          "wins": 0, "win_rate": None, "fills": 0, "positions_open": 0})
 
         for t in b.trades:
-            r = row(t.kind)
-            r["pnl_realized"] += t.pnl
-            r["trades_closed"] += 1
-            if t.pnl > _EPS:
-                r["wins"] += 1
+            row(t.kind)["pnl_realized"] += t.pnl
+        for rec in b.closing.values():  # legs of a basket already closed, waiting for the last leg
+            r = row(str(rec.get("kind") or "basket"))
+            for lg in rec.get("legs") or []:
+                r["pnl_realized"] += float(lg.get("proceeds") or 0.0) - float(lg.get("cost") or 0.0)
+        for i in (ideas if ideas is not None else self._ideas_of(b)):
+            if i.closed and not i.synthetic and not i.frozen:
+                r = row(i.kind)
+                r["trades_closed"] += 1
+                if i.pnl > _EPS:
+                    r["wins"] += 1
         for p in b.positions.values():
             r = row(p.kind)
             r["pnl_realized"] += p.realized_pnl
@@ -3261,18 +3511,20 @@ class PaperEngine:
                          "of no edge).")
         return " ".join(parts) if parts else None
 
-    def _verdict(self, b: _Book, val: Mapping[str, Any], now: float, exploratory: bool, n_port: int) -> Verdict:
+    def _verdict(self, b: _Book, val: Mapping[str, Any], now: float, exploratory: bool, n_port: int, *,
+                 ideas: Optional[List[IdeaOutcome]] = None, untested: Optional[Sequence[str]] = None) -> Verdict:
         params = self._config.params or StrategyParams()
         exp = self._exposure(b)
         eq = float(val["equity_liq"])
         swing_share = abs(exp.national_tilt_d) * float(params.national_swing_sd_pts) / eq if eq > _EPS else None
         return compute_verdict(
-            b.pid, self._ideas_of(b), pnl_liq=eq - b.start_capital, covered_hours=self._coverage.covered_hours,
+            b.pid, ideas if ideas is not None else self._ideas_of(b), pnl_liq=eq - b.start_capital,
+            covered_hours=self._coverage.covered_hours,
             wall_hours=self._coverage.wall_hours(now), day_hours=self._coverage.day_hours(),
             max_drawdown=b.max_drawdown, closed_trades=b.trades, exploratory=exploratory, n_portfolios=n_port,
             depth_unknown_share=_num(val.get("depth_unknown_share")), swing_share=swing_share,
             unvalued_positions=int(val.get("unvalued_n", 0)), unvalued_value=float(val.get("unvalued", 0.0)),
-            demo=bool(self._config.demo),
+            demo=bool(self._config.demo), untested=untested if untested is not None else self._untested(b),
         )
 
     def _ideas_of(self, b: _Book) -> List[IdeaOutcome]:
@@ -3293,6 +3545,8 @@ class PaperEngine:
             g["pnl"] += t.pnl
             g["cost"] += t.cost
             g["synthetic"] = g["synthetic"] or t.synthetic
+            if t.exit_reason in END_REASONS:
+                g["closed"] = False  # booked at liquidation value when the run ended: still an open idea
         for basket_id, rec in b.closing.items():
             entry = b.entries.get(rec.get("entry") or "") or {}
             entered = float(entry.get("entered_at") or 0.0)
@@ -3326,7 +3580,14 @@ class PaperEngine:
                                    frozen=bool(g["frozen"]), day=_utc_day(entered)))
         return out
 
+    def _ended(self) -> bool:
+        return self._run is None and self._ended_run is not None and self._final_summaries is not None
+
     def portfolios(self, now: Optional[float] = None) -> List[PortfolioSummary]:
+        """Every portfolio's summary; once a run has ended, the summaries it ended with (before its open positions
+        were turned into trades at liquidation value)."""
+        if self._ended():
+            return copy.deepcopy(self._final_summaries)  # type: ignore[arg-type]
         return self._summaries(self._now_or(now))
 
     def _now_or(self, now: Optional[float]) -> float:
@@ -3387,6 +3648,8 @@ class PaperEngine:
         return self._ideas_of(b) if b is not None else []
 
     def verdicts(self, now: Optional[float] = None) -> Dict[str, Verdict]:
+        if self._ended():
+            return {s.portfolio_id: copy.deepcopy(s.verdict) for s in self._final_summaries or [] if s.verdict is not None}
         now = self._now_or(now)
         head = headline_id(self._config)
         n_port = len(self._config.portfolios)
@@ -3411,8 +3674,9 @@ class PaperEngine:
                 pass
         return [e for e in out if kind is None or e.kind == kind]
 
-    def _snapshot(self, now: float, reason: str) -> Dict[str, Any]:
-        summaries = self._summaries(now)
+    def _snapshot(self, now: float, reason: str, summaries: Optional[List[PortfolioSummary]] = None) -> Dict[str, Any]:
+        if summaries is None:
+            summaries = self._summaries(now)
         try:
             study = self._study.summary()
         except Exception:
@@ -3459,19 +3723,42 @@ class PaperEngine:
         everything from memory (no persistence reads)."""
         now = self._now_or(now)
         cfg = self._config
-        summaries = self._summaries(now) if (self._run or self._ended_run) else []
+        ended = self._ended()
+        if ended:
+            summaries = copy.deepcopy(self._final_summaries) or []
+        else:
+            summaries = self._summaries(now) if (self._run or self._ended_run) else []
         head = headline_id(cfg)
         headline = None
         for s in summaries:
             if s.portfolio_id == head:
                 headline = _headline_dict(s)
-        equity = {b.pid: downsample_equity([(p.ts, p.liq_value) for p in b.equity]) for b in self._books.values()}
+        live_equity = {s.portfolio_id: float(s.equity_liq) for s in summaries}
+        equity: Dict[str, List[List[float]]] = {}
+        for b in self._books.values():
+            pts = [(p.ts, p.liq_value) for p in b.equity]
+            # points are stored at most once per equity_min_spacing_s (D59); the SERVED series ends with the current
+            # valuation so the chart, the equity table and the headline P&L agree on the same screen
+            cur = live_equity.get(b.pid)
+            if not ended and cur is not None and (not pts or now > pts[-1][0] + _EPS):
+                pts.append((float(now), round(cur, 6)))
+            equity[b.pid] = downsample_equity(pts)
         positions: List[Dict[str, Any]] = []
         baskets: Dict[Tuple[str, str], Dict[str, Any]] = {}
         for b in self._books.values():
             for pos in sorted(b.positions.values(), key=lambda p: p.exchange_id):
                 d = pos.to_dict()
-                d["unrealized_liq"] = _r6(float(pos.liq_value) - float(pos.cost)) if pos.liq_value is not None else None
+                if pos.status == "frozen":
+                    # market closed without a ruling (D45): it counts 0 in equity_liq / pnl_liq, so the row shows
+                    # what the totals charge (value 0, unrealised -cost); the last mark is listed separately
+                    d["last_liq_value"] = _r6(pos.liq_value)
+                    d["liq_value"] = 0.0
+                    d["unrealized_liq"] = _r6(-float(pos.cost))
+                    d["unvalued"] = True
+                else:
+                    d["unrealized_liq"] = (_r6(float(pos.liq_value) - float(pos.cost)) if pos.liq_value is not None
+                                           else None)
+                    d["unvalued"] = False
                 d["exit_note"] = pos.exit_plan.note if pos.exit_plan is not None else ""
                 d["age_hours"] = round(max(0.0, now - pos.opened_at) / 3600.0, 6)
                 positions.append(d)
@@ -3479,13 +3766,15 @@ class PaperEngine:
                     key = (b.pid, pos.basket_id)
                     bk = baskets.setdefault(key, {"portfolio_id": b.pid, "basket_id": pos.basket_id, "idea_id": pos.idea_id,
                                                   "sets": None, "cost": 0.0, "floor_value": 0.0, "liq_value": 0.0,
-                                                  "legs": []})
-                    bk["sets"] = pos.qty if bk["sets"] is None else min(bk["sets"], pos.qty)
+                                                  "legs": [], "naked_qty": 0.0})
                     bk["cost"] = round(bk["cost"] + float(pos.cost), 6)
-                    bk["floor_value"] = round(bk["floor_value"] + pos.qty * float(pos.floor_per_unit or 0.0), 6)
-                    bk["liq_value"] = round(bk["liq_value"] + float(pos.liq_value or 0.0), 6)
+                    bk["liq_value"] = round(bk["liq_value"] + float(d.get("liq_value") or 0.0), 6)
                     bk["legs"].append({"exchange_id": pos.exchange_id, "side": pos.side, "qty": pos.qty,
-                                       "liq_value": _r6(pos.liq_value)})
+                                       "liq_value": _r6(d.get("liq_value"))})
+            for (pid, basket_id), bk in baskets.items():
+                if pid != b.pid:
+                    continue
+                self._finish_basket_row(b, basket_id, bk)
         orders = sorted([o for b in self._books.values() for o in b.orders.values()],
                         key=lambda o: (o.created_at, o.order_id), reverse=True)
         try:
@@ -3506,6 +3795,33 @@ class PaperEngine:
             "study": study, "budget": None, "fair_value": None,
             "caveats": list(CAVEATS) + ([DEMO_CAVEAT] if cfg.demo else []), "last_step": None,
         }
+
+    def _basket_legs_total(self, b: _Book, basket_id: str) -> int:
+        """How many legs the basket was entered with (open + already closed)."""
+        open_legs = [p for p in b.positions.values() if p.basket_id == basket_id]
+        n = len(open_legs) + len((b.closing.get(basket_id) or {}).get("legs") or [])
+        for p in open_legs:
+            entry = b.entries.get((b.ledger.get(p.position_id) or {}).get("entry") or "") or {}
+            n = max(n, len(entry.get("legs") or {}))
+        return n
+
+    def _finish_basket_row(self, b: _Book, basket_id: str, bk: Dict[str, Any]) -> None:
+        """``sets`` = the matched quantity over EVERY leg of the basket (a leg already sold counts 0); ``floor_value``
+        = sets x the set's floor; shares beyond the matched sets are naked (no floor) and listed separately."""
+        legs = bk["legs"]
+        n_total = self._basket_legs_total(b, basket_id)
+        qtys = [float(lg["qty"]) for lg in legs]
+        sets = min(qtys) if qtys and len(legs) >= n_total else 0.0
+        per_leg = max((float(p.floor_per_unit or 0.0) for p in b.positions.values() if p.basket_id == basket_id),
+                      default=0.0)
+        bk["sets"] = round(sets, 6)
+        bk["floor_value"] = round(sets * per_leg * n_total, 6)
+        naked = 0.0
+        for lg in legs:
+            lg["naked_qty"] = round(max(0.0, float(lg["qty"]) - sets), 6)
+            naked += lg["naked_qty"]
+        bk["naked_qty"] = round(naked, 6)
+        bk["legs_total"] = n_total
 
     def previous_summary(self) -> Optional[Dict[str, Any]]:
         """The ``/api/paper?run=previous`` body: the newest ENDED run's final snapshot in the §10.1 shape (reads
@@ -3536,7 +3852,8 @@ class PaperEngine:
                             "pnl_liq": p.get("pnl_liq"), "pnl_liq_pct": p.get("pnl_liq_pct"), "pnl_mark": p.get("pnl_mark"),
                             "equity_liq": p.get("equity_liq"), "unvalued": p.get("unvalued"),
                             "depth_unknown_share": p.get("depth_unknown_share"), "verdict": p.get("verdict"),
-                            "verdict_caveats": [CAVEATS[i] for i in VERDICT_CAVEATS]}
+                            "verdict_caveats": [CAVEATS[i] for i in VERDICT_CAVEATS],
+                            "untested": list(p.get("untested") or [])}
         rid = str(rec.get("run_id"))
         try:
             trades = self._persistence.paper_trades(rid, limit=TRADES_MAX)
@@ -3620,7 +3937,7 @@ def _headline_dict(s: PortfolioSummary) -> Dict[str, Any]:
     return {"portfolio_id": s.portfolio_id, "label": s.label, "latency_s": s.latency_s, "pnl_liq": s.pnl_liq,
             "pnl_liq_pct": s.pnl_liq_pct, "pnl_mark": s.pnl_mark, "equity_liq": s.equity_liq, "unvalued": s.unvalued,
             "depth_unknown_share": s.depth_unknown_share, "verdict": s.verdict.to_dict() if s.verdict else None,
-            "verdict_caveats": [CAVEATS[i] for i in VERDICT_CAVEATS]}
+            "verdict_caveats": [CAVEATS[i] for i in VERDICT_CAVEATS], "untested": list(s.untested or [])}
 
 
 def _empty_run(cfg: PaperConfig, fingerprint: str, code_version: str) -> Dict[str, Any]:

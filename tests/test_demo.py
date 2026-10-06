@@ -1183,3 +1183,219 @@ def test_sim_clock_and_no_wait() -> None:
         limiter.acquire()  # a third read inside the simulated minute would have to wait: loud, deterministic
     clock.advance(61)
     limiter.acquire()
+
+
+# --------------------------------------------------------------------------- outside-move scenarios (OUTSIDE_MOVES.md §15)
+
+MOVES_TITLES = {
+    "327": "Will the Democratic Party win the New Hampshire Senate?",
+    "328": "Will the Republican Party win the Ohio Senate?",
+    "329": "Will the Democratic Party win the Wisconsin Governor?",
+    "330": "Will the Republican Party win the Georgia Governor?",
+    "331": "Will the Democratic Party win the Minnesota Senate?",
+    "332": "Will the Republican Party win the Pennsylvania Governor?",
+    "333": "Will the Democratic Party win the Michigan Governor?",
+}
+MOVES_RACES = {
+    "9035": ("2026:SENATE:NH", "D"), "9036": ("2026:SENATE:OH", "R"), "9037": ("2026:GOVERNOR:WI", "D"),
+    "9038": ("2026:GOVERNOR:GA", "R"), "9039": ("2026:SENATE:MN", "D"), "9040": ("2026:GOVERNOR:PA", "R"),
+    "9041": ("2026:GOVERNOR:MI", "D"),
+}
+MOVES_BASE = {"9035": 0.56, "9036": 0.58, "9037": 0.52, "9038": 0.62, "9039": 0.60, "9040": 0.40, "9041": 0.50}
+MOVES_SPREAD = {"9035": 0.01, "9036": 0.02, "9037": 0.02, "9038": 0.02, "9039": 0.01, "9040": 0.02, "9041": 0.01}
+
+
+def moves_market(offset: Optional[Offset] = None, seed: int = 7) -> DemoMarket:
+    return DemoMarket(seed=seed, now=T0, clock=offset if offset is not None else (lambda: 0.0), outside_moves=True)
+
+
+def outside_value(market: DemoMarket, eid: str, venue: str, t: float) -> Optional[float]:
+    quote = market.outside_quote(eid, venue, T0 + t)
+    return None if quote is None else round((quote[0] + quote[1]) / 2, 4)
+
+
+def test_published_outside_move_constants() -> None:
+    assert demo_mod.MOVES_DEMO_VENUES == ("demo-a", "demo-b") and demo_mod.MOVES_DEMO_CYCLE_S == 3600.0
+    assert demo_mod.MOVES_DEMO_MARKET_IDS == tuple(MOVES_TITLES) and demo_mod.MOVES_DEMO_EXCHANGE_IDS == tuple(MOVES_RACES)
+    assert demo_mod.MOVES_DEMO_SCENARIOS == {"lead_short": "9035", "lead_long": "9036", "never": "9037", "thin_spike": "9038",
+                                             "cup_first": "9039", "reverts": "9040", "disagree": "9041"}
+    assert [m[1] for m in demo_mod.MOVES_DEMO_MARKETS] == list(MOVES_TITLES.values())
+    assert demo_mod.MOVES_DEMO_LEAD_SHORT_S == (180.0, 60.0, 300.0, 120.0)
+    assert demo_mod.MOVES_DEMO_LEAD_LONG_S == (480.0, 720.0, 360.0, 600.0)
+
+
+def test_the_default_demo_has_no_outside_move_markets_and_is_unchanged() -> None:
+    plain, moves = make_market(), moves_market()
+    assert len(plain.exchanges) == 34 and len(plain.markets) == 26 and "outside_moves" not in plain.scenario
+    assert len(moves.exchanges) == 41 and len(moves.markets) == 33
+    assert plain.outside_quote("9035", "demo-a", T0) is None and plain.outside_quote("9001", "demo-a", T0) is None
+    # every existing outcome prices, books and trades exactly as in the default demo
+    for ex in plain.exchanges:
+        for t in (-2 * HOUR, 0.0, 95.0, 20 * MIN, 2 * HOUR):
+            assert plain._quote(ex, T0 + t) == moves._quote(moves._exchange_by_id[ex.id], T0 + t), (ex.id, t)
+        assert plain._block(ex, int(T0 // HOUR)) == moves._block(moves._exchange_by_id[ex.id], int(T0 // HOUR))
+    sc = dict(moves.scenario)
+    assert sc.pop("outside_moves") == {"exchange_ids": demo_mod.MOVES_DEMO_SCENARIOS, "cycle_s": 3600.0,
+                                       "venues": ["demo-a", "demo-b"]}
+    assert sc == plain.scenario
+
+
+def test_outside_move_markets_use_the_cup_grammar_one_leg_per_race() -> None:
+    from supermarket_bot.fairvalue import parse_race
+
+    market = moves_market()
+    client = make_client(market)
+    try:
+        rows = {m["id"]: m for m in client.list_markets(tournament_id=TID, status="open")["data"]}
+        for mid, title in MOVES_TITLES.items():
+            assert rows[mid]["title"] == title and not rows[mid]["isMultiOutcome"]
+            assert rows[mid]["settlementDate"] == CUP_END
+        exchanges = {rows[mid]["exchanges"][0]["id"]: rows[mid]["title"] for mid in MOVES_TITLES}
+        assert list(exchanges) == list(MOVES_RACES)
+        keys = []
+        for eid, title in exchanges.items():
+            ref = parse_race(title)
+            assert ref is not None and (ref.race_key, ref.party) == MOVES_RACES[eid]
+            keys.append(ref.race_key)
+        other = {parse_race(m["title"]).race_key for mid, m in rows.items() if mid not in MOVES_TITLES and parse_race(m["title"])}
+        assert len(set(keys)) == 7 and not set(keys) & other  # own races: no basket, no pair
+        quotes, missing = _quotes(client, list(MOVES_RACES))
+        assert missing == [] and all(on_tick(b) and on_tick(a) for b, a in quotes.values())
+        assert {eid: round(a - b, 3) for eid, (b, a) in quotes.items()} == MOVES_SPREAD  # liquid 0.01, medium 0.02
+        for eid in MOVES_RACES:
+            assert market.fair_value_feed(eid, T0) is None  # no fair value: no value ideas, no paper trade (M12)
+    finally:
+        client.close()
+
+
+def test_outside_quotes_follow_the_script_on_both_venues() -> None:
+    m = moves_market()
+    # lead_short: +0.06 over [c+60, c+75] on both venues; back down in cycle 1 (the direction flips)
+    assert outside_value(m, "9035", "demo-a", 59) == 0.56 and outside_value(m, "9035", "demo-a", 75) == 0.62
+    assert outside_value(m, "9035", "demo-a", 67.5) == pytest.approx(0.59, abs=1e-3)
+    assert outside_value(m, "9035", "demo-a", HOUR + 59) == 0.62 and outside_value(m, "9035", "demo-a", HOUR + 75) == 0.56
+    assert outside_value(m, "9035", "demo-a", 2 * HOUR + 80) == 0.62
+    # lead_long: down 0.06 over [c+150, c+180]
+    assert outside_value(m, "9036", "demo-a", 150) == 0.58 and outside_value(m, "9036", "demo-a", 180) == 0.52
+    assert outside_value(m, "9036", "demo-a", HOUR + 180) == 0.58
+    # never: +0.07 at c+240..270 in even cycles, back at c+900..930 in odd cycles
+    assert outside_value(m, "9037", "demo-a", 270) == 0.59 and outside_value(m, "9037", "demo-a", HOUR + 899) == 0.59
+    assert outside_value(m, "9037", "demo-a", HOUR + 930) == 0.52 and outside_value(m, "9037", "demo-a", 2 * HOUR + 270) == 0.59
+    # cup_first: the outside moves at c+660..690; reverts: up at c+540..570, back at c+780..840
+    assert outside_value(m, "9039", "demo-a", 659) == 0.60 and outside_value(m, "9039", "demo-a", 690) == 0.66
+    assert [outside_value(m, "9040", "demo-a", t) for t in (539, 570, 780, 810, 840)] == [0.40, 0.46, 0.46, 0.43, 0.40]
+    assert outside_value(m, "9040", "demo-a", HOUR + 570) == 0.34  # cycle 1: down, then back
+    # spikes only on venue A: the thin single print and the wide, thin book (9038); the lone mover (9041)
+    a, b = m.outside_quote("9038", "demo-a", T0 + 120), m.outside_quote("9038", "demo-b", T0 + 120)
+    assert a == (0.7, 0.72, 500.0, 500.0) and outside_value(m, "9038", "demo-b", 120) in (0.615, 0.62, 0.625)
+    assert m.outside_quote("9038", "demo-a", T0 + 134)[:2] == (0.7, 0.72)
+    assert m.outside_quote("9038", "demo-a", T0 + 135)[:2] == (0.61, 0.63)  # gone before the next 15-s poll
+    assert m.outside_quote("9038", "demo-a", T0 + 500) == (0.64, 0.72, 20.0, 20.0)  # 8 pts wide, 20 at the touch
+    assert m.outside_quote("9038", "demo-a", T0 + 601) == (0.61, 0.63, 500.0, 500.0)
+    assert b[2:] == (500.0, 500.0) and m.outside_quote("9038", "demo-b", T0 + 500)[2:] == (500.0, 500.0)
+    assert outside_value(m, "9041", "demo-a", 315) == 0.55 and outside_value(m, "9041", "demo-a", 915) == 0.50
+    assert outside_value(m, "9041", "demo-b", 315) in (0.495, 0.5, 0.505)
+    assert outside_value(m, "9041", "demo-a", HOUR + 315) == 0.45  # cycle 1: the other way
+    # nothing for other outcomes, other venues, or before the history start; nothing scripted before t0
+    assert m.outside_quote("9001", "demo-a", T0) is None and m.outside_quote("9035", "polymarket", T0) is None
+    assert m.outside_quote("9035", "demo-a", m.history_start - 1) is None
+    assert outside_value(m, "9035", "demo-a", -HOUR + 75) == 0.56
+
+
+def test_venue_b_jitters_a_quarter_of_its_15_second_buckets() -> None:
+    m = moves_market()
+    diffs = []
+    for i in range(400):
+        a = m.outside_quote("9037", "demo-a", T0 - 2 * HOUR + 15 * i)
+        b = m.outside_quote("9037", "demo-b", T0 - 2 * HOUR + 15 * i)
+        assert round(a[1] - a[0], 3) == round(b[1] - b[0], 3) == 0.02  # the same spread
+        diffs.append(round(b[0] - a[0], 3))
+        assert all(on_tick(p) or abs(p * 1000 - round(p * 1000)) < 1e-6 for p in a[:2] + b[:2])
+    assert set(diffs) <= {-0.005, 0.0, 0.005}
+    share = sum(1 for d in diffs if d) / len(diffs)
+    assert 0.15 < share < 0.35
+    # one 15-s bucket, one jitter: two times inside the same bucket give the same quote
+    bucket = math.floor((T0 + 1000) / 15.0) * 15.0
+    assert m.outside_quote("9037", "demo-b", bucket) == m.outside_quote("9037", "demo-b", bucket + 14.9)
+
+
+def test_cup_mids_follow_the_scripted_cup_moves() -> None:
+    m = moves_market()
+
+    def mid(eid: str, t: float) -> float:
+        return m.mid_at(eid, T0 + t)
+
+    # lead_short: the Cup follows 180 s after the outside move in cycle 0 (60 s in cycle 1), +0.045 over 120 s
+    assert mid("9035", 239) == pytest.approx(mid("9035", 0), abs=0.005)
+    assert round(mid("9035", 360) - mid("9035", 239), 3) == 0.045
+    assert round(mid("9035", HOUR + 240) - mid("9035", HOUR + 119), 3) == -0.045
+    # lead_long: down 0.045 over [c+630, c+750] in cycle 0 (L = 480), back up over [c+870, c+990] in cycle 1 (L = 720)
+    assert round(mid("9036", 750) - mid("9036", 629), 3) == -0.045
+    assert round(mid("9036", HOUR + 990) - mid("9036", HOUR + 869), 3) == 0.045
+    # cup_first: the Cup moves at c+360..480, before the outside (c+660)
+    assert round(mid("9039", 480) - mid("9039", 359), 3) == 0.045
+    # the other scenarios' Cup prices only carry the (small) noise
+    for eid in ("9037", "9038", "9040", "9041"):
+        assert all(abs(mid(eid, t) - MOVES_BASE[eid]) <= 0.01 for t in range(0, int(2 * HOUR), 300)), eid
+
+
+def test_no_new_surge_from_the_scripted_cup_moves() -> None:
+    """Every scripted Cup move is 0.045 over >= 120 s and the noise is held around it: no 5-minute change reaches the
+    surge detector's 0.05 and no hour its 0.08 (the Surges view stays unchanged), over 3 hours of 30-s snapshots."""
+    from supermarket_bot import analytics
+    from supermarket_bot.models import PricePoint
+
+    for seed in (7, 3):
+        m = moves_market(seed=seed)
+        for eid in MOVES_RACES:
+            ex = m._exchange_by_id[eid]
+            pts = []
+            for i in range(-24 * 120, 3 * 120 + 1):
+                ts = T0 + 30.0 * i
+                q = m._quote(ex, ts)
+                pts.append(PricePoint(ts=ts, price=q[0], last=q[0], bid=q[1], ask=q[2]))
+            mids = [p.price for p in pts]
+            live = len(mids) - 3 * 120 - 1
+            for i in range(live, len(mids)):
+                assert max(abs(mids[i] - mids[j]) for j in range(i - 11, i)) <= 0.045 + 1e-9, (seed, eid, i)
+                assert max(abs(mids[i] - mids[j]) for j in range(i - 121, i)) < 0.08, (seed, eid, i)
+            for i in range(live, len(pts), 4):
+                found = analytics.detect_surges(pts[: i + 1], pts[i].ts, eid, ex.market.id)
+                assert found == [], (seed, eid, found)
+
+
+def test_the_demo_outside_venue_polls_the_scripted_quotes() -> None:
+    from supermarket_bot.fairvalue import MatchTarget
+
+    m = moves_market()
+    venue = demo_mod.DemoOutsideVenue(m, "demo-a")
+    targets = [MatchTarget(exchange_id=eid, market_id=mid, title=MOVES_TITLES[mid])
+               for mid, eid in zip(MOVES_TITLES, MOVES_RACES)] + [MatchTarget("9001", "301", "Other")]
+    result = venue.poll(targets, T0 + 75.0, deadline=T0 + 85.0)
+    assert (result.venue, result.status, result.requests, result.errors) == ("demo-a", "ok", 0, [])
+    assert set(result.quotes) == set(MOVES_RACES)  # only the scripted outcomes
+    q = result.quotes["9035"]
+    assert (q.venue, q.external_id, q.label) == ("demo-a", "demo-a:9035",
+                                                 "Demo venue A: Will the Democratic Party win the New Hampshire Senate?")
+    assert (q.bid, q.ask, q.last, q.mid, q.spread) == (0.615, 0.625, None, 0.62, 0.01)
+    assert (q.bid_size, q.ask_size, q.fetched_at, q.match_kind, q.match_confidence) == (500.0, 500.0, T0 + 75.0, "EXACT", 1.0)
+    assert venue.budget() == {"used": 0, "limit": 0} and venue.close() is None
+    b = demo_mod.DemoOutsideVenue(m, "demo-b").poll(targets, T0 + 75.0)
+    assert b.quotes["9035"].label.startswith("Demo venue B: ") and b.quotes["9035"].external_id == "demo-b:9035"
+    assert venue.poll(["9036", "9001"], T0).quotes.keys() == {"9036"}  # bare exchange ids work too
+    # deterministic: a second market with the same seed and start answers the same
+    again = demo_mod.DemoOutsideVenue(moves_market(), "demo-a").poll(targets, T0 + 75.0)
+    assert {k: v.to_dict() for k, v in again.quotes.items()} == {k: v.to_dict() for k, v in result.quotes.items()}
+    # never raises
+    broken = demo_mod.DemoOutsideVenue(SimpleNamespace(outside_quote=lambda *a: 1 / 0), "demo-a")
+    failed = broken.poll(targets, T0)
+    assert failed.status == "error" and failed.quotes == {} and failed.errors
+
+
+def test_the_outside_move_demo_is_deterministic() -> None:
+    a, b = moves_market(), moves_market()
+    times = [T0 + 15 * i for i in range(0, 480, 7)]
+    for eid in MOVES_RACES:
+        assert [a.outside_quote(eid, v, t) for v in ("demo-a", "demo-b") for t in times] == \
+               [b.outside_quote(eid, v, t) for v in ("demo-a", "demo-b") for t in times]
+        assert [a.mid_at(eid, t) for t in times] == [b.mid_at(eid, t) for t in times]

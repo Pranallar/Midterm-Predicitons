@@ -770,7 +770,10 @@ class MarketObservation(_Serializable):
     books: Dict[str, BookObservation] = field(default_factory=dict)  # the newest observation per exchange
     trades: Dict[str, List[TradeRecord]] = field(default_factory=dict)  # tape read since the paper cursor, oldest first
     settlements: Dict[str, SettlementInfo] = field(default_factory=dict)
-    open_ids: Set[str] = field(default_factory=set)  # outcomes on the open list AND quoted by the last bulk read
+    # outcomes on the open list AND quoted by the last bulk read. None = not given (the engine then treats every
+    # quoted outcome as open); an EMPTY set means no outcome is open (e.g. a platform-wide halt), so every
+    # position freezes.
+    open_ids: Optional[Set[str]] = None
     infos: Dict[str, ExchangeInfo] = field(default_factory=dict)
     fair_values: Dict[str, FairValue] = field(default_factory=dict)
     races: Dict[str, RaceRef] = field(default_factory=dict)
@@ -835,7 +838,9 @@ class PaperConfig(_Serializable):
     max_tape_pages: int = 3  # follow the tape cursor this many pages when a page comes back full (200)
     book_depth: int = 20
     interval_s: float = 30.0  # the step interval (covered hours count gaps up to 3 x this, §6.11)
-    gap_cancel_s: float = 300.0  # after a gap longer than this, resting orders count as cancelled at the last step before it
+    # after a gap longer than this, resting orders count as cancelled at the last step before it (D48: prints from
+    # the downtime never fill them); a cancel decided while running lands after the portfolio's latency instead
+    gap_cancel_s: float = 300.0
     min_latency_s: float = 2.0  # a fill uses only observations at least this long after the decision
     max_fill_delay_s: float = 120.0  # a taker order with no usable observation by then expires unfilled
     stale_quote_s: float = 120.0  # no decisions, fills or exits on an outcome whose bulk quote is older
@@ -1068,6 +1073,9 @@ class Verdict(_Serializable):
     swing_share: Optional[float] = None  # |national tilt| x national_swing_sd_pts / equity: one-swing exposure
     top_race_share: Optional[float] = None  # largest single race's share of |pnl_liq|
     synthetic_excluded: int = 0  # replays: ideas with candle / synthetic fills left out
+    # ---- added by the engine fixes after revision 2 ----
+    synthetic_pnl: float = 0.0  # P&L of those synthetic ideas: NOT in pnl_liq / the sentence / the guards
+    untested: List[str] = field(default_factory=list)  # kinds this portfolio trades that could not be tested (why)
 
 
 @dataclass
@@ -1116,6 +1124,12 @@ class PortfolioSummary(_Serializable):
     # kind -> {"entries", "filled", "fill_rate", "avg_slippage", "unfilled", "unfilled_pnl_now", "exits", "avg_exit_slippage"}
     execution: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     no_trade_reason: Optional[str] = None  # plain sentence when the portfolio has no fills (why: no data vs no edge)
+    # ---- added by the engine fixes after revision 2 ----
+    # one sentence per kind this portfolio trades that the run could NOT test (e.g. value ideas while outside fair
+    # values were off or offline), shown next to the verdict whether or not the portfolio has fills
+    untested: List[str] = field(default_factory=list)
+    legging_trades: int = 0  # legging-residue exits of still-open sets (not closed ideas; not in the win rate)
+    legging_pnl: float = 0.0
 
 
 @dataclass

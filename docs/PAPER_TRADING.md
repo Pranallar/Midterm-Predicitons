@@ -391,10 +391,17 @@ match, probability, uncertainty, source, note, updated_at`; `#` lines are commen
   `ConnectError`), DNS failure or timeout ends this provider's refresh at once with status
   `"offline"` (no further calls that refresh). HTTP 429 -> honour `Retry-After` capped at
   `MAX_RETRY_AFTER_S` (600 s; else the backoff) as `next_try_at`; 5xx -> `"error"`. Consecutive
-  failures back off through `BACKOFF_S` (30, 60, 120, 300, 600 s) via `next_try_at`; a refresh
-  during backoff returns status `"backoff"` with no requests. Error texts are one sentence, e.g.
-  "Polymarket is unreachable from this machine (connection refused by the network proxy): no
-  outside fair value from Polymarket." Never fake a value.
+  failures back off through `BACKOFF_S` (30, 60, 120, 300, 600 s) via `next_try_at`. A refresh
+  during backoff makes no request and keeps the **real cause first** (live-4): after an offline
+  failure (connect, proxy refusal, DNS, timeout or transport error) it returns status `"offline"`
+  with `next_try_at`, `errors[0]` the cause ("Polymarket is unreachable from this machine (...)")
+  and `errors[1]` "No request to Polymarket until <time> (waiting after repeated failures)."; after
+  other failures (429, 5xx) it returns `"backoff"`, again with the cause first and the "backing off
+  ... next try at" text second. Error texts are one sentence, e.g. "Polymarket is unreachable from
+  this machine (connection refused by the network proxy): no outside fair value from Polymarket."
+  Never fake a value. A provider's `last_ok_at` is set only when the venue actually answered
+  (requests > 0, or it returned quotes, matches or rejections), so a venue that never answered
+  never shows a "last answer".
 * Do not use `GET /price` (side semantics conflict) or the POST batch endpoints.
 
 ### 4.5 Kalshi provider (`https://api.elections.kalshi.com/trade-api/v2`, no auth for reads)
@@ -516,9 +523,13 @@ decision (B, `longshot_shrink`).
   after releasing its lock); reloads the map if changed; computes races (`races_for` with the map's
   overrides) and targets.
 * `refresh(now)`: `map.reload_if_changed()`; `manual.load()`; each provider
-  `refresh(targets, now, deadline=now + REFRESH_DEADLINE_S)` (sequentially); normalise, blend,
-  combine, renormalise; record; keep the snapshot. Never raises (an unexpected exception becomes
-  `snapshot.errors` and a log warning).
+  `refresh(targets, now, deadline=now + REFRESH_DEADLINE_S)` (sequentially; only when there is at
+  least one active target: before `set_targets` the providers are not asked and their status stays
+  `"pending"`, live-4); normalise, blend, combine, renormalise; record; keep the snapshot. Never
+  raises (an unexpected exception becomes `snapshot.errors` and a log warning). `now` stays the base
+  of the provider deadlines, the blend age and the manual read; the **publish time** is `now` plus
+  the time the providers took on the service clock, and never earlier than the newest provider
+  quote's `fetched_at` (lookahead-2).
 * **Recording** (for replays, D24, D59): call `recorder(records)` with one `FairValueRecord` per
   outcome whose value, bid or ask moved by at least `FV_RECORD_MIN_CHANGE` (one tick), or whose
   `usable`, `confidence` or `suspect` changed, since its last record, plus a heartbeat record for
@@ -526,9 +537,14 @@ decision (B, `longshot_shrink`).
   FairValue.as_of), `venues` (venues whose quotes were used) and a compact `detail`
   `{"as_of", "venues", "match_kind", "match_confidence", "uncertainty", "prev_value", "suspect"}`
   (no reason text, no `sources`). After every refresh also call
-  `refresh_recorder(FairValueRefresh(ts=now, venues={venue: {"status", "fetched_at"}}))` (one row
-  per refresh: it proves that unchanged values were re-confirmed, so the replay knows their real
-  age). Recorder exceptions are caught.
+  `refresh_recorder(FairValueRefresh(ts=<publish time>, venues={venue: {"status", "fetched_at"}}))`
+  (one row per refresh: it proves that unchanged values were re-confirmed, so the replay knows their
+  real age). **Records, the refresh row and the snapshot (`at`, `last_refresh_at`) are stamped with
+  the publish time** (when the refresh returned), not the refresh start, so every record has `as_of
+  <= ts` and a replay's `ts <= t - latency_s` rule never trades on a value before it was fetched
+  (lookahead-2); manual values keep their record time (their `updated_at` is not an availability
+  time). An "ok" venue without quotes and the manual row use the refresh start as their
+  `fetched_at` (the cautious stamp). Recorder exceptions are caught.
 * `current()` is a deep-enough copy (callers may not mutate shared state); `races()`,
   `targets()`, `matches()` (one `MatchRow` per target), `status()` =
   `{"mode", "enabled", "last_refresh_at", "usable", "total", "providers": {name: {"status",
@@ -655,9 +671,12 @@ Common rules for every idea it returns:
   buys the opposite contract of an earlier (higher-score) idea's leg on the same exchange gets a
   risk line "Conflicts with ..."; a carry opposite an arbitrage/basket leg is dropped as before.
   When an engine-violation `arbitrage` idea buys exactly the legs and sides of a `basket` idea,
-  emit only the basket (it carries the exit plan). **Two value ideas on different legs of one race
-  that bet on different winners** (YES on two legs, or NO on two legs) are an unbalanced partial set
-  priced on possibly inconsistent fair values: keep only the higher-score one (D38).
+  emit only the basket (it carries the exit plan). **A race gets at most one value idea** (D38):
+  two value ideas on different legs of one race that bet on different winners (YES on two legs, or
+  NO on two legs) are an unbalanced partial set priced on possibly inconsistent fair values, and two
+  that bet on the **same** winner (YES on the D leg plus NO on the R leg) are one bet on one race
+  outcome that would get two full Kelly sizes; in both cases keep only the higher-score one
+  (strategy-2).
 * `watch` ideas keep `order_type = "taker"`, `bet = None`, `exit_plan = None` and are never traded.
 
 ### 5.2 `value` ideas (`value_opportunity`)
@@ -716,8 +735,12 @@ imported history in replays: `history_fv_max_age_s`):
   `SLOW_COUNT_STATES`; else None. Markets settling before the Cup end never get one. (A position
   whose EV leans on the uncalled branch is therefore flat before the closeout window.)
 * `called_prob(race, fav, params)`: `fav >= 0.95` -> `called_prob_safe` (0.97; 0.80 if the state
-  is in `RCV_STATES`); state in `SLOW_COUNT_STATES` -> `called_prob_slow` (0.40); known race
-  elsewhere -> `called_prob_fast` (0.85); no race -> the mean of fast and slow.
+  is in `RCV_STATES` or the race is chamber control); state in `SLOW_COUNT_STATES` -> `called_prob_slow`
+  (0.40); known race elsewhere -> `called_prob_fast` (0.85); no race -> the mean of fast and slow.
+  **Chamber control** (office `HOUSE_CONTROL` / `SENATE_CONTROL`, state "US", `strategy.is_chamber`)
+  counts as a slow count everywhere a state's count speed matters (`called_prob`, the regime exit
+  rule, a set's riskless test): it is decided by the last seats counted (slow counts such as CA, AZ
+  and NV), so it is often uncalled at the closeout (strategy-6).
 * Rationale (examples of the required content, wording free): fair value with source,
   confidence, uncertainty and age; the gap at the ask and the required edge; the exit target and
   what it banks; the regime sentence from `regime_ev`; depth at the limit when known. Risks:
@@ -925,7 +948,11 @@ For one idea (`size`), with `W = ctx.equity`:
   national swing toward Democrats, `sum(qty x factor_delta)` over open positions and pending entries,
   set legs excluded. A new directional position may not push `|tilt_after| *
   params.national_swing_sd_pts` above `tilt_cap * W` (conservative: a one-standard-deviation,
-  3-point national polling miss may cost at most 10% of equity), unless it reduces `|tilt|`. A
+  3-point national polling miss may cost at most 10% of equity), unless it reduces `|tilt|`; a
+  position against an over-cap tilt may take it through zero and then only up to the cap on the
+  other side: `units <= (tilt_cap x W / national_swing_sd_pts - sign(delta) x tilt) / |delta|`, never
+  the old `max(cap, |tilt|)` bound that let it flip an over-cap tilt to the same size the other way
+  (strategy-7). A
   toss-up YES share has delta `phi(0) / 7 = 0.057` per point, so the cap allows about 58,500
   toss-up shares on 100,000 (the old 30%-of-cost cap allowed 60,000, i.e. the same at toss-ups,
   but it also charged a 0.95 safe seat 0.95 per share although its delta is only 0.015).
@@ -942,13 +969,16 @@ For one idea (`size`), with `W = ctx.equity`:
   SUSQies left after pending orders)", "The book offers 1,850 shares up to 0.545".
 * `size_all(opps, ctx)`: sort by `score` desc then `idea_id`; size each in turn against
   exposure (cost, race, tilt, directional slots) and free cash updated by the earlier decisions;
-  return `{idea_id: SizeDecision}`. `size(opp, ctx)` sizes one idea against the given exposure only
-  (what the Strategy view shows: every card is sized as if it were the only new idea).
+  return `{idea_id: SizeDecision}`. `size(opp, ctx)` sizes one idea against the given exposure only.
+  The Strategy view sizes its cards with `size_all` (best score first; the chaser's bold bet funded
+  first), exactly as the paper engine does, so the card sizes add up within the caps, the slate rule,
+  `top_k` and the one bold bet; each later card says what the ideas before it take ("Sized after the
+  N ideas funded before it, which take X SUSQies: the card sizes add up", strategy-1).
 
 #### 5.6.2 `ConservativePolicy` (`name="conservative"`)
 
 `kelly_mult 0.25`, `idea_cap 0.08`, `riskless_cap 0.08` (riskless and bounded sets), `total_cap
-0.60`, `race_cap 0.12`, `tilt_cap 0.10` (swing cap). With an empty exposure, `equity = cash` and
+0.60`, `race_cap 0.12`, `tilt_cap 0.10` (swing cap). With an empty exposure and `equity = cash` and
 **no stored book** it reproduces the legacy sizes of `fade_opportunity`, `carry_opportunity` and
 `arbitrage_opportunities` exactly (existing tests); with a stored book the depth-walked rule may
 give fewer shares than the legacy "Kelly at the touch, then cap by depth" rule: B updates exactly
@@ -1025,12 +1055,21 @@ Rules that apply in every chaser mode except `out_of_reach`:
   selected directional ideas with `settles_before_cup_end` True or `called_prob >= 0.85`, the
   best-scored one whose cost `c` (expected average fill, else the touch) satisfies `c <=
   bold_max_cost(bar, W) = cap * W / (bar - W + cap * W)` (W 100,000, bar 221,500, cap 60%: c <=
-  0.3306) and whose depth (when known) holds the units gets `stake = min((bar - W) * c / (1 - c),
-  SWING_BOLD_CAP_PCT * W, free cash)`, `units = floor(stake / c)`, `bold=True`, line "Bold bet: if it
-  wins, your value reaches the 221,500 bar; it loses 52,071 otherwise" (c 0.30). If no idea qualifies,
-  every idea is sized as `chase` and the line says why ("No bold bet: the cheapest qualifying
-  contract costs 0.45; above 0.33 even a 60% stake cannot reach the bar (it would win to 173,333),
-  so a swing would waste the variance"). Never two bold bets: their win states would not be joint.
+  0.3306) gets `units = floor((bar - W) / (1 - c))` (the stake whose 1/0 win reaches the bar, `c`
+  re-priced at that size on the book's average fill, or at the **limit** when the depth is unknown),
+  `bold=True`, line "Bold bet: if it wins, your value reaches the 221,500 bar; it loses 52,071
+  otherwise" (c 0.30) -- **only if that stake can be funded now** (strategy-4): at most
+  `SWING_BOLD_CAP_PCT` (60%) of W, within the book's depth, the total cap and the free cash (reserved
+  at the limit). The bold bet is funded first, so better-scored ideas cannot use up its cash; the
+  output stays in score order. If no idea qualifies, every idea is sized as `chase` and the line says
+  why ("No bold bet: the cheapest qualifying contract costs 0.45; above 0.33 even a 60% stake cannot
+  reach the bar (it would win to 173,333), so a swing would waste the variance", or "No bold bet: the
+  free cash (20,000 SUSQies, reserved at the 0.285 limit) cannot fund a stake that reaches the bar
+  ..."). A bold bet is a binary held to its 1/0 result: its decision carries `sizing.bold_exit_plan(opp)`
+  (kind "settle", `hold_to_resolution`, no target, no dynamic fair-value target, no stop and no time
+  stop; only the idea's `exit_before_ts` regime exit is kept) and the engine stores that plan for the
+  entry (strategy-3), because a convergence or bracket exit could never produce the win state the
+  stake was sized for. Never two bold bets: their win states would not be joint.
 * Set kinds (riskless or bounded): `CHASER_BASKET_CAP_PCT` (20%) per set (D27); fixed kinds: the
   conservative rule. Hard caps and "never more than the free cash" apply in every mode.
 
@@ -1046,9 +1085,15 @@ multiplied", and "Sizes never exceed the free cash".
 `build_report` keeps its signature and adds keyword-only `fair_values=None, races=None,
 settlement_regime="unknown", leaderboard=None, bar=None, sizing="conservative", params=None,
 fair_value_status=None, recent_mids=None`. It builds a `StrategyInputs` from its arguments, calls
-`generate_signals`, sizes every idea with `get_policy(sizing).size(opp, ctx)` where `ctx` =
-`SizingContext(now, equity = sizing basis (balance else initial else 100,000), cash = free_cash =
-equity, start_capital = initial, cup_end, days_left, bar, my_rank, regime, params)`, sets
+`generate_signals`, sizes every idea **jointly** with `get_policy(sizing).size_all(signals, ctx)`
+(and the other policy's `size_all` for `alt_sizing`) where `ctx` = `SizingContext(now, equity =
+account_value (cash plus positions: the basis of the bar and the leaderboard, as the engine's
+equity_liq) else balance else initial else 100,000, cash = free_cash = balance (else the same
+fallback), exposure = ExposureSummary(gross_cost = account_value - balance), start_capital =
+initial, cup_end, days_left, bar, my_rank, regime, params)` (strategy-5: the chaser's `M` is bar /
+account value, never bar / cash; the sizing panel explains the basis, and says `M` may be overstated
+when the account value is unknown); the chaser's bold card gets `sizing.bold_exit_plan` (held to
+settlement); sets
 `suggested_shares = units`, `suggested_cost = round(units * (avg_cost or entry_price), 2)`, `sizing
 = decision.to_dict()`, `alt_sizing` = the other policy's decision, makes the rationale's size
 sentence agree with the decision (fade, carry and arbitrage keep their legacy sentence format so
@@ -1123,7 +1168,17 @@ every other portfolio is **exploratory** (§6.9). Per-portfolio latency: an orde
 Every portfolio starts with the same capital. Start capital, in order: `PaperConfig.start_capital`
 / the reset request's value ("set by you"); the real account value ("account value"); the real cash
 ("cash"); the tournament's initial balance ("initial balance"); 100,000 ("default 100,000"). The
-runner passes the value and its source to `engine.start`. Portfolios are independent what-ifs: they
+runner passes the value and its source to `engine.start`. A run that had to start on "default
+100,000" is **re-based** (ui-4, `PaperEngine._rebase_default_capital`, at the top of `step()`) to the
+account value (or cash, or initial balance) as soon as the inputs carry one, provided nothing has
+filled yet in any portfolio (no fill, position, trade or closing leg) and no final snapshot exists:
+orders already sized on the default are withdrawn (cancelled, "Start capital set from your account
+value (X SUSQies): this order was sized on the default 100,000 and is placed again at the new size"),
+the books are rebuilt at the new capital, stored equity points rewritten, and the ideas sized again in
+the same step. Portfolios with their own `spec.start_capital` are left alone, and replays never
+re-base (`rebase_default_capital=False`: a replay's capital is fixed). The threaded tracker also
+waits for its first context refresh before the first paper step (§7.2), so this is rare; a run that
+keeps "default 100,000" says so on the Simulation view. Portfolios are independent what-ifs: they
 share signals and reads but not liquidity, cash or positions.
 
 ### 6.2 One step (`run_step` and `PaperEngine.step`)
@@ -1149,14 +1204,21 @@ order**, then persists:
    `StepReport.gap_s` is set.
 1. **Settlements and closures first** (§6.6, D23): settle positions, cancel orders on settled or
    closed outcomes. Nothing fills on an outcome that settled or left `obs.open_ids`.
+   `MarketObservation.open_ids` is `Optional`: `None` means "not given" (every quoted outcome counts
+   as open); an **empty** set means no outcome is open (e.g. a platform-wide halt), so every position
+   freezes (fills-3).
 2. **Taker fills** for orders with status `pending` (§6.3). Orders whose `created_at +
    max_fill_delay_s < now` (their portfolio's value) and are still unfilled expire ("No order book
    read within 120 s of the decision: not filled").
 3. **Maker fills** for `resting` and `cancelling` orders from `obs.trades` (§6.4). A resting
    order whose idea was absent from `signals` for `maker_cancel_after_missing_steps` (2)
    consecutive steps, or whose `expires_at` passed, becomes `cancelling` with `cancel_at` = that
-   step's time (or `expires_at`): the real order would have rested until then, so prints up to
-   `cancel_at` still fill it. It closes (`cancelled` / `expired`, "The conditions for this
+   step's time **plus the portfolio's latency** (a cancel takes as long to land as a placement: 240 s
+   for the human headline, which therefore still takes the adverse fills of a news sweep in those
+   minutes, fills-2), or `expires_at` (set when the order was placed): the real order would have
+   rested until then, so prints up to `cancel_at` still fill it; until `cancel_at` the read plan
+   treats it as a resting order. The downtime cancel of step 0 stays at the last step before the gap
+   (D48). It closes (`cancelled` / `expired`, "The conditions for this
    resting order no longer hold" / "Expired unfilled") at the first step whose tape for that
    exchange was read after `cancel_at`, or `max_fill_delay_s` after `cancel_at` without such a
    read (no further fills).
@@ -1269,7 +1331,9 @@ for) so exit slippage is reported (§6.13).
 4. Target: `target_bid` and bid >= target -> "target", limit = `target_bid - 0.005`, planned
    `target_bid`; value positions with `dynamic_fv_target` and a usable current fair value use
    `target = floor_tick(fv_contract - half_spread - exit_buffer)` instead (reason "fair_value" when
-   the fair value moved, "converged" otherwise). **Baskets** (D29): when the touch per-set proceeds
+   the fair value moved, "converged" otherwise), with `fv_contract` shrunk by the same longshot rule
+   as the idea (`q < 0.15 -> q x (1 - longshot_shrink)`, `_fv_for_exit`, strategy-9), so the engine
+   never waits to sell above the idea's own fair value. **Baskets** (D29): when the touch per-set proceeds
    `sum(contract bids of the legs) - set cost >= min_set_profit`, evaluate the **depth-walked**
    proceeds of selling the whole set quantity: `depth.liquidation_proceeds` of each leg's qty into
    that leg's sell levels from its newest real book at most `mark_book_max_age_s` old; exit
@@ -1280,10 +1344,18 @@ for) so exit slippage is reported (§6.13).
 6. A chaser `replaces` decision names this position -> "replaced", limit = touch bid - 0.005.
 7. `hold_to_resolution` or none fired: keep.
 
+A **bold** entry (the chaser's bold-to-goal bet, §5.6.4) stores `sizing.bold_exit_plan(opp)` instead
+of the idea's plan (the shared idea is not mutated): no target, no dynamic fair-value target, no stop
+and no time stop; it closes only by settlement, the regime exit, the end of the Cup or run, or an
+explicit "replaced" (strategy-3).
+
 **Legging out** (D29): when some legs of a basket exit group have filled (wholly or partly) and
 another leg is still unfilled `max_fill_delay_s` after the group's creation (or its order expired),
 the remainder of every leg is force-exited at limit 0.005 with reason "legging" (a set with one leg
-sold is a naked position, not a basket). A position with a pending exit order gets no second one.
+sold is a naked position, not a basket). Once a leg has sold and the legs are unmatched (or the exit
+already is a legging exit), the group is stuck when **any** leg's exit order expired or the group is
+past `max_fill_delay_s`, whether or not that leg partly filled (accounting-2); leftover unmatched legs
+are never re-evaluated as a new basket. A position with a pending exit order gets no second one.
 The trade's `exit_reason` is the reason of the exit order that closed it (a basket closed partly by
 "converged" and partly by "legging" records "legging").
 
@@ -1302,7 +1374,9 @@ The trade's `exit_reason` is the reason of the exit order that closed it (a bask
   `closed_no_ruling`, no orders, no exits; they unfreeze if the outcome reappears. **Frozen
   positions are "unvalued"** (D45): they count 0 in `equity_liq` and `pnl_liq`;
   their last liquidation value is shown separately (`PortfolioSummary.unvalued`) and the verdict
-  sentence names how many there are. Such closures often follow news, so the last mark could hide a
+  sentence names how many there are. `unrealized_pnl_liq` charges them at `-cost`, and their
+  `positions[]` row shows what the totals charge: `liq_value` 0, `unrealized_liq = -cost`, `unvalued`
+  True, the stale mark in `last_liq_value` (realised + unrealised = total, accounting-8). Such closures often follow news, so the last mark could hide a
   loss.
 * At and after `cup_end`: no entries and no exits; positions keep their last liquidation value,
   flag `post_cup`, until settled.
@@ -1313,10 +1387,20 @@ Per open position, every step (D31):
 
 * `liq_value, depth_state = liquidation_value(side, qty, book, quote, last_real_book=, now=, config=)`:
   * **fresh**: the newest REAL observation for the exchange (never `source == "synthetic"`) at most
-    `mark_book_max_age_s` (900 s) old **and** consistent with the quote (its best level within one
-    tick of the touch); walked with `depth.liquidation_proceeds`; shares beyond its depth are worth 0;
+    `mark_book_max_age_s` (900 s) old; when the quote is at least as new as the book, the book must be
+    consistent with it (best level within one tick of the touch); a book read **after** the quote, or
+    while the quote is older than `stale_quote_s`, defines the touch itself (an old quote never
+    overrules a newer book, and a newer book with no bids is worth 0; this check runs before the
+    "quote has no bid" shortcut, fills-4); walked with `depth.liquidation_proceeds`; shares beyond its
+    depth are worth 0;
   * **stale**: else the last real book at most `mark_depth_max_age_s` (1 h) old, its sell levels
-    shifted so the best equals today's touch bid (`depth.shift_levels`), walked the same way;
+    shifted so the best equals today's touch bid (`depth.shift_levels`; unshifted when that book is
+    newer than the quote), walked the same way;
+  * in every state the portfolio's **own consumed liquidity** (§6.3, D35) is subtracted from the
+    contract sell levels before they are walked (`adjust_levels`, so marks and fills agree on depth:
+    a mark never re-sells into bids this portfolio already sold into, e.g. the rung its own partial
+    exit just took, fills-1, accounting-5); the consistency check and the shift use the raw levels, and
+    the stale shift is by the raw book's offset;
   * **unknown**: else `min(qty, depth_unknown_full_shares) x touch + max(0, qty - 100) x touch x (1 -
     depth_unknown_haircut)` (100 shares at the touch, the rest at half of it: a 21,000-share position
     on an unseen book is never valued as if it all sold at the touch);
@@ -1328,9 +1412,14 @@ Per open position, every step (D31):
 * Portfolio: `positions_liq = sum(liq_value of open, non-frozen positions)`, `equity_liq = cash +
   positions_liq - outstanding collateral advances`; likewise `equity_mark`, `equity_fv` (positions
   without a fair value count at liquidation value; None when no position has one). `pnl_liq =
-  equity_liq - start_capital`; `unrealized_pnl_liq = positions_liq - cost of open positions`;
+  equity_liq - start_capital`; `unrealized_pnl_liq = positions_liq - cost of open positions` (frozen
+  positions at `-cost`);
   `unvalued` = last liquidation value of frozen positions; `depth_unknown_share` /
   `depth_stale_share` = the share of `equity_liq` in positions marked "unknown" / "stale".
+* `PortfolioSummary.by_kind[kind]` (`pnl_realized`, `pnl_unrealized_liq`, `pnl_liq`, `trades_closed`,
+  `wins`, `win_rate`, `fills`, `positions_open`) adds up to the portfolio: the realised P&L of legs
+  already sold from a half-closed basket counts in its kind's row, and closed ideas and wins come
+  from the `IdeaOutcome`s (accounting-7).
 * The read plan re-reads mark books largest liquidation value first (§6.10).
 * Drawdown: running peak of `equity_liq`; `max_drawdown_abs = max(peak - equity_liq)`,
   `max_drawdown = max((peak - equity_liq) / peak)`.
@@ -1378,7 +1467,11 @@ highlighted. Revision 2:
 P&L (`liq_value - cost` of the open quantity + partial realised P&L); `entered_at` = the entry
 order's decision time; `direction` = "D"/"R"/"N"; `race_key` (else `market:<id>`); `cost`;
 `synthetic` (any synthetic fill, replays); `frozen`. `compute_verdict` drops synthetic and frozen
-ideas (counting them in `synthetic_excluded` / `unvalued_positions`).
+ideas (counting them in `synthetic_excluded` / `unvalued_positions`), and **the P&L it states and
+tests leaves the synthetic ideas out too** (accounting-4): `Verdict.pnl_liq` = the portfolio's
+`pnl_liq` minus the P&L of the synthetic (assumed candle / synthetic-book fill) ideas, which goes into
+`Verdict.synthetic_pnl`; the sentence, the `pnl > 0` test, `pnl_ex_best` and `top_race_share` use it,
+and the reasons say "their +X is not in the P&L above".
 
 **Statistic** (D2). Two-way cluster-robust t-interval of the mean P&L per idea,
 `cluster_t_interval(pnls, race_keys, time_blocks, level=L)` with time block = `(int(entered_at //
@@ -1387,7 +1480,15 @@ clusters)`, `G - 1` degrees of freedom (`t_quantile`, stdlib). The same interval
 return on capital `pnl / cost` (so a 50-share hole does not count like an 8,000-set basket).
 `L = CI_LEVEL` (0.90) for the headline; `L = 1 - FAMILY_ALPHA / n_portfolios` (0.10 / 9 -> 98.9%)
 for exploratory portfolios. Win rate (Wilson, z 1.645) over **closed** trades only, labelled
-"closed trades only: biased toward quick winners".
+"closed trades only: biased toward quick winners". "Closed trades" here and in
+`PortfolioSummary.trades_closed` / `wins` / `win_rate` (and per kind) are closed **ideas**
+(`IdeaOutcome`s): a legging-residue exit of a set that is still held is a fragment of an open idea,
+not a closed trade; those are published apart as `legging_trades` / `legging_pnl` with the reason
+"N legging exits of sets still held: X (part of those open ideas, not closed ideas)" (ui-7). When a
+kind the portfolio trades could not be tested (value ideas while outside fair values were off or
+offline), `Verdict.untested` / `PortfolioSummary.untested` / `headline.untested` carry one sentence
+each ("Value ideas were not tested: usable outside fair values on 0% of steps ...") and it is added
+to the sentence and the reasons whether or not there are fills (ui-3).
 
 **Thresholds**: `MIN_COVERED_HOURS` 12, `MIN_IDEAS` 30, `MIN_CLUSTERS` 20 (on G). Below any: level
 `insufficient`.
@@ -1445,9 +1546,10 @@ recomputed when the runner publishes (every step); it is O(n), no resampling.
    it; `after = created_at + latency`; group = the order group.
 2. Books for deferred set entries (every leg, one group) and for basket exits waiting for books.
 3. Tape for exchanges with resting orders, if not read in the last `trade_poll_s` (60 s), oldest
-   poll first, and for exchanges with `cancelling` orders not read since their `cancel_at`
-   (regardless of `trade_poll_s`, first); `since` = the oldest `last_trade_ts`/`created_at` of
-   their orders.
+   poll first, and for exchanges with `cancelling` orders whose `cancel_at` has passed and that
+   were not read since (regardless of `trade_poll_s`, first; a cancel whose `cancel_at` is still in
+   the future is read like a resting order, fills-2); `since` = the oldest
+   `last_trade_ts`/`created_at` of their orders.
 4. Books for open positions whose newest real observation is older than `mark_refresh_s` (300 s),
    **largest liquidation value first** (D31).
 5. Books for exchanges with resting orders whose newest book is older than
@@ -1502,7 +1604,11 @@ paper read also needs a free slot above the snapshot loop's reserve (§9).
   "reason", "verdicts", "portfolios", "study"}`) before `paper_end_run`; open positions become
   trades with `exit_reason=reason` at liquidation value. Reasons: "reset", "settings changed",
   "completed" (`paper --hours N` without `--keep-running`). `paper_last_ended_run()` serves
-  `/api/paper?run=previous`, so a reset at 23 h does not lose its verdict.
+  `/api/paper?run=previous`, so a reset at 23 h does not lose its verdict. `end_run` keeps a deep copy
+  of the **pre-liquidation** summaries; once a run has ended, `summary()`, `portfolios()` and
+  `verdicts()` (so `/api/paper` and the CLI's final text) serve those, never a recomputation on the
+  liquidated books (which would bypass the depth and swing guards, call unrealised P&L realised and
+  change the closed-only win rate); END_REASONS trades never count as closed ideas (accounting-1).
 * `reset(now, start_capital, capital_source, target_hours)` = `end_run(now, "reset")` + `start`.
 * `MemoryPaperPersistence` implements the protocol in memory (tests, backtests); TrackerStore
   implements it in SQL (E). Both must pass the same contract test (§7.8).
@@ -1565,15 +1671,21 @@ and the full size when `SUPERMARKET_PERF=1`.
   semantics, no look-ahead) and statuses via `update_surge_status` at `t`; an attribution is
   attached only from a stored surge (through `guard.surges(since, until=t)`) on the same exchange and
   direction whose `detected_at` lies within the detection's window and whose
-  `attribution.analyzed_at <= t`. Never use a stored surge's later fields.
+  `attribution.analyzed_at <= t`. Never use a stored surge's later fields. `analyzed_at` is the time
+  the analysis **returned** (`Attributor.analyze` stamps its completion, and the tracker re-stamps it
+  with its own clock before `set_attribution`, never earlier), because the verdict reaches the store
+  and the paper step only then (lookahead-3); its start time stays the end of the news window.
 * **High bands**: `analytics.high_band(series <= t, t, ...)`.
 * **Fair values** (`use_fair_values`, D24): per exchange the newest record with `ts <= t -
   latency_s` (availability), turned into a FairValue by `replay_fair_value(record, refresh, t,
   latency_s)`: its `as_of` is the record's live `as_of`, advanced to the oldest `fetched_at` of the
   record's venues in the newest `fair_value_refreshes` row with `ts <= t - latency` when that row is
   newer than the record and all those venues were "ok" in it (an unchanged value re-confirmed every
-  minute stays fresh, as it was live); otherwise the value ages from the record's `as_of` and becomes
-  stale after 90 s, as it would have live. Records with source "history" (imported, §4.11) are used
+  minute stays fresh, as it was live), but never past `t - latency_s`; otherwise the value ages from
+  the record's `as_of` and becomes stale after 90 s, as it would have live. A record whose `as_of` is
+  later than `t - latency_s` (rows recorded before the service stamped records at the refresh's
+  return carry the refresh **start**) is not available yet and is skipped (lookahead-2; not for
+  "history" or manual records, whose `as_of` is not a fetch time). Records with source "history" (imported, §4.11) are used
   when `use_history_fair_values`, aged from their bar end against `history_fv_max_age_s`, and marked
   `history=True`. Manual values are available from their record ts (never the user's `updated_at`).
   A test: a constant fair value recorded live (change-only records plus one refresh row per minute)
@@ -1622,17 +1734,33 @@ and the full size when `SUPERMARKET_PERF=1`.
   same-snapshot ticks, and `guard_filtered`.
 * `warnings`: "Only N hours of data" (< 12 h); "Most quotes are candle-based: spreads and depth are
   assumptions" (candle share > 50%); "No fair values were recorded in this window: value ideas could
-  not trade"; **`OVERLAP_WARNING`** when the window overlaps the live paper run
-  (`config.live_run_started_at`; `overlap_hours` in the report: "... a backtest over the same data
-  is not an independent check, so agreement between the two is not evidence"); `SWEEP_WARNING` for
-  sweeps; `stopped_early`.
+  not trade"; **`OVERLAP_WARNING`** when the window overlaps a paper run
+  (`overlap_hours` in the report: "... a backtest over the same data is not an independent check, so
+  agreement between the two is not evidence"); `SWEEP_WARNING` for sweeps; `stopped_early`. The
+  overlap is the union of **every** paper run the store holds (`store.paper_run_times()`: the current
+  run and the ones that ended -- completed, reset, "settings changed" after a code update -- an open
+  run ending now) intersected with the window, not only the current run's start
+  (`config.live_run_started_at`): the CLI `backtest` (including `--demo`, whose simulation is itself a
+  paper run over that window) and the dashboard apply `pipeline.apply_paper_overlap` after the replay,
+  which puts the warning first and, when the replay filled on stored order books (only the paper run's
+  reader writes `book_snapshots`), adds that those books are the paper run's own reads right after its
+  own decisions (lookahead-1). `run_backtest` itself does the same from `source.paper_run_times()`
+  when the source has it (`PreloadedHistory` keeps the runs it was loaded with, so sweeps see them);
+  `apply_paper_overlap` is idempotent with it.
+* **Assumed fills** (accounting-4): when any portfolio has ideas filled on assumed liquidity (candle
+  prints or synthetic books), one warning names, per portfolio, how much of the "P&L at liquidation"
+  column came from them ("The P&L at liquidation column includes assumed fills ... that the verdicts
+  leave out: human:conservative -0.46 from 2 ideas; ... The verdict sentences state the P&L without
+  them."); the dashboard shows the verdict's P&L ("+X without assumed fills") under such rows.
 * `parse_sweep(["min_value_edge=0.01,0.02", "latency_s=30,60"])`; values parsed as int, float,
   bool or string; names looked up in `StrategyParams`, then `BacktestConfig`, then
   `PaperConfig`; unknown name -> ValueError listing the valid ones.
 * `sweep(source, base, grid)`: Cartesian product, at most 50 runs (else ValueError); returns the
   base run's report with `sweep` rows `{"params": {...}, "label": "min_value_edge=0.01,
-  latency_s=30", "pnl_liq", "trades_closed", "verdict_level", "max_drawdown"}` for the
-  headline portfolio, sorted by `pnl_liq` desc, and `SWEEP_WARNING` in `warnings`. The CLI's
+  latency_s=30", "pnl_liq", "verdict_pnl", "synthetic_pnl", "trades_closed", "verdict_level",
+  "max_drawdown"}` for the headline portfolio, sorted by `verdict_pnl` desc (the P&L without assumed
+  fills, so assumed fills cannot pick the "best" settings, accounting-4), and `SWEEP_WARNING` in
+  `warnings`. The CLI's
   `--latency-sweep` is `latency_s=30,120,300` (D54): how much of the result survives acting later.
 
 ### 6.13 Execution statistics and "why no trades" (D7, D62)
@@ -1818,7 +1946,8 @@ New / changed `TrackerStore` methods (thread-safe like the rest; JSON via `_dump
 | `add_leaderboard_snapshot(snap)`, `leaderboard_snapshots(since, until=None)` | oldest first |
 | `candles(exchange_id, resolution, since, until=None) -> List[Dict]` | `{"ts" (bucket start), "close_ts", "open", "high", "low", "close", "vwap", "volume", "trade_count"}`, bucket start in range, oldest first |
 | `tick_bounds() -> Optional[Tuple[float, float]]` | min and max tick ts |
-| `acquire_lease(name, owner: Dict, now, ttl_s) -> Optional[Dict]` | None when acquired or renewed by the same `owner_id`; else the current holder `{"owner_id", "pid", "host", "heartbeat_at"}` when its heartbeat is younger than `ttl_s` (an older lease is taken over) |
+| `acquire_lease(name, owner: Dict, now, ttl_s) -> Optional[Dict]` | None when acquired or renewed by the same `owner_id`; else the current holder `{"owner_id", "pid", "host", "heartbeat_at", "alive"}`. A holder on **this** machine is asked directly (`lease_holder_alive`: `os.kill(pid, 0)` on POSIX, plus a `/proc` start-time check for a recycled pid): while it runs it holds the lease whatever its heartbeat age, up to `LEASE_LIVE_HOLDER_MAX_S` (600 s; `alive` True); once it has ended (a crash, a closed terminal) its lease is taken over at once (`last_takeover` records it). A holder on another machine, or this very process, holds it while its heartbeat is younger than `ttl_s` (`alive` None); an older lease is taken over (live-1, live-5) |
+| `paper_run_times() -> List[Dict]` | every run's `{"run_id", "started_at", "updated_at", "ended_at"}`, oldest first, without decoding config/state (the backtest's overlap, lookahead-1) |
 | `renew_lease(name, owner_id, now) -> bool`, `release_lease(name, owner_id)` | |
 | `paper_*` | `paper.PaperPersistence` exactly (§6.11), incl. `paper_last_ended_run()`, `paper_put_events`, `paper_events`; `paper_load_run(None)` = newest with `ended_at IS NULL`; returns `{"run_id", "started_at", "config", "state", "updated_at", "ended_at"}` |
 | `classmethod open_read_only(path) -> TrackerStore` | a second connection `sqlite3.connect("file:<path>?mode=ro", uri=True)` that refuses writes (the dashboard's backtests, D52) |
@@ -1861,12 +1990,33 @@ lease: bool = False`.
   and `demo.no_wait` (raises `SimClockStall` instead of sleeping).
 * **Lease** (D46): with `lease=True` (`build_live` and `build_demo` pass it), `start()` and every
   synchronous `run_once()` / `paper_step()` first call `store.acquire_lease("tracker", owner, now,
-  ttl_s=3 * interval)` (`owner = {"owner_id": f"{host}:{pid}:{started_at}", "pid", "host"}`) and
-  renew it at the end of every cycle; if another live owner holds it, `start()` raises
-  `TrackerBusy(holder)` (the CLI exits 2: "Another process (pid 1234 on my-laptop) is already
-  running the tracker on data/cup/tracker.sqlite3: stop it, or use --data-dir for a separate copy.
-  Running two would double the API reads; the account allows 100 per minute across all keys."). The
-  lease is released on `stop()`.
+  ttl_s=3 * interval)` (`owner = {"owner_id": f"{host}:{pid}:{started_at}", "pid", "host"}`). The
+  threaded tracker renews it from its own `tracker-lease` thread every interval / 3 (at most 30 s), not
+  only at the end of a cycle: a cycle can sit in the client's retries (`Retry-After: 60`, up to 5
+  attempts) for longer than the TTL, and a second dashboard must still be refused meanwhile (live-1).
+  If another live owner holds it, `start()` raises `TrackerBusy(holder, path, ttl_s, now)` (the CLI
+  exits 2). For a process that is running on this machine the message says to stop it first ("Another
+  process (pid 1234 on vm) is already running the tracker on data/cup/tracker.sqlite3: stop it first
+  (close that dashboard, or press Ctrl-C in its terminal), then start again. Running two would double
+  the API reads; the account allows 100 per minute across all keys."); for one on another machine it
+  adds that the lock frees itself within the TTL of its last heartbeat if that process has already
+  ended. It never suggests `--data-dir` for "a separate copy" (that starts a new paper run and a full
+  history download, live-5). A lease left by a process on this machine that no longer exists (a crash,
+  a closed terminal) is taken over at once and logged ("the previous run (pid N) ended without
+  shutting down; continuing it"). The lease is released on `stop()`; SIGTERM and SIGHUP (closing the
+  terminal window; left alone under `nohup`) stop `dashboard` and `paper` like Ctrl-C, so they
+  release it too.
+* **First paper step** (accounting-3, §6.1): the paper worker's first step waits (at most
+  min(`context_refresh`, 60 s)) for the first context refresh, which publishes the balance, the
+  account value and the leaderboard before its order-book reads; so a threaded run (dashboard, live
+  `paper`) starts on the account value like the fast demo, not on the "default 100,000" because the
+  balance read was still in flight. The engine also re-bases a default-capital run before its first
+  fill (ui-4).
+* **Attribution time** (lookahead-3): `Attributor.analyze` stamps `analyzed_at` with its clock when it
+  returns (its start stays the end of the news window), and the tracker re-stamps it with its own clock
+  when `analyze()` returned (never earlier than the attributor's own stamp), because that is when the
+  verdict reaches the store and the paper step; a replay's `analyzed_at <= t` rule then never uses
+  a verdict during the minute or so its reads, news search and LLM judge took.
 * When `paper` is given: `self.paper_runner = PaperRunner(paper, TrackerMarketReader(self),
   self._paper_inputs, limiter=self.paper_limiter, clock=self._clock, interval=self.interval,
   extras_fn=lambda: {"fair_value": <compact fair_values.status()>})`, where `_paper_inputs(now)` =
@@ -2023,8 +2173,10 @@ New commands:
   `--latency-sweep` (= `--sweep latency_s=30,120,300`), `--sizing`, `--regime`, `--json`, `--demo`
   (first run the demo fast for `--demo-hours 6` into a temporary directory, then backtest that).
   Prints the testability table first, then the window, coverage, assumptions, a table per portfolio
-  (P&L at liquidation, ideas, closed-only win rate, drawdown, verdict level), the headline verdict,
-  the event study, sweep rows and warnings.
+  (P&L at liquidation, ideas, closed-only win rate, drawdown, verdict level), the headline verdict
+  followed (as `paper` does) by "Note: " + `DEMO_CAVEAT` on demo data (the demo's outside prices lead
+  the Cup by design, lookahead-5), `TABLE_WARNING` for several portfolios and the verdict caveats, then
+  the event study, sweep rows and warnings (the overlap with any stored paper run first, §6.12.3).
 * `fairvalue`: list matches. `--demo`, `--fair-value {auto,manual}`, `--template` (write
   `data/<slug>/fair_values.json` if absent and say where), `--only-usable`, `--json`,
   `--show-override EID` (print the override snippets for one outcome and the map's path),
@@ -2193,7 +2345,11 @@ at 390 px wide.
    settings** (`run.settings`: sizing, regime, all collateral, start capital, code version);
    "24-hour test complete" badge when `run.complete`; the Reset button; a "Previous run" button when
    `has_previous` (loads `?run=previous` and shows its final snapshot: reason, end time, headline
-   verdict, portfolio rows).
+   verdict **with the same verdict caveats as the live headline, the demo caveat for a demo run and
+   the table warning above its portfolio rows**, ui-1; the panel also shows while a new run waits
+   for its first step, ui-8). When `run.capital_source` is "default 100,000" a warning says the
+   account value was not known at the start, so the sizes and percentages are relative to the default
+   (ui-4).
 3. **Headline** (the pre-registered portfolio, D4): its label ("You, acting by hand ~4 min late:
    all ideas, conservative sizing"), `pnl_liq` (signed, with an up/down icon and the word
    "profit"/"loss"), `pnl_liq_pct`, "at liquidation value", then "(at mid marks: +1,234)"; the verdict
@@ -2201,7 +2357,10 @@ at 390 px wide.
    far) and the verdict sentence verbatim; the reasons as a list; **directly under it the verdict
    caveats** (`headline.verdict_caveats`: one day is a small sample; value pays at resolution; you
    act by hand minutes later; no market impact), not only under "How to read this" (D54); a line for
-   unvalued positions and one for the depth-unknown share when non-zero.
+   unvalued positions and one for the depth-unknown share when non-zero; `headline.untested` (value
+   ideas not tested because the outside prices were off or offline) as a warning line right under the
+   "all ideas" label (ui-3). Signed P&L amounts take their marker from the sign at cent precision (an
+   amount under one SUSQie shows two decimals, "▼−0.42"; ui-10).
 4. **Signal study** (D6), next to the headline: `study` as a table per kind (value, basket):
    columns +5 min, +30 min, +2 h, +6 h; cells "212 signals: +0.004 (-0.001 to +0.009) per share;
    converged 41%, reversed 12%" (intervals only when present); above it the two fixed sentences
@@ -2211,18 +2370,23 @@ at 390 px wide.
    thicker and labelled at its end), a start-capital reference line, a legend (`<ul>`; each item a
    toggle button `aria-pressed`), a "Show as table" toggle rendering the same data (rows = up to 50
    evenly spaced times, columns = portfolios), and an `aria-label` summary naming the headline only
-   ("9 portfolios; headline (you, by hand): +412 at liquidation"). **Never** name or highlight the
-   best portfolio (D4).
+   ("9 portfolios; headline (you, by hand): +412 at liquidation", followed by the move as a share
+   of the start capital). The y axis spans at least ±0.5% of the start capital around the start line
+   (ui-13), so a tiny move does not fill the plot. **Never** name or highlight the best portfolio
+   (D4).
 6. **Portfolios table**: `table_warning` as a fixed sentence above it ("The best of 9 portfolios
    looks better than it is by chance: judge the headline, and confirm any single kind on data
    recorded later."); three `<tbody>` groups: "Your headline (decided before the run)" (`human:*`),
    "Bot speed: an upper bound for acting by hand" (`policy:*`), "By strategy (equal capital,
    conservative sizing, exploratory)" (`kind:*`); columns: Portfolio, P&L at liquidation, %, Ideas
-   (closed / open), Win rate ("closed trades only"), Max drawdown, Open positions, Latency, Verdict
+   (closed / open), Win rate ("closed trades only"; closed ideas, with `legging_trades` /
+   `legging_pnl` listed under it as "N legging exits X, not counted", ui-7), Max drawdown, Open
+   positions, Latency, Verdict
    (badge; exploratory rows read "Exploratory: <level>"), and "Model's own valuation" (`equity_fv -
    start_capital`, header with the footnote `model_label`: "not evidence of profit"); under a row's
    label its `no_trade_reason` when present; a `<details>` per row with the execution statistics per
-   kind (fill rate, average slippage, "signals that did not fill would show +X now", exit slippage).
+   kind (fill rate, average slippage, "signals that did not fill would show +X now" -- only when the
+   server could value them, else "N signals did not fill", ui-12 -- exit slippage).
 7. **Chaser sizing**: the `policy:chaser` portfolio's `sizing` (and the headline's when it is a
    chaser): mode (and "kept by hysteresis"), bar with its range, M, the Markov sentence and every
    line; a note "The chaser accepts large, correlated swings to try to reach the top 3; it can also
@@ -2231,18 +2395,25 @@ at 390 px wide.
    link to `#exchange/<id>`), Side, Shares, Avg cost, Liquidation value, Unrealised, Exit plan
    (`exit_note`), Flags (plain words: "depth from an older book", "depth unknown: valued with a
    haircut", "market closed, no ruling yet (not counted)", "quote stale", "after the Cup end", "bold
-   bet"). **Baskets** sub-table from `baskets`: legs, sets, cost, "floor at settlement" vs "now at
-   liquidation" side by side, with the sentence "Right after entry a set is worth less at
-   liquidation than its cost: that is the spread, not a loss of the locked edge."
+   bet"); a frozen (`unvalued`) row reads "unvalued (last X)" in Liquidation value (accounting-8).
+   **Baskets** sub-table from `baskets`: legs, sets, cost, "floor at settlement" vs "now at
+   liquidation" side by side, naked shares beyond the sets named per leg and under the floor ("N
+   naked shares beyond the sets: no floor", accounting-6), with the sentence "Right after entry a set
+   is worth less at liquidation than its cost: that is the spread, not a loss of the locked edge."
 9. **Recent fills**: newest first: time, portfolio label, "Bought 300 YES @ 0.695" / "Sold" /
    "Settled", slippage vs the decision-time price, kind badge, reason.
 10. **Closed trades**: kind, outcome, P&L, exit reason (plain words), hold time.
 11. **Backtest**: the **testability table first** (`report.testability`: kind, status word,
     sentence); then status line (pending/ready/error/unavailable/no_data); window and hours; the
     overlap warning prominently when present; coverage as short sentences; assumptions list;
-    per-portfolio rows (P&L, ideas, verdict level); the replay's signal study; sweep table when
-    present (with `SWEEP_WARNING`); warnings.
-12. **Fair values**: counts and provider statuses ("Polymarket: offline from this machine"),
+    per-portfolio rows (P&L, ideas, verdict level) under the table warning (ui-1), with "+X without
+    assumed fills" under a P&L that includes assumed (candle / synthetic-book) fills (the verdict's
+    `pnl_liq`; sweep rows: `verdict_pnl`, accounting-4); the replay's signal study; sweep table when
+    present (with `SWEEP_WARNING`); warnings. An error status reads "The backtest failed: <cause>.
+    It retries in a minute." (one period, ui-12).
+12. **Fair values**: counts and provider statuses ("Polymarket: offline from this machine", "not
+    asked yet" for `pending`; "last answer N ago" only when the venue answered, else "never answered"
+    for an offline/failing one, live-4),
     manual file path and errors, **map file** path, override count and errors; table: Outcome, Race,
     Fair value (value, source, confidence, uncertainty, age), Cup bid / ask, Gap, Matched venues
     (external id, label, reason), Usable (yes/no + reason, badges "suspect match" / "near match:
@@ -2270,7 +2441,12 @@ simulated step (every 30 s)."
   favourite, to catch a liquidity hole"); add icons to `ICONS` as needed (inline SVG paths only).
 * `isSet(o)`: `kind` is `arbitrage` or `basket`.
 * Idea card facts when present: "Fair value" (`fair_value`, `fair_source`, `fv_uncertainty` as
-  "± 1.0 cents"), "Order" (taker: "Limit 0.535 (keeps the full required edge)"; maker: "Resting limit
+  "± 1.0 cents"; a longshot value idea adds "valued at 0.117 as a longshot", its shrunk `prob_win`,
+  strategy-9), "Win probability" (a hole's reads "Chance it fills": `prob_win` is the resting
+  order's fill probability there, ui-5), "Edge per share" / "Expected return" for a sized taker idea
+  at its **expected average fill** (`edge - (fill_price - entry_price)`, with the best-price figure
+  beside it) and "Expected average fill" (ui-2: the API keeps `edge` / `expected_return` at the
+  touch, §5.2), "Order" (taker: "Limit 0.535 (keeps the full required edge)"; maker: "Resting limit
   at 0.695 until 14:30"), "If filled at the limit" (`bet_limit`: edge per share), "Exit plan"
   (`exit_plan.note`), "National swing" (`factor_delta`: "A 3-point national swing toward the
   Republicans costs 0.17 per share"), "Set type" for sets ("Riskless at a 1/0 settlement" /
@@ -2278,7 +2454,8 @@ simulated step (every 30 s)."
   sizing" (`alt_sizing.units` + its first line), "Per day of capital" (`profit_per_capital_day` as a
   percentage).
 * A sizing panel from `report.sizing` (+ `alternative`): policy, mode, bar and its range, M, the
-  Markov sentence, lines; and the regime sentence ("Settlement rule assumed: ...").
+  Markov sentence (shown for every policy, once; the tile reads "Chance of reaching the bar: at most
+  46%", an upper bound, ui-9), lines; and the regime sentence ("Settlement rule assumed: ...").
 
 ### 8.4 Tests (F)
 
@@ -2361,14 +2538,20 @@ epoch seconds, absent values `null`.
   "has_previous": bool,                   // an ended run exists (?run=previous will answer)
   "headline": null | {"portfolio_id": str, "label": str, "latency_s": float, "pnl_liq": float, "pnl_liq_pct": float,
                       "pnl_mark": float, "equity_liq": float, "unvalued": float, "depth_unknown_share": float|null,
-                      "verdict": Verdict.to_dict(), "verdict_caveats": [str]},   // CAVEATS[i] for i in VERDICT_CAVEATS
+                      "verdict": Verdict.to_dict(), "verdict_caveats": [str],   // CAVEATS[i] for i in VERDICT_CAVEATS
+                      "untested": [str]},                 // kinds the headline could not test (ui-3)
   "table_warning": str,                   // TABLE_WARNING with n = number of portfolios
   "model_label": str,                     // FV_MODEL_LABEL
-  "portfolios": [PortfolioSummary.to_dict()],        // config order (headline first); each has sizing, verdict, execution, no_trade_reason
-  "equity": {pid: [[ts, equity_liq], ...]},          // <= 300 points per portfolio, oldest first
-  "positions": [PaperPosition.to_dict() + {"unrealized_liq": float|null, "exit_note": str, "age_hours": float}],   // <= 200
-  "baskets": [{"portfolio_id", "basket_id", "idea_id", "sets": float, "cost": float, "floor_value": float,
-               "liq_value": float, "legs": [{"exchange_id", "side", "qty", "liq_value"}]}],
+  "portfolios": [PortfolioSummary.to_dict()],        // config order (headline first); each has sizing, verdict, execution, no_trade_reason,
+                                                     // untested, legging_trades, legging_pnl; trades_closed / wins / win_rate count closed ideas (ui-7)
+  "equity": {pid: [[ts, equity_liq], ...]},          // <= 300 points per portfolio, oldest first; while the run is active the last
+                                                     // point is the current equity_liq (= headline.equity_liq, ui-6)
+  "positions": [PaperPosition.to_dict() + {"unrealized_liq": float|null, "exit_note": str, "age_hours": float,
+                "unvalued": bool, "last_liq_value": float|null}],   // <= 200; a frozen row: liq_value 0, unrealized_liq -cost (accounting-8)
+  "baskets": [{"portfolio_id", "basket_id", "idea_id", "sets": float,   // sets = the matched qty over EVERY leg entered (a sold leg counts 0)
+               "cost": float, "floor_value": float,                   // floor_value = sets x the set's floor (accounting-6)
+               "liq_value": float, "naked_qty": float, "legs_total": int,  // naked_qty: shares beyond the sets, no floor
+               "legs": [{"exchange_id", "side", "qty", "liq_value", "naked_qty"}]}],
   "orders": [PaperOrder.to_dict()],                  // pending, resting and cancelling, <= 100, newest first
   "fills": [PaperFill.to_dict()],                    // <= 100, newest first
   "trades": [PaperTrade.to_dict()],                  // <= 100, newest first
@@ -2390,7 +2573,10 @@ Disabled: `{"now", "enabled": false, "available": false, "error": "The paper tra
 "fair_value": null, "caveats": [], "last_step": null}`. `?run=previous` with no ended run: 404
 `{"error": "No earlier simulation run has ended yet."}`; otherwise the same shape built from that
 run's final snapshot (`run.final`, `run.ended_at`, `run.end_reason` set; `orders`, `fills`,
-`trades`, `positions`, `equity` may be empty).
+`trades`, `positions`, `equity` may be empty). Once the current run has ended, `/api/paper` serves its
+pre-liquidation final summaries (the same numbers as `?run=previous`, accounting-1). `Verdict.to_dict()`
+includes `synthetic_pnl` (replays: the P&L of the assumed-fill ideas left out of `pnl_liq`) and
+`untested`.
 
 ### 10.2 `POST /api/paper/reset`
 
@@ -2422,6 +2608,8 @@ Body (JSON object): `{"confirm": true, "start_capital": number (optional, 1..10,
 ```
 {"now": float, "enabled": bool, "mode": "auto" | "manual" | "off", "last_refresh_at": float|null,
  "providers": [{"name", "status", "last_ok_at", "last_error", "requests", "matched", "quoted", "next_try_at"}],
+     // status: "ok" | "partial" | "offline" | "backoff" | "error" | "disabled" | "pending" (not asked yet);
+     // last_ok_at only once the venue answered; last_error is the real cause, never the backoff text (live-4)
  "manual": {"path": str, "exists": bool, "entries": int, "errors": [str]} | null,
  "map": {"path": str, "exists": bool, "overrides": int, "loaded_at": float|null, "errors": [str]} | null,
  "history": {"records": int, "first": float|null, "last": float|null} | null,   // imported outside history
@@ -2434,8 +2622,9 @@ Body (JSON object): `{"confirm": true, "start_capital": number (optional, 1..10,
     "gap": float|null,            // fair.value - sm_mid (positive: the Cup is below fair value)
     "edge_yes": float|null,       // fair.value - sm_ask, before costs
     "edge_no": float|null,        // sm_bid - fair.value, before costs
-    "near": bool, "suspect": bool,
-    "snippets": {"disable": str, "pin": str|null, "confirm": str|null, "trade_near": str|null},
+    "near": bool, "suspect": bool,      // near: a NEAR venue match exists (or a fair value priced from one), ui-11
+    "snippets": {"disable": str|null,   // null when nothing is matched (no match to turn off)
+                 "pin": str|null, "confirm": str|null, "trade_near": str|null},   // trade_near only when near
     "unmatched_reason": str|null}],   // sorted by |gap| desc (nulls last), then title
  "caveats": [str]}
 ```
@@ -2746,7 +2935,10 @@ only if its score is 50% higher (the engine sells that one first). §5.6.4.
 **D13. At most one bold bet, and only if it can reach the bar** (R1-8). With the 60% cap the win
 state reaches the 221,500 bar only for costs <= 0.3306 (at 0.45 it wins only to 173,333, wasting the
 variance). The chaser makes one bold bet, on the best idea that passes that test; otherwise it sizes
-as chase and says why; never two at once (their win states are not joint). §5.6.4.
+as chase and says why; never two at once (their win states are not joint). Round 3: "can reach the
+bar" also means the stake can be funded now (60% cap, depth, total cap, free cash at the limit), and
+a bold position is held to its 1/0 settlement (`sizing.bold_exit_plan`), since its win state is the
+settlement payoff (strategy-3, strategy-4). §5.6.4.
 
 **D14. The bar is estimated linearly from the lower end** (R1-9). Compounding a clipped 5%/day over
 30 days multiplied the bar by 4.3, and 12 h of history turned one 2% mark move into M = 7.6. Growth
@@ -2798,7 +2990,8 @@ arbitrary floor of 0.65 removed. §5.5.
 **D38. Fair values are consistent within a race** (R1-33, R2-23). After blending and combining,
 legs of a fully valued race are renormalised to sum to 1 (or all made unusable when they disagree);
 a placeholder leg dropped by the provider is not "quoted" and does not poison the race sum; two value
-ideas on different winners of one race keep only the better one. §4.7, §5.1.
+ideas on different winners of one race keep only the better one, and so do two on the same winner
+(YES-D plus NO-R: one race outcome, one Kelly bet; round 3, strategy-2). §4.7, §5.1.
 
 ### 14.5 Backtest
 
@@ -2881,7 +3074,9 @@ delay `run_once`. §7.2, §9.
 **D46. One tracker per store, temporary directories for demo commands** (R2-6). A store lease
 (heartbeat, 3 x interval) makes a second `paper`/`dashboard` on the same store refuse to start (exit
 2 with the reason); `paper --demo`, `backtest --demo` and the tests use `tempfile.mkdtemp()` so they
-never delete a running `dashboard --demo` database. §7.1, §7.2, §7.5.
+never delete a running `dashboard --demo` database. The heartbeat has its own thread (a cycle stuck in
+retries keeps it fresh), a running process on the same machine is refused whatever its heartbeat age,
+and a dead one's lease is taken over at once (round-3 live-1, live-5). §7.1, §7.2, §7.5.
 
 **D47. `build_demo(fresh_db=False)`** (R2-7): keeps the store, so the restart test continues the same
 run (same run id, steps, cash, positions, open orders, counters). §7.4, §7.8.

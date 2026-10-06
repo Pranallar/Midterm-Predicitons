@@ -986,7 +986,9 @@ def test_backoff_sequence_and_next_try_at() -> None:
         assert res.status == "offline"
         waits.append(res.next_try_at - now)  # type: ignore[operator]
         during = provider.refresh(targets, now + 1)
-        assert during.status == "backoff" and during.requests == 0 and during.next_try_at == res.next_try_at
+        # live-4: while waiting after an offline failure the venue is still reported offline, cause first
+        assert during.status == "offline" and during.requests == 0 and during.next_try_at == res.next_try_at
+        assert during.errors[0] == res.errors[0] and "No request to Polymarket until" in during.errors[1]
         now = res.next_try_at  # type: ignore[assignment]
     assert waits == [30.0, 60.0, 120.0, 300.0, 600.0, 600.0]
     transport.fail = None
@@ -1562,3 +1564,199 @@ def test_import_history_offline_one_error_nothing_stored() -> None:
     ]
     assert len(transport.calls) == 2  # one request per provider, then it stopped
     assert_get_only(transport)
+
+
+# --------------------------------------------------------------------------- regressions (paper-trading verification)
+
+
+class _SlowProvider:
+    """A provider whose refresh takes ``takes`` seconds on the shared clock (Polymarket then Kalshi near the 30-s
+    deadline); the outside price moves 0.50 -> 0.65 at ``jump_at``. ``ahead`` puts fetched_at that far after the
+    service clock (a provider clock that runs ahead)."""
+
+    name = "polymarket"
+
+    def __init__(self, clock: FakeClock, takes: float, jump_at: float, ahead: float = 0.0) -> None:
+        self.clock = clock
+        self.takes = takes
+        self.jump_at = jump_at
+        self.ahead = ahead
+
+    def refresh(self, targets: Sequence[MatchTarget], now: float, *, deadline: Optional[float] = None) -> ProviderResult:
+        self.clock.advance(self.takes)
+        fetched = self.clock() + self.ahead
+        price = 0.65 if fetched >= self.jump_at else 0.50
+        res = ProviderResult(venue="polymarket", status="ok", requests=3)
+        for t in targets:
+            res.quotes[t.exchange_id] = FairValueQuote(
+                venue="polymarket", external_id="pm:1", label="x", bid=price - 0.005, ask=price + 0.005, last=price,
+                fetched_at=fetched, match_kind="EXACT", match_confidence=1.0)
+        return res
+
+    def close(self) -> None:
+        pass
+
+
+TX_INFO = ExchangeInfo("1", "m1", None, "Will the Democratic Party win the Texas Senate?")
+
+
+def _slow_refresh(tmp_path: Path, *, explicit_now: bool, ahead: float = 0.0
+                  ) -> Tuple[FairValueService, List[FairValueRecord], List[FairValueRefresh], FakeClock]:
+    clock = FakeClock(T0)
+    records: List[FairValueRecord] = []
+    refreshes: List[FairValueRefresh] = []
+    svc = FairValueService(tmp_path, providers=[_SlowProvider(clock, 40.0, T0 + 35.0, ahead)], clock=clock,
+                           recorder=records.extend, refresh_recorder=refreshes.append)
+    svc.set_targets([TX_INFO])
+    svc.refresh(T0 if explicit_now else None)  # the tracker passes its clock's now explicitly
+    return svc, records, refreshes, clock
+
+
+@pytest.mark.parametrize("explicit_now", [True, False])
+def test_lookahead_2_records_are_stamped_when_the_refresh_returns(tmp_path: Path, explicit_now: bool) -> None:
+    svc, records, refreshes, clock = _slow_refresh(tmp_path, explicit_now=explicit_now)
+    assert clock() == T0 + 40  # the providers took 40 s
+    rec = records[-1]
+    assert rec.value == pytest.approx(0.65) and rec.as_of == T0 + 40
+    # available only from when the live service had it: when refresh() returned, never at its start
+    assert rec.ts == T0 + 40 and rec.as_of <= rec.ts
+    assert refreshes[-1].ts == T0 + 40 and refreshes[-1].venues["polymarket"] == {"status": "ok", "fetched_at": T0 + 40}
+    assert svc.current().at == T0 + 40 and svc.status()["last_refresh_at"] == T0 + 40
+    # the blend age still counts from the refresh time: a fresh quote is used
+    assert svc.current().values["1"].usable
+
+
+def test_lookahead_2_a_quote_fetched_after_the_measured_duration_bounds_the_stamp(tmp_path: Path) -> None:
+    _svc, records, refreshes, _clock = _slow_refresh(tmp_path, explicit_now=True, ahead=5.0)
+    assert records[-1].as_of == T0 + 45 and records[-1].ts == T0 + 45 and refreshes[-1].ts == T0 + 45
+
+
+def test_lookahead_2_replay_never_trades_on_a_value_fetched_after_the_decision(tmp_path: Path,
+                                                                               monkeypatch: pytest.MonkeyPatch) -> None:
+    """End to end: the record of a 40-s refresh replayed with latency 30 s (the --latency-sweep's first row). The
+    Cup ask is 0.52 until T0+75, then 0.66; a value buyer (fv - ask >= 0.05, limit 0.55) could not buy at 0.52
+    live (0.65 existed from T0+40; the next decision T0+60 fills at >= T0+90). Before the fix the replay used fv
+    0.65 (as_of T0+40) at the T0+30 decision and booked +130."""
+    from supermarket_bot import backtest as B
+    from supermarket_bot import sizing
+    from supermarket_bot.models import (
+        BacktestConfig, BetShape, BookObservation, ExitPlan, Opportunity, PaperConfig, PortfolioSpec, PricePoint,
+        SizeDecision,
+    )
+
+    _svc, records, refreshes, _clock = _slow_refresh(tmp_path, explicit_now=True)
+
+    class Fixed:
+        name = "fixed"
+        label = "Fixed units"
+
+        def size(self, opp: Any, ctx: Any) -> Any:
+            return SizeDecision(idea_id=str(opp.idea_id), policy=self.name, units=1000, stake=0.0)
+
+        def size_all(self, opps: Sequence[Any], ctx: Any) -> Dict[str, Any]:
+            return {str(o.idea_id): self.size(o, ctx) for o in opps}
+
+        def explain(self, ctx: Any) -> Dict[str, Any]:
+            return {"policy": self.name, "label": self.label, "mode": None, "lines": []}
+
+    monkeypatch.setattr(sizing, "get_policy", lambda name: Fixed())
+    pts: List[PricePoint] = []
+    books: List[BookObservation] = []
+    t = T0 - 7 * 3600
+    while t <= T0 + 1800:
+        a = 0.52 if t < T0 + 75 else 0.66
+        pts.append(PricePoint(ts=t, price=a - 0.005, last=None, bid=round(a - 0.01, 3), ask=a, source="tick"))
+        books.append(BookObservation("1", t, bids=[(round(a - 0.01, 3), 5000)], asks=[(a, 5000)], source="paper"))
+        t += 15.0
+    hist = B.MemoryHistory(exchanges=[TX_INFO], points={"1": pts}, books={"1": books}, fair_values=records,
+                           refreshes=refreshes)
+    seen: List[Tuple[float, float, float]] = []
+    future: List[Tuple[float, float]] = []
+
+    def signal_fn(inputs: Any, params: Any) -> List[Any]:
+        fair = inputs.fair_values.get("1")
+        q = inputs.latest.get("1")
+        if fair is None or fair.value is None or q is None or q.ask is None:
+            return []
+        if fair.as_of is not None and fair.as_of > inputs.now:  # a value from the decision's future
+            future.append((inputs.now, fair.as_of))
+        if fair.value - q.ask >= 0.05:
+            seen.append((inputs.now, fair.value, fair.as_of))
+            return [Opportunity(
+                kind="value", exchange_id="1", market_id="m1", title=TX_INFO.market_title, option=None, side="yes",
+                entry_price=q.ask, target_price=None, stop_price=None, prob_win=0.6, edge=0.05, expected_return=0.1,
+                horizon_hours=1.0, suggested_shares=0, suggested_cost=0.0, score=1.0, confidence=0.6,
+                rationale=["value"], idea_id="value:x1:yes", race_key=None, bet=BetShape("binary", 0.6, 0.4, 0.5, q.ask),
+                exit_plan=ExitPlan(kind="value"), order_type="taker", limit_price=0.55, expires_at=None,
+                fair_value=fair.value, factor_delta=0.05)]
+        return []
+
+    for lat in (30.0, 60.0):
+        seen.clear()
+        future.clear()
+        cfg = BacktestConfig(start=T0, end=T0 + 1800, hours=0.5, step_s=30.0, latency_s=lat, use_fair_values=True,
+                             paper=PaperConfig(portfolios=[PortfolioSpec("bot", "bot", "fixed", None, None, 30.0, 120.0)]))
+        rep = B.run_backtest(hist, cfg, signal_fn=signal_fn)
+        s = rep.portfolios[0]
+        assert future == [], (lat, future)  # the engine swallows exceptions in signal_fn: checked here
+        assert seen == [] and s.fills == 0 and s.pnl_liq == pytest.approx(0.0), (lat, seen, s.fills, s.pnl_liq)
+
+
+def test_live_4_offline_venues_never_show_a_last_answer_and_keep_their_cause(tmp_path: Path) -> None:
+    clock = FakeClock(T0)
+    tr = all_fixtures()
+    tr.fail = lambda r: httpx.ProxyError("403 Forbidden")  # every CONNECT refused, like the sandbox proxy
+    providers = [pm_provider(tr, clock), ks_provider(tr, clock)]
+    svc = FairValueService(tmp_path, providers=providers, clock=clock)
+    # the tracker's fair-value worker refreshes before the first market list is read: no targets yet
+    svc.refresh(T0)
+    st = svc.status()["providers"]
+    assert tr.calls == []
+    for name in ("polymarket", "kalshi"):
+        assert st[name]["status"] == "pending" and st[name]["last_ok_at"] is None, st[name]
+    svc.set_targets(infos_for(NH))
+    seen = []
+    for k in range(1, 61):  # one hour of 60-s refreshes, all refused
+        clock.t = T0 + 60 * k
+        svc.refresh(clock.t)
+        st = svc.status()["providers"]
+        for name, label in (("polymarket", "Polymarket"), ("kalshi", "Kalshi")):
+            p = st[name]
+            seen.append(p["status"])
+            assert p["last_ok_at"] is None, (k, name, p)  # never answered: no "last answer"
+            assert p["status"] == "offline", (k, name, p)  # offline from this machine, every refresh
+            assert p["last_error"].startswith(f"{label} is unreachable from this machine"), (k, name, p)
+    assert set(seen) == {"offline"} and 0 < len(tr.calls) < 60  # still backing off: few requests were sent
+    # the venues come back: the first real answer sets last_ok_at
+    tr.fail = None
+    nxt = max(p["next_try_at"] for p in svc.status()["providers"].values())
+    clock.t = nxt
+    svc.refresh(clock.t)
+    st = svc.status()["providers"]
+    assert st["polymarket"]["status"] == "ok" and st["polymarket"]["last_ok_at"] == nxt
+    assert st["polymarket"]["last_error"] is None
+
+
+def test_live_4_backoff_after_a_server_error_keeps_the_cause_first() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, json={"error": "down"})
+
+    clock = FakeClock()
+    provider = PolymarketProvider(transport=httpx.MockTransport(handler), clock=clock, sleep=clock.advance)
+    res = provider.refresh(targets_for(NH), T0)
+    assert res.status == "error" and "server error (HTTP 503)" in res.errors[0]
+    during = provider.refresh(targets_for(NH), T0 + 1)
+    assert during.status == "backoff" and during.requests == 0
+    assert during.errors[0] == res.errors[0] and "backing off after an error: next try at" in during.errors[1]
+
+
+def test_live_4_a_refresh_that_asked_nothing_is_not_an_answer(tmp_path: Path) -> None:
+    quiet = ScriptedProvider("kalshi")  # status "ok", no request, no quote for this outcome
+    talks = ScriptedProvider("polymarket")
+    talks.quotes[NH_D] = (0.85, 0.86)
+    svc = FairValueService(tmp_path, providers=[talks, quiet], clock=FakeClock())
+    svc.set_targets(infos_for(NH))
+    svc.refresh(T0)
+    st = svc.status()["providers"]
+    assert st["kalshi"]["status"] == "pending" and st["kalshi"]["last_ok_at"] is None
+    assert st["polymarket"]["status"] == "ok" and st["polymarket"]["last_ok_at"] == T0  # quotes are an answer

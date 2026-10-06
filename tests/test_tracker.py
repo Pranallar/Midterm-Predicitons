@@ -2052,7 +2052,10 @@ def test_the_lease_refuses_a_second_tracker_on_the_same_store(make_tracker: Any,
         second.run_once()
     message = str(caught.value)
     assert message.startswith(f"Another process (pid {os_pid()} on ")
-    assert f"is already running the tracker on {path}: stop it, or use --data-dir for a separate copy." in message
+    # this very process: its liveness cannot be told apart, so the heartbeat rule and its wait are explained
+    assert f"is already running the tracker on {path}: stop it first. If it has already ended, the lock frees " \
+           f"itself within {3 * second.interval:.0f} s of its last heartbeat" in message
+    assert "separate copy" not in message  # live-5: a second copy would start a new run and re-download history
     assert message.endswith("Running two would double the API reads; the account allows 100 per minute across all keys.")
     with pytest.raises(tracker_mod.TrackerBusy):
         second.start()
@@ -2068,3 +2071,355 @@ def os_pid() -> int:
     import os
 
     return os.getpid()
+
+
+# --------------------------------------------------------------------------- integration regressions (round 3)
+
+
+def test_live_1_the_lease_heartbeat_survives_a_cycle_stuck_in_retries(make_tracker: Any, fake: Any, world: World,
+                                                                      tmp_path: Any) -> None:
+    """live-1: the snapshot loop renews the lease only between cycles; a cycle that sits in the client's retries
+    (503 Retry-After) for longer than the 3 x interval TTL must not let a second tracker on the same store take
+    the lease, and the first one must not go fatal afterwards."""
+    path = tmp_path / "tracker.sqlite3"
+    gate, blocked = threading.Event(), threading.Event()
+    first = make_tracker(store=TrackerStore(path), lease=True, clock=time.time, interval=0.2)
+    first.run_once()  # the market list is known: the next cycles go straight to the (blocked) price read
+
+    def slow_prices(request: httpx.Request) -> httpx.Response:
+        blocked.set()
+        gate.wait(15)
+        return world._prices(request)
+
+    fake.routes.pop(("GET", "/exchanges/prices"))
+    fake.add("GET", "/exchanges/prices", slow_prices)
+    try:
+        first.start()
+        assert blocked.wait(5)
+        time.sleep(4 * first.interval)  # longer than the TTL (3 x interval) with the cycle still stuck
+        second = make_tracker(store=TrackerStore(path), lease=True, clock=time.time, interval=0.2)
+        with pytest.raises(tracker_mod.TrackerBusy):
+            second.start()
+    finally:
+        gate.set()
+    assert wait_for(lambda: first.status()["cycles"] >= 3, timeout=5)
+    assert first.status()["fatal_error"] is None and first.running
+    first.stop(timeout=2)
+    assert TrackerStore(path).lease("tracker") is None  # released on stop
+
+
+def test_accounting_3_a_threaded_run_starts_on_the_account_value_not_the_default(make_tracker: Any, fake: Any) -> None:
+    """accounting-3 (§6.1): in threaded mode the first paper step runs right after the first cycle, while the
+    context worker is still reading the balance; it must wait for that read, so the run starts on the account
+    value (103,750.50 here) rather than the "default 100,000"."""
+    from supermarket_bot.models import PaperConfig
+    from supermarket_bot.paper import MemoryPaperPersistence, PaperEngine
+
+    def slow_tournament(request: httpx.Request) -> httpx.Response:
+        time.sleep(0.6)  # the first context refresh is still in flight when the first cycle ends
+        return httpx.Response(200, json=TOURNAMENT_INFO)
+
+    fake.routes.pop(("GET", f"/tournaments/{SLUG}"))
+    fake.add("GET", f"/tournaments/{SLUG}", slow_tournament)
+    # without the default-capital re-base, so this tests that the tracker's first step already knows the account
+    engine = PaperEngine(PaperConfig(), persistence=MemoryPaperPersistence(), clock=time.time,
+                         rebase_default_capital=False)
+    tracker = make_tracker(interval=0.05, paper=engine, clock=time.time)
+    tracker.start()
+    assert wait_for(lambda: ((tracker.paper_view() or {}).get("run") or {}).get("steps", 0) >= 1, timeout=10)
+    run = tracker.paper_view()["run"]
+    assert run["capital_source"] == "account value" and run["start_capital"] == pytest.approx(103_750.5)
+    tracker.stop(timeout=2)
+
+
+def test_lookahead_3_an_attribution_is_stamped_when_the_analysis_returned(make_tracker: Any, world: World,
+                                                                         data_clock: FakeClock) -> None:
+    """lookahead-3: the attributor stamps analyzed_at with the clock when its analysis STARTED (then reads the
+    market, the tape, the book, the news and the LLM judge: 59 s here). The verdict exists for the paper step only
+    once analyze() returned, so that is the stored analyzed_at, and a replay (analyzed_at <= t) cannot use it
+    earlier."""
+    from supermarket_bot.backtest import GuardedHistory
+
+    class SlowAttributor(FakeAttributor):
+        def analyze(self, surge: Surge) -> Attribution:
+            started = data_clock.now
+            result = super().analyze(surge)
+            result.analyzed_at = started  # what Attributor.analyze does
+            data_clock.now += 59.0  # reads, news search, LLM judge
+            return result
+
+    tracker = make_tracker(attributor=SlowAttributor())
+    sid = jump_scenario(tracker, world, data_clock)["new_surges"][0]
+    t_start = data_clock.now
+    assert tracker.analyze_pending(1) == 1
+    stored = tracker.store.get_surge(sid).attribution
+    assert stored.analyzed_at == t_start + 59.0
+    guard = GuardedHistory(tracker.store)
+    for t, visible in ((t_start, False), (t_start + 30.0, False), (t_start + 59.0, True)):
+        guard.set_time(t)
+        [s] = [x for x in guard.surges(since=t_start - 7200, until=t) if x.id == sid]
+        assert (s.attribution is not None) is visible, t
+
+
+@pytest.mark.skipif(__import__("os").name != "posix", reason="pid liveness is checked on POSIX only")
+def test_live_5_a_lease_left_by_a_dead_process_on_this_machine_is_continued(make_tracker: Any, tmp_path: Any,
+                                                                            caplog: Any) -> None:
+    """live-5: after a crash or a closed terminal the lease names this host and a pid that no longer exists; the
+    restart takes it over at once (and says the previous run ended without shutting down) instead of refusing."""
+    import logging
+    import socket
+    import subprocess
+    import sys
+
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait(timeout=30)
+    path = tmp_path / "tracker.sqlite3"
+    store = TrackerStore(path)
+    host = socket.gethostname()
+    assert store.acquire_lease("tracker", {"owner_id": f"{host}:{proc.pid}:{time.time() - 60:.6f}:1", "pid": proc.pid,
+                                           "host": host}, T0, ttl_s=90.0) is None
+    tracker = make_tracker(store=store, lease=True)
+    with caplog.at_level(logging.WARNING, logger="supermarket_bot"):
+        tracker.run_once()  # the heartbeat is fresh (same data time), but its process is gone
+    assert store.lease("tracker")["owner_id"] == tracker._owner["owner_id"]
+    assert f"the previous run (pid {proc.pid} on {host}) ended without shutting down; continuing it" in caplog.text
+
+
+def test_live_5_tracker_busy_says_to_stop_a_running_process_and_never_suggests_a_separate_copy() -> None:
+    running = tracker_mod.TrackerBusy({"pid": 42, "host": "vm", "alive": True}, "data/cup/tracker.sqlite3")
+    assert str(running).startswith("Another process (pid 42 on vm) is already running the tracker on "
+                                   "data/cup/tracker.sqlite3: stop it first (close that dashboard, or press Ctrl-C in "
+                                   "its terminal), then start again.")
+    remote = tracker_mod.TrackerBusy({"pid": 42, "host": "laptop", "heartbeat_at": 1000.0}, "db", ttl_s=90.0, now=1030.0)
+    assert ("If it has already ended, the lock frees itself within 90 s of its last heartbeat (about 60 s from now): "
+            "start again then.") in str(remote)
+    for exc in (running, remote):
+        assert "separate copy" not in str(exc) and "--data-dir" not in str(exc)
+
+
+# --------------------------------------------------------------------------- outside-move alerts (OUTSIDE_MOVES.md §13)
+
+
+class StubWatcher:
+    """Stands in for moves.OutsideMoveWatcher (package core): records how the tracker binds and steps it, and checks
+    the lock rule (the tracker's lock is never held while the watcher runs)."""
+
+    def __init__(self, poll_s: float = 15.0, gate: Optional[threading.Event] = None, use_feed: bool = False) -> None:
+        self.poll_s = poll_s
+        self.cup: Any = None
+        self.tracker: Any = None
+        self.gate = gate
+        self.use_feed = use_feed
+        self.steps: List[Optional[float]] = []
+        self.lock_held: List[bool] = []
+        self.started = threading.Event()
+        self.last_error: Optional[str] = None
+        self.books: List[Any] = []
+        self.book_ids: List[str] = []
+        self._status: Dict[str, Any] = {"enabled": True, "poll_s": poll_s, "last_step_at": None, "steps": 0, "open": 0,
+                                        "actionable": 0, "actionable_alerts": [], "venues": {"ok": 0, "total": 2},
+                                        "last_error": None}
+        self._summary: Dict[str, Any] = {"alerts": [], "steps": 0}
+
+    def bind(self, cup: Any) -> None:
+        self.cup = cup
+
+    def add_listener(self, fn: Any) -> None:
+        pass
+
+    def step(self, now: Optional[float] = None) -> Any:
+        if self.tracker is not None:
+            self.lock_held.append(self.tracker._lock._is_owned())
+        self.started.set()
+        if self.gate is not None:
+            self.gate.wait(10)
+        self.steps.append(now)
+        if self.use_feed:
+            self.quotes = self.cup.quotes()
+            self.history = self.cup.history(7200)
+            for eid in self.book_ids:
+                self.books.append(self.cup.book(eid))
+        self._status = dict(self._status, steps=len(self.steps), last_step_at=now, last_error=self.last_error)
+        self._summary = {"alerts": [], "steps": len(self.steps)}
+        return SimpleNamespace(at=now, errors=[])
+
+    def status(self) -> Dict[str, Any]:
+        return self._status
+
+    def summary(self) -> Dict[str, Any]:
+        return self._summary
+
+
+def test_moves_no_watcher_no_thread_and_none_everywhere(make_tracker: Any) -> None:
+    plain = make_tracker(interval=0.05)
+    plain.start()
+    assert "tracker-moves" not in {t.name for t in plain._threads}
+    status = plain.status()
+    assert status["moves"] is None and status["read_budget"]["moves"] is None
+    assert plain.moves_step() is None and plain.moves_view() is None and plain.moves_budget is None
+    plain.stop(timeout=2)
+
+
+def test_moves_watcher_is_bound_and_stepped_by_its_own_worker(make_tracker: Any) -> None:
+    watcher = StubWatcher(poll_s=0.05)
+    tracker = make_tracker(interval=0.05, moves=watcher)
+    watcher.tracker = tracker
+    assert isinstance(watcher.cup, tracker_mod.TrackerCupFeed) and watcher.cup.tracker is tracker
+    tracker.start()
+    try:
+        assert "tracker-moves" in {t.name for t in tracker._threads}
+        assert wait_for(lambda: len(watcher.steps) >= 3, timeout=5)
+        assert tracker.status()["cycles"] >= 1  # the worker starts after the first cycle (the Cup series is loaded)
+    finally:
+        tracker.stop(timeout=2)
+    assert not any(t.is_alive() for t in tracker._threads)
+    assert watcher.lock_held and not any(watcher.lock_held)  # lock rule (§12.3)
+
+
+def test_moves_step_view_and_status(make_tracker: Any, data_clock: FakeClock) -> None:
+    watcher = StubWatcher()
+    tracker = make_tracker(moves=watcher)
+    watcher.tracker = tracker
+    tracker.run_once()
+    report = tracker.moves_step(T0 + 15)
+    assert report.at == T0 + 15 and watcher.steps == [T0 + 15]
+    assert tracker.moves_step() is not None and watcher.steps[-1] is None  # the watcher reads its own clock
+    assert tracker.moves_view() == {"alerts": [], "steps": 2}
+    status = tracker.status()
+    assert status["moves"] == watcher.status() and status["moves"] is not watcher.status()  # a copy
+    assert status["read_budget"]["moves"] == {"used": 0, "limit": 4, "room": 4}  # MOVES_READS_PER_MIN
+    assert not any(watcher.lock_held)
+
+
+def test_moves_problem_follows_the_watchers_last_error(make_tracker: Any) -> None:
+    watcher = StubWatcher()
+    tracker = make_tracker(moves=watcher)
+    tracker.run_once()
+    watcher.last_error = "Kalshi is unreachable from this machine (could not connect): no outside quotes from Kalshi."
+    tracker.moves_step()
+    [problem] = [p for p in tracker.status()["problems"] if p["source"] == tracker_mod.MOVES_PROBLEM]
+    assert problem["message"] == watcher.last_error and problem["severity"] == "warning"
+    watcher.last_error = None
+    tracker.moves_step()
+    assert not any(p["source"] == "outside moves" for p in tracker.status()["problems"])
+    assert tracker_mod.PROBLEM_SEVERITY["outside moves"] == "warning"
+
+
+def test_cup_quotes_come_from_the_published_snapshot(make_tracker: Any, world: World, data_clock: FakeClock) -> None:
+    from supermarket_bot.moves import CupQuote
+
+    tracker = make_tracker()
+    assert tracker.cup_quotes() == {} and tracker.cup_history(3600) == {}
+    tracker.run_once()
+    quotes = tracker.cup_quotes()
+    assert set(quotes) == {"e1", "e2", "e3a", "e3b", "e3c"}
+    assert quotes["e1"] == CupQuote(ts=T0, bid=0.39, ask=0.41, mid=pytest.approx(0.40), last=0.40, spread=pytest.approx(0.02))
+    world.set("e1", 0.44, spread=0.04)
+    data_clock.now += 30
+    tracker.run_once()
+    q = tracker.cup_quotes()["e1"]
+    assert q.ts == T0 + 30 and (q.bid, q.ask) == (0.42, 0.46) and q.spread == pytest.approx(0.04)
+    # the series cache: the last 2 h of tick snapshots, oldest first, ts = each snapshot's completion
+    history = tracker.cup_history(7200)
+    assert [(h.ts, h.mid) for h in history["e1"]] == [(T0, pytest.approx(0.40)), (T0 + 30, pytest.approx(0.44))]
+    assert [h.ts for h in tracker.cup_history(10)["e1"]] == [T0 + 30]
+    # an outcome the bulk price read stops returning is stale after 3 intervals: no quote (no look-ahead, no old price)
+    del world.quotes["e2"]
+    for _ in range(4):
+        data_clock.now += 30
+        tracker.run_once()
+    assert "e2" not in tracker.cup_quotes() and "e1" in tracker.cup_quotes()
+
+
+def test_the_cup_feed_book_uses_the_moves_budget_and_is_never_stored(make_tracker: Any, fake: Any) -> None:
+    watcher = StubWatcher()
+    tracker = make_tracker(moves=watcher, moves_reads_per_min=2)
+    tracker.run_once()
+    feed = watcher.cup
+    obs = feed.book("e1")
+    assert obs.source == "moves" and obs.observed_at == T0 and obs.exchange_id == "e1"
+    assert obs.bids == [(0.39, 150.0), (0.38, 300.0)] and obs.asks == [(0.41, 120.0), (0.42, 250.0)]
+    assert fake.calls_to("/exchanges/e1/orderbook")[-1].params == {"depth": "20", "tournamentId": TOURNAMENT_ID}
+    assert tracker.store.book("e1") is None and tracker.store.book_snapshots("e1", 0.0) == []  # M12: not stored
+    assert feed.book("e2") is not None
+    reads = len(fake.calls_to("/exchanges/e1/orderbook"))
+    assert tracker.moves_budget.status() == {"used": 2, "limit": 2, "room": 0}
+    assert feed.book("e1") is None and len(fake.calls_to("/exchanges/e1/orderbook")) == reads  # no room: no read
+    assert tracker.status()["read_budget"]["moves"] == {"used": 2, "limit": 2, "room": 0}
+
+
+def test_the_cup_feed_book_stays_behind_the_read_reserve(make_client: Any, make_tracker: Any, fake: Any) -> None:
+    client = make_client(reads_per_min=40)
+    watcher = StubWatcher()
+    tracker = make_tracker(client=client, moves=watcher)
+    tracker.run_once()
+    while client.read_limiter.used < 40 - 12:
+        client.read_limiter.acquire()
+    assert tracker.read_reserve.room() == 0 and tracker.moves_budget.room() == 0
+    before = len(fake.calls_to("/exchanges/e1/orderbook"))
+    assert watcher.cup.book("e1") is None and len(fake.calls_to("/exchanges/e1/orderbook")) == before
+    off = StubWatcher()
+    disabled = make_tracker(moves=off, moves_reads_per_min=0)
+    assert disabled.moves_budget.status() == {"used": 0, "limit": 0, "room": 0}
+    assert off.cup.book("e1") is None
+
+
+def test_a_failed_cup_book_read_is_the_outside_moves_problem(make_tracker: Any, fake: Any) -> None:
+    watcher = StubWatcher(use_feed=True)
+    tracker = make_tracker(moves=watcher)
+    tracker.run_once()
+    fake.routes.pop(("GET", "/exchanges/e1/orderbook"))
+    fake.add("GET", "/exchanges/e1/orderbook", (500, error_body("INTERNAL", "boom")))
+    watcher.book_ids = ["e1"]
+    tracker.moves_step()
+    assert watcher.books == [None]
+    [problem] = [p for p in tracker.status()["problems"] if p["source"] == "outside moves"]
+    assert problem["severity"] == "warning" and problem["count"] == 1
+    assert tracker.status()["fatal_error"] is None  # a 500 is not fatal
+    assert tracker.status()["recent_errors"][-1]["where"] == "outside-move order book for exchange e1"
+    watcher.book_ids = []
+    tracker.moves_step()  # a clean step clears it
+    assert not any(p["source"] == "outside moves" for p in tracker.status()["problems"])
+
+
+def test_the_cup_feed_stored_book_history_and_quotes(make_tracker: Any) -> None:
+    watcher = StubWatcher(use_feed=True)
+    tracker = make_tracker(moves=watcher)
+    feed = watcher.cup
+    assert feed.stored_book("e1") is None
+    tracker.store.put_book("e1", T0 - 30, [(0.39, 100)], [(0.41, 80), (0.42, 10)])
+    obs = feed.stored_book("e1")
+    assert (obs.exchange_id, obs.observed_at, obs.bids, obs.asks) == ("e1", T0 - 30, [(0.39, 100.0)], [(0.41, 80.0), (0.42, 10.0)])
+    tracker.run_once()
+    tracker.moves_step()
+    assert set(watcher.quotes) == {"e1", "e2", "e3a", "e3b", "e3c"} and watcher.history["e1"][0].ts == T0
+
+
+def test_the_projection_adds_the_moves_book_reads(make_tracker: Any) -> None:
+    plain = make_tracker()
+    with_moves = make_tracker(moves=StubWatcher())
+    base = plain.status()["read_budget"]["projected_per_min"]
+    assert with_moves.status()["read_budget"]["projected_per_min"] == pytest.approx(base + 4.0)
+    none = make_tracker(moves=StubWatcher(), moves_reads_per_min=0)
+    assert none.status()["read_budget"]["projected_per_min"] == pytest.approx(base)
+
+
+def test_status_returns_quickly_while_a_slow_watcher_step_runs(make_tracker: Any) -> None:
+    gate = threading.Event()
+    watcher = StubWatcher(poll_s=0.05, gate=gate)
+    tracker = make_tracker(interval=0.05, moves=watcher)
+    watcher.tracker = tracker
+    try:
+        tracker.start()
+        assert watcher.started.wait(5)  # the step is stuck (an outside host is slow)
+        cycles = tracker.status()["cycles"]
+        assert wait_for(lambda: tracker.status()["cycles"] >= cycles + 3, timeout=5)  # the snapshot loop goes on
+        started = time.monotonic()
+        tracker.status()
+        tracker.view()
+        tracker.moves_view()
+        assert time.monotonic() - started < 1.0
+    finally:
+        gate.set()
+        tracker.stop(timeout=2)
+    assert watcher.lock_held and not any(watcher.lock_held)

@@ -54,6 +54,7 @@ show up straight away. Stop it with Ctrl-C.
 | **High 90s** | Outcomes whose favourite side has sat at 0.95 or more, and whether they settle before the Cup ends |
 | **Strategy** | Ranked, sized trade ideas with reasoning and risks, plus a risk mode based on your standing |
 | **Simulation** | The paper trader: simulated portfolios on the live ideas, their P&L at liquidation value, the verdict, the signal study and the replay backtest (see [Simulate before you trade](#simulate-before-you-trade)) |
+| **Outside moves** | Alerts when Polymarket or Kalshi moves on one of the Cup's races, whether the Cup has caught up, a suggested hand trade, and the "is the Cup delayed?" lag study (see [Outside moves](#outside-moves-is-the-cup-delayed)) |
 | **Market detail** | Price chart with surges marked, order book, recent trades, headlines |
 
 How a surge gets its verdict:
@@ -127,6 +128,14 @@ Let it run for a day on live data, then read the **Simulation** tab before you a
   (that pays on November 3-4), election night, or how the Cup's end settlement will work.
 * **"Hours" are covered hours**: time the bot was actually watching. A laptop that sleeps
   overnight does not count those hours, and the gaps are shown.
+* **Start capital** is your account value (cash plus positions), read before the first step. If the
+  account could not be read before anything filled, the run keeps the default 100,000 and the
+  Simulation tab says so: reset the run once the account is known.
+* **What is left out is said where the number is**: value ideas are named as untested when the
+  outside prices were off or offline; positions in a market that closed without a ruling count 0
+  ("unvalued"); a legging exit of a basket that is still held is not a closed trade; a basket's
+  unmatched ("naked") shares have no floor; and in a backtest, P&L from assumed fills (candle prints
+  or synthetic books) is shown apart and left out of the verdict.
 * **`--regime`**: the Cup's end-of-tournament settlement rule is not published. `unknown` (the
   default, or `SUPERMARKET_SETTLEMENT_REGIME`) values open positions conservatively;
   `resolved_outcomes` assumes decided races pay 1/0; `vwap_closeout` assumes a closing-price
@@ -149,7 +158,9 @@ python -m supermarket_bot fairvalue                           # every outcome's 
   final `/api/paper` body. Two `paper --demo --fast` runs print identical output.
 * `backtest` opens the database read-only and first prints **what it can test**: value ideas need
   recorded (or imported) outside prices, baskets need same-snapshot quotes, arbitrage cannot be
-  replayed. A replay over the same hours as the live run is not an independent check. Options:
+  replayed. A replay over hours a paper run also saw (the current run, or one that ended or was
+  reset) is not an independent check, and says so: its real order books there are the paper run's
+  own reads. Options:
   `--store`, `--hours`, `--since`/`--until`, `--step`, `--latency`, `--sweep NAME=V1,V2`, `--json`.
 * The dashboard's **Reset** button (`POST /api/paper/reset`, local only) ends the current run and
   starts a new one; the ended run's result stays under "Previous run".
@@ -184,21 +195,155 @@ unreachable (some networks block them), the bot says so and simply has no outsid
   history (GET only) so the backtest can test value ideas over days before the bot was recording.
   Polymarket's history is indicative (not executable prices) and is labelled so.
 
+## Outside moves (is the Cup delayed?)
+
+If the Cup's prices really trail Polymarket and Kalshi, an outside move is a chance to act before the Cup
+catches up. The bot watches for exactly that, and also **measures** whether it is true, so you can decide
+with numbers instead of a hunch.
+
+**What it does.** About every 15 seconds it reads the Polymarket and Kalshi markets already matched to the
+Cup's outcomes (the same checked matches as the [outside fair values](#outside-fair-values); an outcome is
+watched only once its match passed the live check). It reads them anonymously, with `GET` requests only,
+batched (up to 50 Polymarket ids or 100 Kalshi tickers per request), and stamps every quote with the time
+the answer **arrived**. When an outside price moves a lot, it compares the move with the Cup at the same
+moment and raises an alert. **It never trades and never places an order**: every alert is a prompt for you
+to look and, if you agree, place an order by hand.
+
+**When it alerts.** A move counts when it is large over 1, 5, 15 or 60 minutes: at least 3, 4, 5 or 7
+points (a point is 0.01), *and* at least 4 times how much that outcome's outside price usually moves over the
+same window (until it has 30 minutes of history, the minimum x 1.5). Noise is filtered out, and every
+filtered move is listed under "Filtered out" with its reason, so nothing is dropped silently:
+
+* **thin or wide book**: the outside spread was wider than 5 points, Polymarket liquidity below $5,000, or
+  fewer than 100 contracts at the touch;
+* **single print**: one quote jumped and the next one was back (a move must hold on two quotes at least 10 s
+  apart, and the more conservative of the two is used);
+* **the other venue did not move**: Polymarket and Kalshi disagree (when both are watched, both must move
+  the same way);
+* **stale or interrupted quotes**: the venue was not read recently, or there was a gap inside the window;
+* **placeholder or one-sided quote**, **match confidence too low**, **near match** (different settlement
+  wording) and **suspect match** (more than 25 points from the Cup price): the outside price may not be the
+  same question;
+* **no recent Cup price** to compare with.
+
+One move gives **one** alert, which then updates in place (the peak, the windows, the suggested trade).
+
+**What an alert says.** The outside price before and after, the window and the venues; the Cup now (bid,
+ask, mid) and how far it moved over the same time; the **lag gap** (the part of the outside move not yet in
+the Cup); and a status:
+
+* **Cup lagging**: the outside moved and the Cup has not. The alert suggests a concrete hand trade: the side
+  (Buy YES, or Buy NO when the outside fell), a limit price on the 0.005 tick, the shares offered at that
+  price (from a Cup order book at most 2 minutes old), the edge per share after the Cup's spread, and the
+  edge left after the outside price's own uncertainty. If less than 1 cent a share would be left, it says
+  "no trade suggested" instead. **A suggestion only, not a sure thing**: the outside price can be wrong or
+  thin, the Cup may never follow (the gap can last until the race is decided), and others may trade first.
+* **Cup already moved**: the Cup has already made most of the move: no edge left to chase.
+* **Cup moved first**: the Cup moved before the outside price did: the outside followed the Cup, not a lag.
+* **Outside reverted**: the outside price came back before the Cup moved.
+
+**Is the Cup delayed? (the lag study).** For every outside move the bot records whether and when the Cup
+moved at least half as far the same way, held on two consecutive Cup snapshots (**followed**, with the lag
+in seconds after the outside move and after the alert), or the outside price came back first (**reverted**),
+or the Cup had not followed after 60 minutes (**not followed**; "never followed" = reverted + not followed).
+It also records the **capturable gap**: how much of the gap was still there 4 minutes after the alert (about
+how long it takes to act by hand), net of the Cup's spread, and what buying then and selling 30 minutes later
+would have given per share (an upper bound: no market impact, no queue). Because the Cup is only read every
+snapshot interval, both use the less favourable of the Cup snapshots just before and just after that moment.
+The summary gives the number of moves and races (counted over the moves it has resolved, never the pending
+ones), the share followed within 1, 5, 15 and 60 minutes, the median lag, the share never followed and the
+average capturable gap, each with its sample size. With fewer than 20 resolved moves or 10 races it says
+plainly that the sample is far too small to tell. Moves the Cup made first are counted separately;
+moves toward the Cup's price and moves measured while the bot was not running are excluded and counted.
+
+**In the dashboard**: the **Outside moves** tab (its badge counts open lagging alerts with a suggestion)
+shows the live alerts, the lag study, a status line per venue and what was filtered out. Sound (a short
+beep) and desktop notifications are **off** until you switch them on with their buttons.
+`dashboard --no-moves` turns the watcher off; `--moves-poll 15` (5 to 120 s) and `--moves-book-reads 4`
+(0 to 30) tune it. It needs `--fair-value auto` (the default).
+
+**In a terminal**: the `moves` command runs the tracker headless (no web server, no paper trader) and prints
+each alert as it happens:
+
+```bash
+python -m supermarket_bot moves                         # live, until Ctrl-C (your key from .env)
+python -m supermarket_bot moves --bell --only-lagging   # ring the terminal bell on a lagging alert with a suggestion
+python -m supermarket_bot moves --demo --fast           # 2 simulated hours of the scripted demo in under a minute
+python -m supermarket_bot moves --replay                # the stored alerts and the lag study (offline, read-only)
+python -m supermarket_bot moves --json                  # one JSON object per line
+```
+
+Options: `--hours H` (stop after H hours; default until Ctrl-C, `--fast` 2), `--poll S` (5 to 120, default 15),
+`--interval S` (Cup snapshots, default 30), `--book-reads N` (0 to 30 a minute, default 4), `--bell`,
+`--only-lagging`, `--summary-every M` (minutes, default 15), `--replay [--since ISO] [--store PATH]`,
+`--no-news`, and the global `--json`, `--data-dir`, `--tournament`, `--env-file`. `moves --demo` and
+`moves --replay` need no API key; `moves --demo` works in a temporary folder unless you pass `--data-dir`.
+Exit codes: 0 ok, 2 usage or another bot on the same database, 1 an API or disk error, 130 Ctrl-C (after the
+final summary).
+
+```
+[moves 14:05:15] CUP LAGGING   North Carolina Senate (D)  Will the Democratic Party win the North Carolina Senate?
+    outside 0.517 -> 0.573 (+5.5 pts in 5 min; Polymarket, Kalshi); Cup 0.512 (bid 0.505 / ask 0.520), +0.0 pts; lag gap 5.5 pts
+    suggestion (not a sure thing): Buy YES at 0.520, 300 shares at that price (750 up to 0.525); +0.037/share net of the spread, +0.018 after the outside price's uncertainty
+[moves 14:07:30] FOLLOWED  North Carolina Senate (D)  Will the Democratic Party win the North Carolina Senate?
+    the Cup moved +3.2 pts, 4.3 min after the outside move (1.8 min after the alert)
+[moves 14:20:00] summary: Only 3 outside moves on 3 races so far (1 followed by the Cup, 1 never, 1 where the Cup moved first): far too few to say whether the Cup lags. Wait for at least 20 moves on 10 races.
+```
+
+Every alert event (opened, status change, closed) is also appended to `data/<tournament>/alerts.jsonl`
+(one JSON object per line, never rewritten), and alerts with their lag outcomes are kept in the database
+for 30 days, so they survive a restart: a restart within 10 minutes continues the open alerts; after a
+longer gap their lag measurement is marked "censored" rather than guessed.
+
+**Read budgets.** Outside reads never touch the Super Market budget; each outside site has its own limit of
+45 reads a minute in this bot, shared with the fair-value refresh (the watcher always leaves it at least 8):
+
+| Site | Watcher (every 15 s) | Fair-value refresh (every 60 s) | Per minute |
+| --- | --- | --- | --- |
+| `gamma-api.polymarket.com` | 5 batched calls (231 ids) = 20 a minute | 5 | about 25 (28 in a discovery minute) |
+| `api.elections.kalshi.com` | 3 batched calls (220 tickers) = 12 a minute | 3 | about 15 (20) |
+| Super Market | 0 | | at most 4 Cup order books a minute for lagging alerts, only when the read reserve has room (never waited for) |
+
+Both sites document limits far above these. If a site is unreachable or answers 429 (rate limited), the
+bot waits as asked (at most 10 minutes), says so in the venue status line, and the other venue keeps working.
+A 5-second poll would need more Polymarket reads than this bot allows itself; some polls are then skipped
+(the command warns at start-up).
+
+**The demo** (`dashboard --demo`, `moves --demo`) adds seven scripted outcomes (exchanges 9035-9041) whose
+outside prices lead the Cup by a few minutes, one the Cup never follows, a thin single-print spike and a
+one-venue move that must not alert, one where the Cup moves first and one that reverts; the script repeats
+every hour in the other direction. **The leads are scripted, so demo alerts and lag statistics say nothing
+about the real Cup.**
+
+**Honest limits.** An outside price can be wrong, thin or briefly stale (Polymarket's prices carry no quote
+time, so a move may be up to one poll older than stamped); the Cup is read once per snapshot interval (30 s by
+default), so a measured lag can be up to one interval longer than the real one; a gap the Cup has not closed may stay open until
+the race is decided; you act minutes later by hand while others may act first; and a few days of lag
+statistics are a small sample (moves cluster on news days and races share national swings). Alerts never
+change the paper trader's inputs or verdict.
+
 ## One process per account
 
 The account allows 100 reads a minute across **all** your keys. The dashboard uses about 36-40 a
 minute once it is running (up to about 80 in the first quarter of an hour, while it loads price
 history), keeps 12 of the client's 90 for the price snapshots and lets the paper trader use at
-most 20 (6 while the history loads). `/api/status` shows the projected rate and warns above 75.
+most 20 (6 while the history loads). The outside-move watcher adds at most 4 Cup order-book reads a
+minute (usually 0-1), only when there is room above those 12. `/api/status` shows the projected rate and
+warns above 75.
 
 So run **one** bot per account. Each database has a lease: a second `dashboard` or `paper` on the
 same `data/<tournament>/tracker.sqlite3` refuses to start (exit code 2) and names the process that
-holds it. Use `--data-dir` for a separate copy, and stop the other process before you start
-another one on the same account; another script on the account has about 10 reads a minute left.
+holds it: stop that one first (close its dashboard, or Ctrl-C in its terminal). The lease stays held
+while that process runs, even when an API outage keeps it waiting in retries. If the previous run
+crashed or you closed its terminal window, starting again just continues the same run: the bot sees
+that the old process is gone (on the same machine) and takes the lease over. Closing the terminal
+(SIGHUP) or `kill` (SIGTERM) stops the bot cleanly like Ctrl-C; under `nohup` closing the terminal
+leaves it running. Another script on the account has about 10 reads a minute left.
 
 **Disk use**: about 25 MB a day of price snapshots, 10-20 MB of recorded fair values, about 30 MB
 of order books and 10 MB of paper-trading records, kept for 10 days (ended simulation runs for 30
-days): roughly 0.6-0.9 GB at most.
+days): roughly 0.6-0.9 GB at most. The outside-move watcher adds about 35 MB a day of outside quotes, kept
+3 days (about 105 MB), plus its alerts (negligible) and `alerts.jsonl`.
 
 ## Commands
 
@@ -221,6 +366,7 @@ days): roughly 0.6-0.9 GB at most.
 | `paper [--hours 24] [--demo --fast]` | the paper trader without a web server (see [Simulate before you trade](#simulate-before-you-trade)) |
 | `backtest [--store PATH] [--demo]` | replays stored history through the paper trader (read-only; no API key) |
 | `fairvalue [--demo] [--show-override EID]` | outside fair values and matches per outcome; `--template`, `--import-history` |
+| `moves [--demo --fast] [--bell] [--replay]` | outside-move alerts and the lag study without a web server (see [Outside moves](#outside-moves-is-the-cup-delayed)) |
 
 Global flags go **before** the command: `--tournament <slug>`, `--public` (unbound keys),
 `--json` (raw JSON for scripting), `--data-dir <dir>`, `-v` / `-vv` (logging).
@@ -246,6 +392,12 @@ python -m supermarket_bot stream 26 27 --duration 600
 
 `stream` appends every event (trades, top-of-book changes, resyncs, settlements) to
 `data/<tournament-slug>/stream-YYYY-MM-DD.jsonl`.
+
+The dashboard and `moves` append every outside-move alert event to `data/<tournament-slug>/alerts.jsonl`:
+`{"event": "opened" | "status" | "closed", "at": <epoch>, "at_iso": "...Z", "alert": {...}}`. The database
+keeps each alert's latest state (a closed alert no longer carries its trade suggestion), so `moves --replay`
+takes each alert as it was when it opened from the `alerts.jsonl` next to the database; without that file it
+says the suggestion was not kept rather than claiming there was none.
 
 All prices are **YES-denominated probabilities in [0, 1]**. For a NO position the cost per share is
 `1 - price`.

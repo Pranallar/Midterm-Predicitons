@@ -494,9 +494,12 @@ class DashboardApp:
         fair_values: Any = None,
         regime: str = "unknown",
         sizing: str = "conservative",
+        moves: Any = None,
     ) -> None:
         self.tracker = tracker
         self.fair_values = fair_values
+        # docs/OUTSIDE_MOVES.md §18 (package "server"): the tracker's OutsideMoveWatcher (None: alerts are off)
+        self.moves = moves
         self.regime = str(regime or "unknown")
         self.sizing = str(sizing or "conservative")
         self.store = store
@@ -533,6 +536,8 @@ class DashboardApp:
         self._pbt_finished_at: Optional[float] = None
         self._pbt_thread: Optional[threading.Thread] = None
         self._fv_cache: Optional[Tuple[float, Dict[str, Any]]] = None
+        # (strategy payload, the watcher's published summary it was annotated against, the annotated payload)
+        self._strategy_annotated: Optional[Tuple[Dict[str, Any], Any, Dict[str, Any]]] = None
 
     # ------------------------------------------------------------------ inputs
     def _view(self) -> Dict[str, Any]:
@@ -720,7 +725,7 @@ class DashboardApp:
         view_error = self.view_error
         budget = tracker["read_budget"]
         limiter = getattr(self.client, "read_limiter", None)
-        extras = {k: budget[k] for k in ("paper", "reserve", "projected_per_min", "warning") if k in budget}
+        extras = {k: budget[k] for k in ("paper", "moves", "reserve", "projected_per_min", "warning") if k in budget}
         if limiter is not None and _finite(budget.get("used")) is None:
             try:
                 budget = {"used": limiter.used, "limit": limiter.limit, "window_s": getattr(limiter, "window", 60.0)}
@@ -728,6 +733,13 @@ class DashboardApp:
                 budget = {}
             budget.update(extras)  # the tracker's paper budget, reserve and projection (§10.5) pass through
             tracker["read_budget"] = budget
+        # docs/OUTSIDE_MOVES.md §18.3: the outside-move watcher's Cup order-book budget ({"used", "limit", "room"} | null)
+        moves_budget = _book_reads_dict(budget.get("moves"))
+        if moves_budget is None and self.moves is not None:
+            moves_budget = self._moves_book_reads()
+        budget["moves"] = moves_budget
+        moves_status = tracker.get("moves") if isinstance(tracker.get("moves"), Mapping) else self._moves_status()
+        tracker["moves"] = moves_status
         problems = list(tracker["problems"])
         paused_for = _limiter_pause(limiter)
         if limiter is not None:
@@ -767,6 +779,7 @@ class DashboardApp:
             "view_updated_at": self.view_updated_at,
             "problems": problems,
             "detection": tracker["detection"],
+            "moves": moves_status,  # the watcher's compact status (§12.4: badge, notifications) | null
             "account": {
                 "balance": ctx["balance"],
                 "initial_balance": ctx["initial_balance"] if ctx["initial_balance"] is not None else DEFAULT_INITIAL_BALANCE,
@@ -782,6 +795,7 @@ class DashboardApp:
                 "paper": self._paper_enabled(),
                 "fair_value": (getattr(self.fair_values, "mode", None) or "off") if self.fair_values is not None else "off",
                 "sizing": self.sizing, "regime": self.regime,
+                "moves": self.moves is not None,  # docs/OUTSIDE_MOVES.md §18.3
             },
             "counts": {
                 "outcomes": len(rows),
@@ -1038,20 +1052,21 @@ class DashboardApp:
     # ------------------------------------------------------------------ strategy
     def strategy(self) -> Dict[str, Any]:
         now = self.clock()
+        # (the outside-move annotation takes self._lock itself: it always runs after the lock is released)
         with self._lock:
             cached = self._strategy_cache
-            if cached is not None and now - cached[0] < cached[1]:
-                return cached[2]
+        if cached is not None and now - cached[0] < cached[1]:
+            return self._annotate_strategy(cached[2])
         with self._strategy_build:
             now = self.clock()
             with self._lock:
                 cached = self._strategy_cache
-                if cached is not None and now - cached[0] < cached[1]:
-                    return cached[2]
+            if cached is not None and now - cached[0] < cached[1]:
+                return self._annotate_strategy(cached[2])
             payload, ttl = self._build_strategy(now)
             with self._lock:
                 self._strategy_cache = (now, ttl, payload)
-            return payload
+        return self._annotate_strategy(payload)
 
     def _backtest_state(self) -> Tuple[Any, str, Optional[str]]:
         with self._lock:
@@ -1420,6 +1435,9 @@ class DashboardApp:
                             live_run_started_at=self._live_run_started_at(),
                         )
                         report = run_backtest(ro, config, progress=lambda done, total: time.sleep(0))
+                        # lookahead-1: every stored paper run counts (one that ended -- completed, reset,
+                        # "settings changed" -- saw this data as much as the current one)
+                        pipeline.apply_paper_overlap(report, pipeline.paper_run_intervals(ro, now=self.clock()))
                         status = "ready"
                 finally:
                     ro.close()
@@ -1450,11 +1468,167 @@ class DashboardApp:
         if cached is not None and now - cached[0] < FAIRVALUE_TTL_S and now >= cached[0]:
             out = dict(cached[1])
             out["now"] = now
-            return out
+            return self._annotate_fairvalue(out)
         payload = self._build_fairvalue(now)
         with self._lock:
             self._fv_cache = (now, payload)
-        return payload
+        return self._annotate_fairvalue(payload)
+
+    def outside_moves(self, state: Optional[str] = None, since: Optional[float] = None,
+                      limit: Optional[int] = None) -> Dict[str, Any]:
+        """``GET /api/moves`` (docs/OUTSIDE_MOVES.md §18.2): the watcher's published summary plus ``now``, ``enabled``,
+        ``available``, ``error``, ``demo`` and ``book_reads``, filtered by ``state`` ("open" | "closed" | "all"),
+        ``since`` (detected_at >= since) and ``limit`` (1..500, default 100). The disabled body when there is no
+        watcher. Query validation (400) happens in the handler.
+
+        Lock rule (§12.3): the published summary and status are read lock-free; only a filtered request asks the
+        watcher for its in-memory alert list (``alerts()``, which takes the watcher's leaf lock briefly)."""
+        from .moves import MOVES_MAX_ALERTS_API
+
+        now = self.clock()
+        watcher = self.moves
+        if watcher is None:
+            return moves_payload(None, now, enabled=False, demo=self.demo)
+        demo = self.demo or bool(getattr(watcher, "demo", False))
+        error: Optional[str] = None
+        summary: Optional[Mapping[str, Any]] = None
+        try:
+            raw = watcher.summary()
+            summary = raw if isinstance(raw, Mapping) else None
+        except Exception as exc:  # a broken watcher never takes the endpoint down; it says so
+            log.warning("outside-move summary failed: %s", exc, exc_info=log.isEnabledFor(logging.DEBUG))
+            error = f"The outside-move alerts could not be read ({type(exc).__name__}): see the dashboard's log."
+        status = self._moves_status()
+        if error is None and status is not None and status.get("last_error"):
+            error = str(status["last_error"])
+        if summary is None and error is None:
+            error = "The outside-move alerts could not be read: see the dashboard's log."
+        alerts: Optional[List[Mapping[str, Any]]] = None
+        if summary is not None and (state in ("open", "closed") or since is not None
+                                    or (limit is not None and limit != MOVES_MAX_ALERTS_API)):
+            alerts = self._moves_alerts(watcher, summary, state, since, limit or MOVES_MAX_ALERTS_API)
+        return moves_payload(summary, now, enabled=True, demo=demo, error=error, book_reads=self._moves_book_reads(),
+                             alerts=alerts)
+
+    @staticmethod
+    def _moves_alerts(watcher: Any, summary: Mapping[str, Any], state: Optional[str], since: Optional[float],
+                      limit: int) -> List[Mapping[str, Any]]:
+        """The alerts of a filtered /api/moves request, in the summary's order (open first: actionable, then other
+        open, newest first; then closed newest first). Every alert in the watcher's memory (30 days) when it can list
+        them, else the published summary's (at most 100). Filters on each alert dict's own ``state`` so the list
+        always agrees with the alerts it shows."""
+        listed: Any = None
+        fn = getattr(watcher, "alerts", None)
+        if callable(fn):
+            try:
+                listed = fn(None, since, None)
+            except Exception as exc:
+                log.debug("outside-move alerts() failed: %s", exc)
+                listed = None
+        if not isinstance(listed, (list, tuple)):
+            listed = summary.get("alerts") or []
+        out: List[Mapping[str, Any]] = []
+        for alert in listed:
+            if not isinstance(alert, Mapping):
+                continue
+            if state in ("open", "closed") and alert.get("state") != state:
+                continue
+            detected = _finite(alert.get("detected_at"))
+            if since is not None and (detected is None or detected < since):
+                continue
+            out.append(alert)
+            if len(out) >= limit:
+                break
+        return out
+
+    def _moves_status(self) -> Optional[Dict[str, Any]]:
+        """The watcher's compact published status (§12.4; lock-free), or None."""
+        if self.moves is None:
+            return None
+        try:
+            raw = self.moves.status()
+        except Exception as exc:
+            log.debug("outside-move status failed: %s", exc)
+            return None
+        return dict(raw) if isinstance(raw, Mapping) else None
+
+    def _moves_book_reads(self) -> Optional[Dict[str, int]]:
+        """``tracker.read_budget.moves`` ({"used", "limit", "room"}) without taking the tracker's lock when the tracker
+        exposes its MovesBudget; else from ``tracker.status()``; None without a watcher's budget."""
+        budget = getattr(self.tracker, "moves_budget", None)
+        status_fn = getattr(budget, "status", None)
+        if callable(status_fn):
+            try:
+                return _book_reads_dict(status_fn())
+            except Exception as exc:
+                log.debug("outside-move book budget failed: %s", exc)
+        if self.moves is None:
+            return None
+        st = self._tracker_status()
+        raw = (st or {}).get("read_budget")
+        return _book_reads_dict(raw.get("moves")) if isinstance(raw, Mapping) else None
+
+    def _open_move(self, exchange_id: Any) -> Optional[Dict[str, Any]]:
+        """``move_annotation`` of the outcome's OPEN outside-move alert (the watcher's lock-free
+        ``open_alert_for``), or None."""
+        if self.moves is None or exchange_id is None:
+            return None
+        fn = getattr(self.moves, "open_alert_for", None)
+        if not callable(fn):
+            return None
+        try:
+            annotation = move_annotation(fn(str(exchange_id)))
+        except Exception as exc:
+            log.debug("outside-move open_alert_for(%s) failed: %s", exchange_id, exc)
+            return None
+        return annotation if annotation is not None and annotation["state"] == "open" else None
+
+    def _annotate_strategy(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """``outside_move`` on every value idea whose outcome (or any leg's) has an open outside-move alert (§18.4);
+        nothing else changes, and the cached report is never mutated. Re-annotated after each watcher step (the
+        published summary is the version), so a fresh alert shows within one step, not one strategy TTL."""
+        watcher = self.moves
+        opps = payload.get("opportunities")
+        if watcher is None or not isinstance(opps, list) or not opps:
+            return payload
+        try:
+            version = watcher.summary()
+        except Exception:
+            version = None
+        with self._lock:
+            cached = self._strategy_annotated
+        if cached is not None and version is not None and cached[0] is payload and cached[1] is version:
+            return cached[2]
+        changed = False
+        annotated: List[Any] = []
+        for opp in opps:
+            if isinstance(opp, Mapping) and opp.get("kind") == "value":
+                ids = [opp.get("exchange_id")] + [leg.get("exchange_id") for leg in opp.get("legs") or []
+                                                  if isinstance(leg, Mapping)]
+                note = next((n for n in (self._open_move(eid) for eid in ids if eid is not None) if n is not None), None)
+                if note is not None:
+                    opp = dict(opp)
+                    opp["outside_move"] = note
+                    changed = True
+            annotated.append(opp)
+        out = payload
+        if changed:
+            out = dict(payload)
+            out["opportunities"] = annotated
+        if version is not None:
+            with self._lock:
+                self._strategy_annotated = (payload, version, out)
+        return out
+
+    def _annotate_fairvalue(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Every /api/fairvalue row gains ``"move"``: the outcome's open outside-move alert (§18.4) or null."""
+        rows = payload.get("rows")
+        if not isinstance(rows, list):
+            return payload
+        out = dict(payload)
+        out["rows"] = [{**row, "move": self._open_move(row.get("exchange_id"))} if isinstance(row, Mapping) else row
+                       for row in rows]
+        return out
 
     def _build_fairvalue(self, now: float) -> Dict[str, Any]:
         history = None
@@ -1514,14 +1688,20 @@ def fairvalue_payload(fv: Any, quotes: Mapping[str, Mapping[str, Any]], now: flo
             as_of = _finite(fair.get("as_of"))
             fair["age_s"] = round(now - as_of, 3) if as_of is not None else None
         matches = [vm.to_dict() for vm in m.matches]
-        near = bool(fair and fair.get("match_kind") == "NEAR") or any(vm.kind == "NEAR" for vm in m.matches)
+        # ui-11: "near match" only when a NEAR match exists (a venue match of kind NEAR, or a fair value priced
+        # from one): an unmatched outcome's FairValue still carries its race's match kind
+        near = any(vm.kind == "NEAR" for vm in m.matches) or bool(
+            fair and fair.get("match_kind") == "NEAR" and value is not None)
+        has_match = bool(m.matches) or value is not None
         suspect = bool(fair and fair.get("suspect"))
         target = targets.get(eid)
         external = {vm.venue: vm.external_id for vm in m.matches if vm.venue in ("polymarket", "kalshi")}
-        snippets: Dict[str, Optional[str]] = {"disable": f'"{eid}": {{"disabled": true, "note": "wrong match"}}',
-                                              "pin": None, "confirm": None, "trade_near": None}
+        snippets: Dict[str, Optional[str]] = {
+            "disable": f'"{eid}": {{"disabled": true, "note": "wrong match"}}' if has_match else None,
+            "pin": None, "confirm": None, "trade_near": None}
         if target is not None:
-            snippets["disable"] = override_snippet(target, "disable")
+            # "Turn this match off" only for a match that exists; pinning is how an unmatched outcome gets one
+            snippets["disable"] = override_snippet(target, "disable") if has_match else None
             snippets["pin"] = override_snippet(target, "pin", external or None)
             if suspect:
                 snippets["confirm"] = override_snippet(target, "confirm")
@@ -1549,6 +1729,144 @@ def fairvalue_payload(fv: Any, quotes: Mapping[str, Mapping[str, Any]], now: flo
 
 
 # --------------------------------------------------------------------------- HTTP
+
+
+MOVES_STATES_QUERY = ("open", "closed", "all")  # GET /api/moves?state=
+MOVES_LIMIT_MAX = 500  # GET /api/moves?limit= (1..500)
+MOVES_STATE_ERROR = "state must be open, closed or all."
+MOVES_SINCE_ERROR = "since must be a number of seconds since 1970."
+MOVES_LIMIT_ERROR = "limit must be a whole number from 1 to 500."
+MOVES_FV_NOTICE = "Outside-move alerts need --fair-value auto: off."  # docs/OUTSIDE_MOVES.md §17.1 / §18.1
+MOVES_POLL_ERROR = "--moves-poll must be between 5 and 120 seconds"
+_WHOLE_NUMBER_RE = re.compile(r"^\+?[0-9]{1,6}$")
+
+
+def _count(value: Any) -> int:
+    number = _finite(value)
+    return int(number) if number is not None and number > 0 else 0
+
+
+def _book_reads_dict(raw: Any) -> Optional[Dict[str, int]]:
+    """``{"used", "limit", "room"}`` of the watcher's Cup order-book budget (tracker.read_budget.moves), or None."""
+    data = _plain(raw)
+    if not isinstance(data, Mapping):
+        return None
+    return {"used": _count(data.get("used")), "limit": _count(data.get("limit")), "room": _count(data.get("room"))}
+
+
+def moves_query(query: Mapping[str, Sequence[str]]) -> Tuple[Optional[str], Dict[str, Any]]:
+    """``(error, kwargs)`` for ``GET /api/moves?state=&since=&limit=`` (docs/OUTSIDE_MOVES.md §18.2): ``error`` is one
+    of the three 400 sentences, else None and ``kwargs`` are :meth:`DashboardApp.outside_moves` keywords. A blank
+    value means the default (state all, no since, limit 100)."""
+
+    def first(name: str) -> str:
+        values = query.get(name) or [""]
+        return str(values[0] if values else "").strip()
+
+    kwargs: Dict[str, Any] = {"state": None, "since": None, "limit": None}
+    state = first("state").lower()
+    if state:
+        if state not in MOVES_STATES_QUERY:
+            return MOVES_STATE_ERROR, kwargs
+        kwargs["state"] = state
+    since = first("since")
+    if since:
+        try:
+            value = float(since)
+        except ValueError:
+            return MOVES_SINCE_ERROR, kwargs
+        if not math.isfinite(value) or value < 0:
+            return MOVES_SINCE_ERROR, kwargs
+        kwargs["since"] = value
+    limit = first("limit")
+    if limit:
+        if not _WHOLE_NUMBER_RE.match(limit) or not 1 <= int(limit) <= MOVES_LIMIT_MAX:
+            return MOVES_LIMIT_ERROR, kwargs
+        kwargs["limit"] = int(limit)
+    return None, kwargs
+
+
+def _empty_moves_counts() -> Dict[str, Any]:
+    from .moves import SUPPRESS_REASONS
+
+    return {"open": 0, "lagging": 0, "actionable": 0, "today": 0, "closed_today": 0,
+            "suppressed_today": {reason: 0 for reason in SUPPRESS_REASONS}}
+
+
+def moves_payload(summary: Optional[Mapping[str, Any]], now: float, *, enabled: bool, demo: bool,
+                  error: Optional[str] = None, book_reads: Optional[Mapping[str, Any]] = None,
+                  alerts: Optional[Sequence[Mapping[str, Any]]] = None) -> Dict[str, Any]:
+    """The exact ``/api/moves`` body of docs/OUTSIDE_MOVES.md §18.2 from the watcher's published summary (or the
+    disabled body when ``enabled`` is False). ``alerts`` replaces the summary's list when the request filtered it.
+    Pure; every key always present. A watcher whose summary could not be read (``summary`` None while ``enabled``)
+    answers like one that has not stepped yet (``available`` False) with ``error`` saying why, never as "off"."""
+    from .moves import MOVES_CAVEATS, MOVES_DEMO_CAVEAT, MOVES_MAX_SUPPRESSED_SHOWN, MOVES_OFF_ERROR, LagSummary
+    from .moves import SUPPRESS_REASONS
+
+    if not enabled:
+        return {
+            "now": now, "enabled": False, "available": False, "error": MOVES_OFF_ERROR, "demo": bool(demo),
+            "poll_s": None, "last_step_at": None, "steps": 0, "watching": {"outcomes": 0, "matched": 0, "venues": 0},
+            "venues": [], "counts": _empty_moves_counts(), "actionable_ids": [], "alerts": [], "suppressed": [],
+            "summary": None, "thresholds": None, "book_reads": None, "caveats": [],
+        }
+    s: Mapping[str, Any] = summary if isinstance(summary, Mapping) else {}
+    steps = _count(s.get("steps"))
+    raw_counts = s.get("counts") if isinstance(s.get("counts"), Mapping) else {}
+    raw_supp = raw_counts.get("suppressed_today") if isinstance(raw_counts.get("suppressed_today"), Mapping) else {}
+    counts = {key: _count(raw_counts.get(key)) for key in ("open", "lagging", "actionable", "today", "closed_today")}
+    counts["suppressed_today"] = {reason: _count(raw_supp.get(reason)) for reason in SUPPRESS_REASONS}
+    watching = s.get("watching") if isinstance(s.get("watching"), Mapping) else {}
+    lag = s.get("summary")
+    thresholds = s.get("thresholds")
+    caveats = [str(c) for c in (s.get("caveats") or MOVES_CAVEATS) if c]
+    if demo and MOVES_DEMO_CAVEAT not in caveats:  # demo results always say they are scripted
+        caveats.append(MOVES_DEMO_CAVEAT)
+    listed = alerts if alerts is not None else s.get("alerts")
+    return {
+        "now": now,
+        "enabled": True,
+        "available": summary is not None and steps >= 1,
+        "error": str(error) if error else None,
+        "demo": bool(demo),
+        "poll_s": _finite(s.get("poll_s")),
+        "last_step_at": _finite(s.get("last_step_at")),
+        "steps": steps,
+        "watching": {key: _count(watching.get(key)) for key in ("outcomes", "matched", "venues")},
+        "venues": [dict(v) for v in s.get("venues") or [] if isinstance(v, Mapping)],
+        "counts": counts,
+        "actionable_ids": [str(a) for a in s.get("actionable_ids") or [] if a is not None],
+        "alerts": [a for a in listed or [] if isinstance(a, Mapping)],
+        "suppressed": [x for x in s.get("suppressed") or [] if isinstance(x, Mapping)][:MOVES_MAX_SUPPRESSED_SHOWN],
+        "summary": dict(lag) if isinstance(lag, Mapping) else LagSummary().to_dict(),
+        "thresholds": dict(thresholds) if isinstance(thresholds, Mapping) else None,
+        "book_reads": _book_reads_dict(book_reads),
+        "caveats": caveats,
+    }
+
+
+def move_annotation(alert: Optional[Mapping[str, Any]]) -> Optional[Dict[str, Any]]:
+    """The compact ``outside_move`` / ``move`` object added to /api/strategy value ideas and /api/fairvalue rows
+    (§18.4): {"alert_id", "status", "status_label", "state", "direction", "move", "lag_gap_now", "detected_at",
+    "actionable"}, or None. Takes a full alert dict or the watcher's compact ``open_alert_for`` one."""
+    from .moves import MOVE_STATUS_LABELS
+
+    data = _plain(alert)
+    if not isinstance(data, Mapping) or not data.get("alert_id"):
+        return None
+    status = str(data.get("status") or "") or None
+    direction = _finite(data.get("direction"))
+    return {
+        "alert_id": str(data["alert_id"]),
+        "status": status,
+        "status_label": str(data.get("status_label") or MOVE_STATUS_LABELS.get(status or "", "") or "") or None,
+        "state": str(data.get("state") or "open"),
+        "direction": (1 if direction > 0 else -1) if direction else None,
+        "move": _finite(data.get("move")),
+        "lag_gap_now": _finite(data.get("lag_gap_now")),
+        "detected_at": _finite(data.get("detected_at")),
+        "actionable": bool(data.get("actionable")),
+    }
 
 
 def is_loopback_host(host: str) -> bool:
@@ -1976,6 +2294,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         return self._error(404, NO_PREVIOUS_RUN)
                     return self._json(200, previous)
                 return self._json(200, app.paper())
+            if name == "outside_moves":  # docs/OUTSIDE_MOVES.md §18.2
+                problem, kwargs = moves_query(query)
+                if problem is not None:
+                    return self._error(400, problem)
+                return self._json(200, app.outside_moves(**kwargs))
             return self._json(200, getattr(app, name)())
         if path == "/api/paper/reset":
             return self._error(405, "Use POST to reset the simulation.", (("Allow", "POST"),))
@@ -2010,6 +2333,7 @@ _GET_ROUTES: Dict[str, str] = {
     "/api/paper": "paper",
     "/api/backtest": "backtest",
     "/api/fairvalue": "fairvalue",
+    "/api/moves": "outside_moves",  # docs/OUTSIDE_MOVES.md §18.2
 }
 
 
@@ -2062,6 +2386,7 @@ class Runtime:
     demo_market: Any = None
     fair_values: Any = None  # the tracker's FairValueService (None with --fair-value off)
     clock: Any = None  # the SimClock of a fast demo run (None: real time)
+    moves: Any = None  # the OutsideMoveWatcher (None when outside-move alerts are off; docs/OUTSIDE_MOVES.md §18.1)
 
     def start(self) -> None:
         self.tracker.start()
@@ -2070,6 +2395,9 @@ class Runtime:
         for step, fn in (
             ("tracker", lambda: self.tracker.stop()),
             ("news", lambda: self.news.close() if self.news is not None and hasattr(self.news, "close") else None),
+            # the watcher before the fair values (its providers) and the store it writes to (§18.1): a step still
+            # running finishes its writes, and a later step does nothing
+            ("outside moves", lambda: self.moves.close() if self.moves is not None else None),
             ("fair values", lambda: self.fair_values.close() if self.fair_values is not None else None),
             ("client", lambda: self.client.close()),
             ("store", lambda: self.store.close()),
@@ -2089,11 +2417,13 @@ def _remove_db(path: Path) -> None:
 
 
 def _refuse_if_tracked(db: Path, interval: float) -> None:
-    """Raise ``tracker.TrackerBusy`` when another live process holds ``db``'s tracker lease (its heartbeat is
-    younger than 3 intervals of wall time), so a demo start never deletes a running demo's database."""
+    """Raise ``tracker.TrackerBusy`` when another live process holds ``db``'s tracker lease, so a demo start never
+    deletes a running demo's database. Like ``store.acquire_lease`` (live-5): a process on this machine is asked
+    directly (running: refused whatever its heartbeat age, up to LEASE_LIVE_HOLDER_MAX_S; ended: not refused);
+    otherwise its heartbeat must be younger than 3 intervals of wall time."""
     if not db.is_file():
         return
-    from .store import TrackerStore
+    from .store import LEASE_LIVE_HOLDER_MAX_S, TrackerStore, lease_holder_alive
     from .tracker import LEASE_NAME, TrackerBusy
 
     try:
@@ -2110,8 +2440,13 @@ def _refuse_if_tracked(db: Path, interval: float) -> None:
         return
     beat = _finite(holder.get("heartbeat_at"))
     ttl = 3.0 * max(float(interval), 30.0)
-    if beat is not None and -ttl < time.time() - beat < ttl:  # like store.acquire_lease (a far-future beat is a SimClock's)
-        raise TrackerBusy(holder, str(db))
+    alive = lease_holder_alive(holder)
+    if alive is False:
+        return  # that process ended without shutting down (a crash, a closed terminal): nothing tracks this file
+    limit = max(ttl, LEASE_LIVE_HOLDER_MAX_S) if alive else ttl
+    now = time.time()
+    if beat is not None and -limit < now - beat < limit:  # like store.acquire_lease (a far-future beat is a SimClock's)
+        raise TrackerBusy({**holder, "alive": alive}, str(db), ttl_s=ttl, now=now)
 
 
 def _judge(enabled: bool, out: TextIO) -> Any:
@@ -2186,6 +2521,9 @@ def build_demo(
     fresh_db: bool = True,
     target_hours: Optional[float] = None,
     fair_value_providers: Optional[Callable[[Any], Sequence[Any]]] = None,
+    moves: bool = False,
+    moves_poll_s: Optional[float] = None,
+    moves_book_reads_per_min: Optional[int] = None,
 ) -> Runtime:
     """A dashboard over the simulated market (no API key, no network).
 
@@ -2195,7 +2533,15 @@ def build_demo(
     to **fast mode** (D42): every limiter runs on the SimClock with budgets above the per-step demand and a
     ``sleep`` (:func:`demo.no_wait`) that raises ``SimClockStall`` instead of waiting. ``fresh_db=False``
     keeps an existing ``<data_dir>/demo/tracker.sqlite3`` (restart continuity, D47). ``fair_value_providers``
-    (tests) builds the "auto" providers from the DemoMarket instead of ``[DemoFairValueProvider(market)]``."""
+    (tests) builds the "auto" providers from the DemoMarket instead of ``[DemoFairValueProvider(market)]``.
+
+    docs/OUTSIDE_MOVES.md §18.1 (package "server"): ``moves`` builds ``DemoMarket(outside_moves=True)``, an
+    OutsideMoveWatcher over the two DemoOutsideVenue venues (needs fair value "auto"), ``moves_poll_s`` (default
+    MOVES_POLL_S) and ``moves_book_reads_per_min`` (default: FAST_READS_PER_MIN in fast mode, else
+    MOVES_READS_PER_MIN; an explicit 0 turns the Cup book reads off in both); False (the default) builds exactly the
+    demo of before. With fair value "manual" / "off" no watcher is built and ``MOVES_FV_NOTICE`` is printed to
+    ``out`` (never an exception). The watcher writes ``<data_dir>/demo/alerts.jsonl`` (append-only) and the store;
+    ``fresh_db=False`` keeps both, so a rebuilt demo continues its alerts (restart continuity)."""
     from .attribution import Attributor
     from .bot import resolve_context
     from .client import SuperMarketClient
@@ -2206,6 +2552,10 @@ def build_demo(
 
     fv_mode = _fair_value_mode(fair_value)
     fast = isinstance(clock, SimClock)
+    poll_s = _moves_poll_value(moves_poll_s) if moves else None
+    if moves and fv_mode != "auto":
+        print(MOVES_FV_NOTICE, file=out, flush=True)
+        moves = False
     timed: Dict[str, Any] = {"clock": clock} if clock is not None else {}
     db = Path(data_dir) / "demo" / "tracker.sqlite3"
     db.parent.mkdir(parents=True, exist_ok=True)
@@ -2216,13 +2566,17 @@ def build_demo(
     client: Any = None
     fair_values: Any = None
     searcher: Any = None
+    watcher: Any = None
     try:
         # A kept database continues its demo: the scripted events keep their original start (D47).
         saved_t0 = None if fresh_db else _finite(store.get_state(DEMO_T0_STATE_KEY))
+        # the outside-move scenarios exist only with moves (docs/OUTSIDE_MOVES.md §15.1): without them the
+        # DemoMarket is exactly the one the paper-trading tests know
+        market_kw: Dict[str, Any] = {"outside_moves": True} if moves else {}
         if clock is not None:
-            market = DemoMarket(seed=seed, now=float(clock()), clock=clock, start=saved_t0)
+            market = DemoMarket(seed=seed, now=float(clock()), clock=clock, start=saved_t0, **market_kw)
         else:
-            market = DemoMarket(seed=seed, start=saved_t0)
+            market = DemoMarket(seed=seed, start=saved_t0, **market_kw)
         store.set_state(DEMO_T0_STATE_KEY, market.t0)
         limiter_kw: Dict[str, Any] = {"clock": clock, "sleep": no_wait} if fast else {}
         client = SuperMarketClient(
@@ -2263,6 +2617,24 @@ def build_demo(
         tracker_kw: Dict[str, Any] = dict(timed)
         if fast:
             tracker_kw.update(limiter_clock=clock, limiter_sleep=no_wait)
+        if moves:  # docs/OUTSIDE_MOVES.md §18.1
+            from .demo import MOVES_DEMO_VENUES, DemoOutsideVenue
+            from .moves import MOVES_ALERTS_FILE, MoveParams, OutsideMoveWatcher
+            from .tracker import MOVES_READS_PER_MIN
+
+            # the scripted venues are NOT fair-value providers (M12): the paper trader never sees their quotes
+            watcher = OutsideMoveWatcher(
+                fair_values, providers=[DemoOutsideVenue(market, venue) for venue in MOVES_DEMO_VENUES],
+                persistence=store, alerts_path=db.parent / MOVES_ALERTS_FILE, clock=clock or time.time,
+                params=MoveParams(poll_s=poll_s), demo=True,
+            )
+            if moves_book_reads_per_min is not None and int(moves_book_reads_per_min) <= 0:
+                book_rpm = 0  # --book-reads 0: no Cup order-book reads at all (the trade box says shares unknown)
+            elif fast:
+                book_rpm = FAST_READS_PER_MIN  # a SimClock run never waits for a limiter (D42)
+            else:
+                book_rpm = int(moves_book_reads_per_min) if moves_book_reads_per_min is not None else MOVES_READS_PER_MIN
+            tracker_kw.update(moves=watcher, moves_reads_per_min=book_rpm)
         tracker = Tracker(
             client,
             context,
@@ -2279,12 +2651,15 @@ def build_demo(
             **tracker_kw,
         )
         holder.append(tracker)
+        app_kw: Dict[str, Any] = dict(timed)
+        if watcher is not None:
+            app_kw["moves"] = watcher
         app = DashboardApp(
             tracker, store, client, context, demo=True, interval=interval, news_enabled=news, llm_enabled=judge is not None,
-            fair_values=fair_values, regime=regime, sizing=sizing, **timed,
+            fair_values=fair_values, regime=regime, sizing=sizing, **app_kw,
         )
     except BaseException:  # including Ctrl-C while starting
-        for thing in (searcher, fair_values, store, client):
+        for thing in (watcher, searcher, fair_values, store, client):
             if thing is not None and hasattr(thing, "close"):
                 try:
                     thing.close()
@@ -2292,7 +2667,20 @@ def build_demo(
                     log.debug("closing %r after a failed start failed: %s", thing, exc)
         raise
     return Runtime(app, tracker, store, client, context, news=searcher, demo_market=market, fair_values=fair_values,
-                   clock=clock if fast else None)
+                   clock=clock if fast else None, moves=watcher)
+
+
+def _moves_poll_value(value: Any) -> float:
+    """The watcher's poll period: ``value`` (seconds, MOVES_POLL_MIN_S..MOVES_POLL_MAX_S) or MOVES_POLL_S when None.
+    ``ValueError`` (with the CLI's sentence) for anything else."""
+    from .moves import MOVES_POLL_MAX_S, MOVES_POLL_MIN_S, MOVES_POLL_S
+
+    if value is None:
+        return float(MOVES_POLL_S)
+    poll = _finite(value)
+    if poll is None or not MOVES_POLL_MIN_S <= poll <= MOVES_POLL_MAX_S:
+        raise ValueError(MOVES_POLL_ERROR)
+    return poll
 
 
 # Startup against the real API: when the first read (the tournament) fails with a temporary
@@ -2458,9 +2846,16 @@ def build_live(
     store: Any = None
     searcher: Any = None
     fair_values: Any = None
+    watcher: Any = None
     try:
         options = simulation_options(args)
         fv_mode, sizing, regime = options["fair_value"], options["sizing"], options["regime"]
+        # docs/OUTSIDE_MOVES.md §18.1: the outside-move watcher polls the fair-value providers' validated matches,
+        # so it needs fair value "auto"; asked for without it, it is off and says so once
+        moves_enabled = bool(options["moves"]) and fv_mode == "auto"
+        moves_poll = _moves_poll_value(options["moves_poll_s"]) if moves_enabled else None
+        if options["moves"] and not moves_enabled:
+            print(MOVES_FV_NOTICE, file=out, flush=True)
         slug = getattr(args, "tournament", None) or settings.tournament
         data_dir = Path(settings.data_dir)
         print("Connecting to the Super Market API…", file=out, flush=True)
@@ -2485,13 +2880,27 @@ def build_live(
         interval = float(getattr(args, "interval", 30.0))
         holder: List[Any] = []
         if fv_mode != "off":
-            from .fairvalue import FairValueService, default_providers
+            from .fairvalue import OUTSIDE_READS_PER_MIN_WITH_MOVES, FairValueService, default_providers
 
+            # with the watcher, each outside host gets 45 reads a minute (poll ~20/12 + refresh 5/3, §4.3)
+            provider_kw: Dict[str, Any] = {"reads_per_min": OUTSIDE_READS_PER_MIN_WITH_MOVES} if moves_enabled else {}
             fair_values = FairValueService(
-                data_dir / context.label, mode=fv_mode, providers=default_providers(fv_mode),
+                data_dir / context.label, mode=fv_mode, providers=default_providers(fv_mode, **provider_kw),
                 recorder=store.add_fair_values, refresh_recorder=store.add_fair_value_refresh,
                 cup_mids=lambda: holder[0].cup_mids() if holder else {},
             )
+        tracker_moves: Dict[str, Any] = {}
+        if moves_enabled:
+            from .moves import MOVES_ALERTS_FILE, MoveParams, OutsideMoveWatcher
+            from .tracker import MOVES_READS_PER_MIN
+
+            # providers=None: the FairValueService's own Polymarket/Kalshi providers (one host budget, one backoff)
+            watcher = OutsideMoveWatcher(fair_values, persistence=store,
+                                         alerts_path=data_dir / context.label / MOVES_ALERTS_FILE,
+                                         params=MoveParams(poll_s=moves_poll))
+            book_rpm = options["moves_book_reads_per_min"]
+            tracker_moves = {"moves": watcher,
+                             "moves_reads_per_min": int(book_rpm) if book_rpm is not None else MOVES_READS_PER_MIN}
         engine: Any = None
         if options["paper"]:
             from .paper import PaperEngine
@@ -2506,10 +2915,12 @@ def build_live(
                           paper=engine, paper_reads_per_min=engine.config.reads_per_min if engine is not None else 20,
                           paper_reads_per_min_during_backfill=(
                               engine.config.reads_per_min_during_backfill if engine is not None else 6),
-                          regime=regime, lease=True)
+                          regime=regime, lease=True, **tracker_moves)
         holder.append(tracker)
         if fv_mode == "auto":
             print(FV_AUTO_NOTICE, file=out, flush=True)
+        if watcher is not None:
+            print(moves_live_notice(float(watcher.poll_s)), file=out, flush=True)
         projected = (tracker.status().get("read_budget") or {}).get("projected_per_min")
         if projected is not None:
             print(f"Projected Super Market reads: about {float(projected):.0f} per minute before the market list is read "
@@ -2528,9 +2939,10 @@ def build_live(
             fair_values=fair_values,
             regime=regime,
             sizing=sizing,
+            moves=watcher,
         )
     except BaseException:  # including Ctrl-C while connecting: release what was opened
-        for thing in (searcher, fair_values, store, client):
+        for thing in (watcher, searcher, fair_values, store, client):
             close = getattr(thing, "close", None)
             if callable(close):
                 try:
@@ -2538,7 +2950,33 @@ def build_live(
                 except Exception as exc:
                     log.debug("closing %r after a failed start failed: %s", thing, exc)
         raise
-    return Runtime(app, tracker, store, client, context, news=searcher, fair_values=fair_values)
+    return Runtime(app, tracker, store, client, context, news=searcher, fair_values=fair_values, moves=watcher)
+
+
+# The live Cup's matched outcomes when this was written (docs/OUTSIDE_MOVES.md §4.3): 231 Polymarket ids (50 per call)
+# and 220 Kalshi tickers (100 per call); the fair-value refresh adds 5 and 3 calls a minute.
+MOVES_LIVE_POLYMARKET_IDS = 231
+MOVES_LIVE_KALSHI_TICKERS = 220
+
+
+def moves_live_notice(poll_s: float) -> str:
+    """The start-up line of a live dashboard with the outside-move watcher (§18.1), with the per-host reads a minute
+    that poll period implies (§4.3: about 25 and 15 at 15 s). When the poll needs more than the limiter leaves above
+    the fair-value refresh's headroom (36 of 45), a second sentence says some polls will be skipped (as ``moves``)."""
+    from .fairvalue import OUTSIDE_READS_PER_MIN_WITH_MOVES
+    from .moves import MOVES_POLL_HEADROOM
+
+    poll = float(poll_s)
+    pm = math.ceil(MOVES_LIVE_POLYMARKET_IDS / 50) * 60.0 / poll + 5
+    kalshi = math.ceil(MOVES_LIVE_KALSHI_TICKERS / 100) * 60.0 / poll + 3
+    text = (f"Outside-move alerts: Polymarket and Kalshi every {poll:g} s (GET only, about {pm:.0f} and {kalshi:.0f} "
+            "reads a minute); use --no-moves to stop.")
+    kept = MOVES_POLL_HEADROOM + 1
+    if pm > OUTSIDE_READS_PER_MIN_WITH_MOVES - kept:
+        text += (f" A {poll:g}-second poll needs about {pm:.0f} Polymarket reads a minute; this bot allows itself "
+                 f"{OUTSIDE_READS_PER_MIN_WITH_MOVES} a minute per host and keeps {kept} of them for the fair-value "
+                 "refresh, so some polls will be skipped.")
+    return text
 
 
 def _bind(
@@ -2579,10 +3017,15 @@ def _allow_host_option(args: Any) -> List[str]:
     return names
 
 
-def _install_sigterm(stopping: threading.Event) -> Any:
-    """Make SIGTERM stop the dashboard like Ctrl-C (also while it is still starting). Returns the old handler."""
+STOP_SIGNALS = ("SIGTERM", "SIGHUP")  # SIGHUP: the terminal window was closed (live-5)
 
-    def _sigterm(signum: int, frame: Any) -> None:
+
+def _install_sigterm(stopping: threading.Event) -> Any:
+    """Make SIGTERM, and SIGHUP where it exists (closing the terminal window), stop the dashboard or a ``paper``
+    run like Ctrl-C (also while it is still starting), so the tracker stops and releases its lease instead of
+    dying with it held. Returns the old handlers ({signal number: handler}; None off the main thread)."""
+
+    def _stop_signal(signum: int, frame: Any) -> None:
         if not stopping.is_set():
             stopping.set()
             raise KeyboardInterrupt
@@ -2590,21 +3033,45 @@ def _install_sigterm(stopping: threading.Event) -> Any:
     try:
         import signal
 
-        if threading.current_thread() is threading.main_thread():
-            return signal.signal(signal.SIGTERM, _sigterm)
+        if threading.current_thread() is not threading.main_thread():
+            return None
+        previous: Dict[int, Any] = {}
+        for name in STOP_SIGNALS:
+            signum = getattr(signal, name, None)
+            if signum is None:
+                continue
+            try:
+                if name == "SIGHUP" and signal.getsignal(signum) == signal.SIG_IGN:
+                    continue  # started under nohup: closing the terminal must not stop it
+                previous[int(signum)] = signal.signal(signum, _stop_signal)
+            except (ValueError, OSError):
+                continue
+        return previous or None
     except (ImportError, ValueError, OSError, AttributeError):
         pass
     return None
 
 
 def _restore_sigterm(previous: Any) -> None:
-    if previous is None:
+    if not previous:
         return
     try:
         import signal
 
-        signal.signal(signal.SIGTERM, previous)
+        for signum, handler in dict(previous).items():
+            try:
+                signal.signal(signum, handler if handler is not None else signal.SIG_DFL)
+            except (ValueError, OSError, TypeError):
+                continue
     except (ImportError, ValueError, OSError, AttributeError):
+        pass
+
+
+def _say_safely(text: str, stream: TextIO) -> None:
+    """Print on the way out: after SIGHUP the terminal is gone and a write fails (EIO); shutting down still must."""
+    try:
+        print(text, file=stream, flush=True)
+    except (OSError, ValueError):
         pass
 
 
@@ -2621,6 +3088,8 @@ def simulation_options(args: Any) -> Dict[str, Any]:
     """The dashboard's paper / fair-value / sizing options as ``build_demo`` keywords (§7.5)."""
     fv = "off" if getattr(args, "no_fair_value", False) else _fair_value_mode(getattr(args, "fair_value", None) or "auto")
     capital = getattr(args, "paper_capital", None)
+    poll = getattr(args, "moves_poll", None)
+    book_reads = getattr(args, "moves_book_reads", None)
     return {
         "paper": not bool(getattr(args, "no_paper", False)),
         "fair_value": fv,
@@ -2628,6 +3097,11 @@ def simulation_options(args: Any) -> Dict[str, Any]:
         "sizing": str(getattr(args, "sizing", None) or "conservative"),
         "all_collateral": bool(getattr(args, "all_collateral", False)),
         "paper_capital": float(capital) if capital else None,
+        # docs/OUTSIDE_MOVES.md §18.1: a missing attribute means off (the `paper` parser has none of these options,
+        # so `paper` never runs the watcher; old callers with a bare namespace keep their behaviour)
+        "moves": not bool(getattr(args, "no_moves", True)),
+        "moves_poll_s": float(poll) if poll is not None else None,
+        "moves_book_reads_per_min": int(book_reads) if book_reads is not None else None,
     }
 
 
@@ -2650,6 +3124,13 @@ def run_dashboard(settings: Any, args: Any, out: Optional[TextIO] = None, err: O
     if not math.isfinite(interval) or interval < 1:
         print("error: --interval must be at least 1 second", file=err)
         return 2
+    moves_poll = getattr(args, "moves_poll", None)
+    if moves_poll is not None:  # docs/OUTSIDE_MOVES.md §17.1 / §18.1
+        try:
+            _moves_poll_value(moves_poll)
+        except (TypeError, ValueError):
+            print(f"error: {MOVES_POLL_ERROR}", file=err)
+            return 2
     if not demo and interval < 10:
         print("warning: intervals under 10 s use a lot of the 100 reads/minute budget", file=err)
     for name in allow_hosts:
@@ -2753,9 +3234,9 @@ def _serve(
                 threading.Thread(target=_open_browser, args=(url,), name="open-browser", daemon=True).start()
             server.serve_forever(poll_interval=0.5)
         except KeyboardInterrupt:
-            print("\nStopping the dashboard…", file=out, flush=True)
+            _say_safely("\nStopping the dashboard…", out)
         except TrackerBusy as exc:  # another live process tracks this store (D46): refuse, exit 2
-            print(f"error: {exc}", file=err, flush=True)
+            _say_safely(f"error: {exc}", err)
             code = 2
         finally:
             stopping.set()
@@ -2764,7 +3245,7 @@ def _serve(
             finally:
                 runtime.close()
     except KeyboardInterrupt:  # a second Ctrl-C while shutting down: stop waiting for the workers
-        print("Stopped without waiting for the background work to finish.", file=out, flush=True)
+        _say_safely("Stopped without waiting for the background work to finish.", out)
         return 130
     return code
 

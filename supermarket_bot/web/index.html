@@ -14,6 +14,8 @@
 <body>
 <a class="skip-link" href="#main">Skip to main content</a>
 <div class="sr-only" id="announcer" role="status" aria-live="polite" aria-atomic="true"></div>
+<!-- new lagging outside-move alerts are said here once (docs/OUTSIDE_MOVES.md §19.4), whatever view is shown -->
+<div class="sr-only" id="moves-announcer" role="status" aria-live="polite"></div>
 
 <header class="app-header">
   <div class="header-top">
@@ -55,6 +57,7 @@
       <li><a href="#overview" data-view="overview">Overview</a></li>
       <li><a href="#markets" data-view="markets">Markets <span class="nav-count" id="nav-count-markets"></span></a></li>
       <li><a href="#surges" data-view="surges">Surges <span class="nav-count" id="nav-count-surges"></span></a></li>
+      <li><a href="#moves" data-view="moves">Outside moves <span class="nav-count nav-count-alert" id="nav-count-moves" aria-hidden="true"></span><span class="sr-only" id="nav-moves-sr"></span></a></li>
       <li><a href="#high" data-view="high">High 90s <span class="nav-count" id="nav-count-high"></span></a></li>
       <li><a href="#strategy" data-view="strategy">Strategy</a></li>
       <li><a href="#sim" data-view="sim">Simulation</a></li>
@@ -241,6 +244,16 @@
     <p class="muted-note detection-note" id="surges-note" hidden></p>
     <div class="cards" id="surge-cards"></div>
     <p class="empty" id="surges-empty" hidden></p>
+  </section>
+
+  <section class="view" id="view-moves" data-view="moves" aria-labelledby="h-moves" hidden>
+    <div class="view-errors" id="view-errors-moves" hidden></div>
+    <div class="view-head">
+      <h2 id="h-moves" tabindex="-1">Outside moves</h2>
+      <span class="badge badge-demo" id="moves-demo-badge" hidden title="Simulated outside venues: the demo's moves and the Cup's reactions are scripted">DEMO</span>
+      <p class="view-sub" id="moves-sub">Polymarket and Kalshi prices for the Cup's races, read every 15 s. An alert means an outside price moved and the Cup may not have caught up yet. Nothing is traded: every suggestion is for you to judge and place by hand.</p>
+    </div>
+    <div id="moves-body"></div>
   </section>
 
   <section class="view" id="view-high" data-view="high" aria-labelledby="h-high" hidden>

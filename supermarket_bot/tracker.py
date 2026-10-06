@@ -33,6 +33,13 @@ Paper trading and outside fair values (docs/PAPER_TRADING.md §7.2):
 * a store **lease** (D46) refuses a second tracker on the same database;
 * **lock rule** (D43): nothing calls the paper runner, the engine or the fair-value service while holding
   ``self._lock``.
+
+Outside-move alerts (docs/OUTSIDE_MOVES.md §13): ``moves`` (a :class:`~supermarket_bot.moves.OutsideMoveWatcher`)
+is bound to a :class:`TrackerCupFeed` (the published snapshot quotes, the series cache, stored books and at most
+``moves_reads_per_min`` fresh Cup books a minute inside :class:`MovesBudget`, behind the read reserve and never
+waited for) and steps every ``moves.poll_s`` in its own ``tracker-moves`` worker. Its outside polls use the
+fair-value providers' own per-host budgets, never the Super Market client. The watcher is never called while
+``self._lock`` is held, and ``status()`` reads its published status lock-free.
 """
 
 from __future__ import annotations
@@ -110,10 +117,18 @@ RESERVE_POLL_S = 1.0  # a background read waiting for room above the reserve re-
 SETTLEMENT_PAGES_MAX = 5  # GET /tournaments/{slug}/markets?status=settled pages per read (100 markets each)
 TAPE_PAGE_LIMIT = 200  # trades per tape page (the API maximum)
 LEASE_NAME = "tracker"
+LEASE_TTL_INTERVALS = 3.0  # a lease whose heartbeat is older than this many intervals has lapsed (D46)
+LEASE_HEARTBEATS_PER_TTL = 9.0  # the heartbeat thread renews this often per TTL (every interval / 3)
+LEASE_HEARTBEAT_MAX_S = 30.0
+CONTEXT_WAIT_MAX_S = 60.0  # the first paper step waits at most this long for the first context refresh (§6.1)
 PROJECTED_WARN_PER_MIN = 75.0  # warn above this projected read rate (the account allows 100/min across all keys)
 ACCOUNT_READS_PER_MIN = 100  # the Super Market account limit, shared by every key
 DRAWER_READS_PER_MIN = 4.0  # one open exchange drawer re-reads its book every 15 s
 ANALYSIS_READS_PER_MIN = 2.0  # ~2 reads per new or grown surge (bursts up to the analysis budget)
+# docs/OUTSIDE_MOVES.md §13 (package "wiring"): Cup order-book reads for lagging outside-move alerts (the hand
+# trade's "shares available"), behind the read reserve, skipped (never waited for) when there is no room
+MOVES_READS_PER_MIN = 4
+MOVES_PROBLEM = "outside moves"  # status()["problems"] source of the outside-move watcher (severity "warning")
 _OWNER_SEQ = itertools.count(1)
 # status()["problems"] sources and how bad a current failure of each is
 PROBLEM_SEVERITY: Dict[str, str] = {
@@ -133,6 +148,7 @@ PROBLEM_SEVERITY: Dict[str, str] = {
     "fair value": "warning",
     "settlements": "warning",
     "read budget": "warning",
+    MOVES_PROBLEM: "warning",
 }
 _EPS = 1e-9
 
@@ -203,19 +219,34 @@ def _storage_error(exc: BaseException) -> bool:
 
 
 class TrackerBusy(RuntimeError):
-    """Another live process holds this store's tracker lease (D46): running two would double the reads."""
+    """Another live process holds this store's tracker lease (D46): running two would double the reads.
 
-    def __init__(self, holder: Mapping[str, Any], path: str = "") -> None:
+    The message depends on what is known about the holder (live-5): a process that is running on this machine
+    (``holder["alive"]`` True) is to be stopped first; for one on another machine (or one whose state cannot be
+    checked) it says that the lock frees itself ``ttl_s`` after that process's last heartbeat if it has already
+    ended. It never suggests a second copy of the data (a new paper run and a full history download)."""
+
+    def __init__(self, holder: Mapping[str, Any], path: str = "", *, ttl_s: Optional[float] = None,
+                 now: Optional[float] = None) -> None:
         self.holder = dict(holder or {})
         self.path = str(path or "")
         pid = self.holder.get("pid") if self.holder.get("pid") is not None else "?"
         host = self.holder.get("host") or "another machine"
         where = self.path or "this database"
-        super().__init__(
-            f"Another process (pid {pid} on {host}) is already running the tracker on {where}: stop it, or use "
-            "--data-dir for a separate copy. Running two would double the API reads; the account allows 100 per "
-            "minute across all keys."
-        )
+        tail = "Running two would double the API reads; the account allows 100 per minute across all keys."
+        if self.holder.get("alive") is True:
+            text = (f"Another process (pid {pid} on {host}) is already running the tracker on {where}: stop it first "
+                    "(close that dashboard, or press Ctrl-C in its terminal), then start again. " + tail)
+        else:
+            ttl, beat, at = _num(ttl_s), _num(self.holder.get("heartbeat_at")), _num(now)
+            wait = "after a short wait"
+            if ttl is not None and ttl > 0:
+                left = ttl - (at - beat) if beat is not None and at is not None else None
+                wait = f"within {ttl:.0f} s of its last heartbeat" + (
+                    f" (about {max(1.0, left):.0f} s from now)" if left is not None and left > 0 else "")
+            text = (f"Another process (pid {pid} on {host}) is already running the tracker on {where}: stop it first. "
+                    f"If it has already ended, the lock frees itself {wait}: start again then. " + tail)
+        super().__init__(text)
 
 
 class ReadReserve:
@@ -414,6 +445,8 @@ class Tracker:
         limiter_clock: Optional[Callable[[], float]] = None,
         limiter_sleep: Optional[Callable[[float], None]] = None,
         lease: bool = False,
+        moves: Any = None,
+        moves_reads_per_min: int = MOVES_READS_PER_MIN,
     ) -> None:
         """New in docs/PAPER_TRADING.md §7.2 (the defaults keep the old behaviour): ``fair_values`` (a
         FairValueService, refreshed in its own worker), ``paper`` (a PaperEngine, stepped after each cycle
@@ -422,7 +455,11 @@ class Tracker:
         (rows read per context refresh), ``regime`` / ``strategy_params`` (the paper trader's inputs),
         ``read_reserve`` (client slots kept for the snapshot loop), ``limiter_clock`` / ``limiter_sleep``
         (used by every limiter the tracker builds; the fast demo passes its SimClock and ``demo.no_wait``)
-        and ``lease`` (one tracker per store)."""
+        and ``lease`` (one tracker per store).
+
+        docs/OUTSIDE_MOVES.md §13 (package "wiring"): ``moves`` (an ``moves.OutsideMoveWatcher``; the tracker binds
+        it to a :class:`TrackerCupFeed` and steps it every ``moves.poll_s`` in its own ``tracker-moves`` worker) and
+        ``moves_reads_per_min`` (its Cup order-book budget, :class:`MovesBudget`; 0 disables those reads)."""
         if interval <= 0:
             raise ValueError("interval must be > 0")
         self.client = client
@@ -444,6 +481,9 @@ class Tracker:
         self._analysis_wake = threading.Event()
         self._paper_wake = threading.Event()  # set at the end of every cycle: the paper worker steps once per cycle
         self._first_cycle = threading.Event()  # the context worker starts after the first cycle
+        # set once the first context refresh (balance, account value) has finished, whatever its outcome: the
+        # first paper step waits for it so a run starts on the account value, not the default (accounting-3)
+        self._context_ready = threading.Event()
         self._limiter_clock: Callable[[], float] = limiter_clock or time.monotonic
         self._limiter_sleep: Callable[[float], None] = limiter_sleep or self._wait_or_stop
         # The snapshot loop's reserve on the shared client budget (D44): background reads wait for room above it.
@@ -493,7 +533,9 @@ class Tracker:
         self._projected: Dict[str, Any] = {"per_min": 0.0, "warning": None}
         self.lease_enabled = bool(lease)
         self._lease_held = False
-        self._lease_ttl = 3.0 * self.interval
+        self._lease_ttl = LEASE_TTL_INTERVALS * self.interval
+        # renewed by its own thread (live-1): a cycle stuck in client retries must not let the lease lapse
+        self._lease_heartbeat_s = max(0.05, min(LEASE_HEARTBEAT_MAX_S, self._lease_ttl / LEASE_HEARTBEATS_PER_TTL))
         self._owner: Dict[str, Any] = {
             "owner_id": f"{socket.gethostname()}:{os.getpid()}:{time.time():.6f}:{next(_OWNER_SEQ)}",
             "pid": os.getpid(),
@@ -578,6 +620,20 @@ class Tracker:
         self._problems: Dict[str, Dict[str, Any]] = {}  # source -> current non-fatal failure
         self._detection: Dict[str, Any] = {"enabled": True, "waiting_for_history": 0, "live_only": 0, "reason": None}
 
+        # outside-move alerts (docs/OUTSIDE_MOVES.md §13): the watcher sees the Cup only through a TrackerCupFeed, and
+        # its optional Cup order-book reads have their own small budget behind the read reserve (never waited for)
+        self.moves = moves
+        self.moves_reads_per_min = max(0, int(moves_reads_per_min))
+        self.moves_budget: Optional[MovesBudget] = None
+        self._moves_book_failures = 0  # Cup book reads that failed during the current watcher step
+        if moves is not None:
+            self.moves_budget = MovesBudget(
+                SlidingWindowLimiter(self.moves_reads_per_min, clock=self._limiter_clock, sleep=self._limiter_sleep)
+                if self.moves_reads_per_min > 0 else None,
+                self.read_reserve,
+            )
+            moves.bind(TrackerCupFeed(self))
+
         if paper is not None:
             self._make_paper_runner(paper)
         self._update_projection()
@@ -646,6 +702,7 @@ class Tracker:
         self._analysis_wake.set()
         self._paper_wake.set()
         self._first_cycle.set()  # ends the context worker's wait for the first cycle
+        self._context_ready.set()  # ends the paper worker's wait for the first context refresh
 
     def _api_error(self, where: str, exc: SuperMarketError, source: Optional[str] = None) -> None:
         """Count a non-fatal error (and report it under ``source``); re-raise fatal ones (after
@@ -764,14 +821,59 @@ class Tracker:
         """exchange id -> the Cup's current YES mid from the last published view rows (lock-free)."""
         return dict(self._published.get("mids") or {})
 
+    def cup_quotes(self) -> Dict[str, Any]:
+        """exchange id -> ``moves.CupQuote`` (ts = the snapshot read's completion, bid, ask, mid, last, spread) of every
+        open, non-stale outcome in the last published snapshot; lock-free (docs/OUTSIDE_MOVES.md §13.2)."""
+        from .moves import CupQuote
+
+        quotes = self._published.get("quotes") or {}
+        return {eid: CupQuote(ts=q["ts"], bid=q["bid"], ask=q["ask"], mid=q["mid"], last=q["last"], spread=q["spread"])
+                for eid, q in quotes.items()}
+
+    def cup_history(self, seconds: float) -> Dict[str, List[Any]]:
+        """exchange id -> ``moves.CupQuote`` tick snapshots of the last ``seconds`` (oldest first) from the in-memory
+        series cache, taking ``self._lock`` briefly (never called while the caller holds another lock; §13.2)."""
+        from .moves import CupQuote
+
+        now = float(self._clock())
+        cutoff = now - float(seconds)
+        with self._lock:  # copy plain tuples only; the CupQuotes are built after the lock is released
+            # list(...) copies the items atomically: the loop thread sets self._series[eid] in _points without
+            # this lock, and a new key during the iteration would raise "dictionary changed size"
+            raw = {
+                eid: [(p.ts, p.bid, p.ask, p.price, p.last) for p in pts
+                      if p.source == "tick" and cutoff - 1e-9 <= p.ts <= now + 1e-9]
+                for eid, pts in list(self._series.items()) if eid in self._infos
+            }
+        out: Dict[str, List[Any]] = {}
+        for eid, pts in raw.items():
+            quotes: List[Any] = []
+            for ts, bid, ask, price, last in pts:
+                two_sided = bid is not None and ask is not None
+                mid = round((bid + ask) / 2, 6) if two_sided else price
+                if mid is None:
+                    continue
+                quotes.append(CupQuote(ts=float(ts), bid=bid, ask=ask, mid=float(mid), last=last,
+                                       spread=round(ask - bid, 6) if two_sided else None))
+            if quotes:
+                out[eid] = quotes
+        return out
+
     def _publish(self, now: float, rows: Sequence[Mapping[str, Any]]) -> None:
         """Replace the lock-free snapshot behind :meth:`cup_mids` and :meth:`recent_mids` (end of each cycle)."""
         mids: Dict[str, float] = {}
+        # the outside-move watcher's Cup quotes (§13.2): ts = the row's updated_at, the snapshot read's completion
+        quotes: Dict[str, Dict[str, Any]] = {}
         for row in rows:
             bid, ask, mark = _num(row.get("bid")), _num(row.get("ask")), _num(row.get("mark"))
             mid = round((bid + ask) / 2, 6) if bid is not None and ask is not None else mark
             if mid is not None and not row.get("stale"):
-                mids[str(row["exchange_id"])] = mid
+                eid = str(row["exchange_id"])
+                mids[eid] = mid
+                updated = _num(row.get("updated_at"))
+                if updated is not None:
+                    quotes[eid] = {"ts": updated, "bid": bid, "ask": ask, "mid": mid, "last": _num(row.get("last")),
+                                   "spread": round(ask - bid, 6) if bid is not None and ask is not None else None}
         recent: Dict[str, List[Tuple[float, float]]] = {}
         cutoff = now - pipeline.RECENT_MIDS_S
         for eid in mids:
@@ -786,7 +888,7 @@ class Tracker:
                 if mid is not None:
                     out.append((p.ts, float(mid)))
             recent[eid] = list(reversed(out))
-        self._published = {"mids": mids, "recent": recent, "at": now}
+        self._published = {"mids": mids, "recent": recent, "at": now, "quotes": quotes}
 
     def _update_projection(self) -> None:
         """The §9 read projection from the live outcome count (start-up and after each market-list refresh)."""
@@ -803,7 +905,9 @@ class Tracker:
         backfill = float(self.backfill_limiter.limit) if self.backfill_enabled and backfill_pending else 0.0
         analysis = ANALYSIS_READS_PER_MIN if self.analyze_enabled and self.attributor is not None else 0.0
         paper = float(self.paper_limiter.limit) if self.paper_runner is not None else 0.0
-        total = round(bulk + lists + context + settlements + backfill + analysis + paper + DRAWER_READS_PER_MIN, 1)
+        # the outside-move watcher's Cup book reads (§13.3, its worst case; the outside polls never read the Cup)
+        moves = float(self.moves_reads_per_min) if getattr(self, "moves", None) is not None else 0.0
+        total = round(bulk + lists + context + settlements + backfill + analysis + paper + moves + DRAWER_READS_PER_MIN, 1)
         warning = None
         # Only a client capped like a real account (<= 100/min) shares the account limit; the demo's simulated
         # API has budgets far above it, and warning about the account there would be wrong.
@@ -828,14 +932,23 @@ class Tracker:
         acquire = getattr(self.store, "acquire_lease", None)
         if not callable(acquire):
             return
-        holder = acquire(LEASE_NAME, self._owner, self._clock(), ttl_s=self._lease_ttl)
+        now = self._clock()
+        holder = acquire(LEASE_NAME, self._owner, now, ttl_s=self._lease_ttl)
         if holder is not None:
-            raise TrackerBusy(holder, getattr(self.store, "path", ""))
+            raise TrackerBusy(holder, getattr(self.store, "path", ""), ttl_s=self._lease_ttl, now=now)
+        taken = getattr(self.store, "last_takeover", None)
+        if isinstance(taken, Mapping) and not self._lease_held:
+            if taken.get("alive") is False:
+                log.warning("tracker: the previous run (pid %s on %s) ended without shutting down; continuing it",
+                            taken.get("pid"), taken.get("host"))
+            else:
+                log.warning("tracker: took over the lease of pid %s on %s (no heartbeat for %.0f s)",
+                            taken.get("pid"), taken.get("host"), float(_num(taken.get("age_s")) or 0.0))
         self._lease_held = True
 
     def _renew_lease(self) -> None:
-        if not self.lease_enabled or not self._lease_held:
-            return
+        if not self.lease_enabled or not self._lease_held or self._stop.is_set():
+            return  # (after stop() the lease is released: a late heartbeat must not take it back)
         try:
             ok = self.store.renew_lease(LEASE_NAME, self._owner["owner_id"], self._clock())
         except Exception as exc:
@@ -1421,8 +1534,12 @@ class Tracker:
             if attribution is None:
                 self._mark_not_pending(sid)
                 continue
-            if attribution.analyzed_at is None:
-                attribution.analyzed_at = self._clock()
+            # lookahead-3: the verdict exists for a reader (the paper step, a replay's analyzed_at <= t) only from
+            # now, when analyze() returned -- not from the clock when the analysis started (reads, the news search
+            # and the LLM judge can take a minute)
+            done_at = self._clock()
+            started_at = _num(attribution.analyzed_at)
+            attribution.analyzed_at = max(done_at, started_at) if started_at is not None else done_at
             self._resolve("attribution")
             news_status = getattr(attribution, "news_status", None)
             if news_status == NEWS_UNAVAILABLE:
@@ -1751,6 +1868,11 @@ class Tracker:
                 if isinstance(board, Mapping):
                     updates["leaderboard"] = self._leaderboard(board, initial)
                     self._store_leaderboard(updates["leaderboard"], initial, now)
+            # the account part is known: publish it before the (slower) order-book reads below, so the first paper
+            # step, which waits for it, starts the run on the account value (accounting-3)
+            with self._lock:
+                self._context.update(updates)
+            self._context_ready.set()
 
             book_failures: List[str] = []
             book_reads = 0
@@ -1775,6 +1897,7 @@ class Tracker:
                 if complete:
                     self._context["updated_at"] = now
                     self._context_at = now
+            self._context_ready.set()  # the first attempt is over (read or not): the paper worker may start
 
     def _account_value(self, slug: str, cash: Optional[float]) -> Dict[str, Any]:
         """``account_value`` (cash + open positions at market value) and ``positions_value``.
@@ -2208,6 +2331,7 @@ class Tracker:
             "analysis": {"used": self.analyze_limiter.used, "limit": self.analyze_limiter.limit},
             "requests_sent": sent,
             "paper": self.paper_limiter.status() if self.paper_runner is not None else None,
+            "moves": self.moves_budget.status() if self.moves_budget is not None else None,
             "reserve": self.read_reserve.reserve,
             "projected_per_min": projected.get("per_min"),
             "warning": projected.get("warning"),
@@ -2215,7 +2339,19 @@ class Tracker:
         # Outside self._lock (lock rule, D43): the runner's published summary and the fair-value service.
         status["paper"] = self._paper_status()
         status["fair_value"] = self._fair_value_status()
+        status["moves"] = self._moves_status()
         return status
+
+    def _moves_status(self) -> Optional[Dict[str, Any]]:
+        """The watcher's published compact status (lock-free; §12.4), or None without a watcher."""
+        if self.moves is None:
+            return None
+        try:
+            raw = self.moves.status()
+        except Exception as exc:
+            log.debug("outside-move status failed: %s", exc)
+            return None
+        return _copy_json(dict(raw)) if isinstance(raw, Mapping) else None
 
     def _paper_status(self) -> Optional[Dict[str, Any]]:
         if self.paper_runner is None:
@@ -2285,6 +2421,36 @@ class Tracker:
             self._resolve("paper")
         return report
 
+    def moves_step(self, now: Optional[float] = None) -> Any:
+        """One outside-move watcher step (the ``tracker-moves`` worker calls this every ``moves.poll_s``; the fast demo
+        calls it from ``pipeline.run_simulation``). None without a watcher. Never called under ``self._lock``;
+        reports failures as the MOVES_PROBLEM problem (docs/OUTSIDE_MOVES.md §13.3)."""
+        if self.moves is None:
+            return None
+        with self._lock:
+            self._moves_book_failures = 0
+        # Lock rule (§12.3, D43): the watcher calls back into this tracker (TrackerCupFeed) and the store, so it is
+        # never called while self._lock is held.
+        report = self.moves.step(now)
+        try:
+            last_error = (self.moves.status() or {}).get("last_error")
+        except Exception:
+            last_error = None
+        with self._lock:
+            failures = self._moves_book_failures
+        if last_error:
+            self._problem(MOVES_PROBLEM, str(last_error))
+        elif not failures:
+            self._resolve(MOVES_PROBLEM)  # (a failed Cup book read of this step keeps the problem it reported)
+        return report
+
+    def moves_view(self) -> Optional[Dict[str, Any]]:
+        """The watcher's published summary (lock-free), or None without a watcher (§13.3)."""
+        if self.moves is None:
+            return None
+        summary = self.moves.summary()
+        return dict(summary) if isinstance(summary, Mapping) else None
+
     def paper_view(self, run: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """The runner's published ``/api/paper`` body (a shallow copy, ``run.interval`` set), or for
         ``run="previous"`` the newest ended run's final snapshot. None without a paper trader."""
@@ -2309,6 +2475,10 @@ class Tracker:
         if self.paper_runner is None:
             return None
         self._ensure_lease()  # a second process must not end this store's run (D46)
+        if start_capital is None and self.running and not self._context_ready.is_set():
+            # `paper --reset` right after start(): the new run takes its capital from the account value, which the
+            # first context refresh is still reading (accounting-3); wait for it (bounded) like the first step
+            self._context_ready.wait(max(1.0, min(self.context_refresh, CONTEXT_WAIT_MAX_S)))
         source = "set by you" if start_capital is not None else ""
         return self.paper_runner.reset(self._clock(), start_capital=start_capital, target_hours=target_hours,
                                        capital_source=source)
@@ -2353,6 +2523,10 @@ class Tracker:
                 threads.append(threading.Thread(target=self._fair_value_worker, name="tracker-fairvalue", daemon=True))
             if self.paper_runner is not None:
                 threads.append(threading.Thread(target=self._paper_worker, name="tracker-paper", daemon=True))
+            if self.moves is not None:
+                threads.append(threading.Thread(target=self._moves_worker, name="tracker-moves", daemon=True))
+            if self.lease_enabled and self._lease_held:
+                threads.append(threading.Thread(target=self._lease_worker, name="tracker-lease", daemon=True))
             self._threads = threads
         for thread in threads:
             thread.start()
@@ -2398,6 +2572,19 @@ class Tracker:
                 next_at += (int((now - next_at) // self.interval) + 1) * self.interval
             if self._stop.wait(next_at - now):
                 break
+
+    def _lease_worker(self) -> None:
+        """Renew the store lease every interval / 3 for as long as the tracker runs (live-1, D46). The snapshot
+        loop also renews after each cycle, but a cycle can sit in the client's retries (Retry-After waits) for
+        longer than the 3 x interval TTL; without this a second dashboard would take the lease meanwhile and this
+        tracker would stop with "Another process is already running"."""
+        while not self._stop.wait(self._lease_heartbeat_s):
+            try:
+                self._renew_lease()
+            except _Stopping:
+                break
+            except Exception as exc:
+                self._cycle_failed("lease renewal", exc, label="tracker lease renewal")
 
     def _cycle_failed(self, where: str, exc: BaseException, source: str = "tracker", label: Optional[str] = None) -> None:
         """An unexpected exception ended a cycle or a worker step: count it and show it.
@@ -2480,11 +2667,48 @@ class Tracker:
             if self._stop.wait(FV_REFRESH_S):
                 break
 
+    def _moves_worker(self) -> None:
+        """One outside-move watcher step every ``moves.poll_s`` (docs/OUTSIDE_MOVES.md §13.1), after the first cycle
+        (so the Cup series the watcher loads once at its first step is there). Its outside polls use the providers'
+        own per-host budgets, never the Super Market client; missed slots are skipped, not burst."""
+        while not self._stop.is_set() and not self._first_cycle.wait(min(WORKER_IDLE_S, self.interval)):
+            pass
+        try:
+            period = max(0.05, float(getattr(self.moves, "poll_s", 15.0) or 15.0))
+        except (TypeError, ValueError):
+            period = 15.0
+        next_at = time.monotonic()
+        while not self._stop.is_set():
+            try:
+                self.moves_step()
+            except _Stopping:
+                break
+            except SuperMarketError:
+                if self._stop.is_set():
+                    break  # fatal: already recorded in status
+            except Exception as exc:  # a bug in one step should not end the alerts
+                self._cycle_failed("outside-move step", exc, MOVES_PROBLEM, label="outside-move step")
+            next_at += period
+            now = time.monotonic()
+            if next_at <= now:  # fell behind (a slow outside host): skip the missed slots
+                next_at += (int((now - next_at) // period) + 1) * period
+            if self._stop.wait(next_at - now):
+                break
+
     def _paper_worker(self) -> None:
-        """One paper step per tracker cycle (woken at the end of each cycle)."""
+        """One paper step per tracker cycle (woken at the end of each cycle). The first step waits (at most
+        min(context_refresh, CONTEXT_WAIT_MAX_S)) for the first context refresh, which the context worker starts
+        after the first cycle too: a run must start on the account value (§6.1: set by you > account value > cash
+        > initial balance > default), not on the default 100,000 because the balance read was still in flight
+        (accounting-3)."""
+        first = True
         while not self._stop.is_set():
             if not self._paper_wake.wait(max(WORKER_IDLE_S, self.interval)):
                 continue
+            if first:
+                first = False
+                if not self._context_ready.is_set():
+                    self._context_ready.wait(max(1.0, min(self.context_refresh, CONTEXT_WAIT_MAX_S)))
             self._paper_wake.clear()
             if self._stop.is_set():
                 break
@@ -2501,6 +2725,113 @@ class Tracker:
                     break
             except Exception as exc:
                 self._cycle_failed("paper step", exc, "paper")
+
+
+class MovesBudget:
+    """The outside-move watcher's Cup order-book budget (docs/OUTSIDE_MOVES.md §13.4): its own sliding window
+    (``Tracker.moves_reads_per_min``) AND room above the read reserve, like :class:`PaperBudget` without the backfill
+    rule. Readers call :meth:`acquire` only when ``room() > 0``, so it never waits."""
+
+    def __init__(self, own: Optional[SlidingWindowLimiter], reserve: ReadReserve) -> None:
+        self.own = own  # None when moves_reads_per_min is 0 (no book reads at all)
+        self.reserve = reserve
+
+    @property
+    def limit(self) -> int:
+        return int(self.own.limit) if self.own is not None else 0
+
+    @property
+    def used(self) -> int:
+        return int(self.own.used) if self.own is not None else 0
+
+    def room(self) -> int:
+        if self.own is None:
+            return 0
+        return min(int(self.own.limit) - int(self.own.used), int(self.reserve.room()))
+
+    def acquire(self) -> float:
+        if self.own is None:
+            return 0.0
+        return self.own.acquire()
+
+    def status(self) -> Dict[str, int]:
+        """``{"used", "limit", "room"}`` (limit 0 when disabled)."""
+        return {"used": self.used, "limit": self.limit, "room": max(0, int(self.room()))}
+
+
+class TrackerCupFeed:
+    """The watcher's only view of the Cup (``moves.CupFeed``, docs/OUTSIDE_MOVES.md §13.2): the published snapshot
+    quotes, the series cache, stored books and, inside :class:`MovesBudget`, fresh order-book reads through the
+    tracker's single-attempt client (GET only). Book reads are kept by the watcher and NOT stored in the tracker's
+    book tables, so the paper trader's inputs never depend on the alerts. Never raises: a SuperMarketError is
+    reported through ``tracker._api_error(..., MOVES_PROBLEM)`` and returns None (a fatal key error still stops the
+    tracker as everywhere else)."""
+
+    def __init__(self, tracker: "Tracker") -> None:
+        self.tracker = tracker
+
+    def quotes(self) -> Dict[str, Any]:
+        return self.tracker.cup_quotes()
+
+    def history(self, seconds: float) -> Dict[str, List[Any]]:
+        return self.tracker.cup_history(seconds)
+
+    def _failed(self) -> None:
+        with self.tracker._lock:
+            self.tracker._moves_book_failures += 1
+
+    def book(self, exchange_id: str) -> Optional[BookObservation]:
+        from .moves import MOVES_BOOK_DEPTH
+
+        t = self.tracker
+        eid = str(exchange_id)
+        budget = t.moves_budget
+        if budget is None or budget.room() <= 0:
+            return None  # no room (or reads disabled): shares stay unknown, never a wait
+        where = f"outside-move order book for exchange {eid}"
+        try:
+            budget.acquire()
+            payload = t._quick.get_exchange_orderbook(eid, depth=MOVES_BOOK_DEPTH, tournament_id=t.context.tournament_id)
+        except SuperMarketError as exc:
+            self._failed()
+            try:
+                t._api_error(where, exc, MOVES_PROBLEM)
+            except SuperMarketError:
+                pass  # a fatal key error: the tracker has stopped and recorded it
+            return None
+        observed = t._clock()  # stamped when the response arrived (lookahead-2)
+        try:
+            parsed = Book.from_payload(payload) if isinstance(payload, Mapping) else None
+        except Exception as exc:
+            parsed = None
+            log.debug("outside-move book parse failed: %s", exc)
+        if parsed is None:
+            self._failed()
+            t._record_error(where, "the order book could not be read", MOVES_PROBLEM)
+            return None
+        sequence = parsed.as_of.sequence if parsed.as_of is not None else None
+        return BookObservation(
+            exchange_id=eid, observed_at=float(observed),
+            bids=[(float(lv.price), float(lv.quantity)) for lv in parsed.bids],
+            asks=[(float(lv.price), float(lv.quantity)) for lv in parsed.asks],
+            source="moves", sequence=sequence if isinstance(sequence, int) else None,
+        )
+
+    def stored_book(self, exchange_id: str) -> Optional[BookObservation]:
+        eid = str(exchange_id)
+        try:
+            raw = self.tracker.store.book(eid)
+        except Exception as exc:  # a storage problem: no stored book, the watcher may read one
+            log.debug("stored book for %s unavailable: %s", eid, exc)
+            return None
+        if not isinstance(raw, Mapping) or _num(raw.get("at")) is None:
+            return None
+        try:
+            bids = [(float(p), float(q)) for p, q in raw.get("bids") or []]
+            asks = [(float(p), float(q)) for p, q in raw.get("asks") or []]
+        except (TypeError, ValueError):
+            return None
+        return BookObservation(exchange_id=eid, observed_at=float(raw["at"]), bids=bids, asks=asks, source="tracker")
 
 
 class TrackerMarketReader:

@@ -54,6 +54,7 @@ from .models import (
     _Serializable,
     iso_ts,
 )
+from .moves import MOVES_POLL_HEADROOM, MOVES_POLL_LOCK_WAIT_S
 from .ratelimit import SlidingWindowLimiter
 from .readonly import ReadOnlyViolation, outside_client
 
@@ -91,6 +92,9 @@ KALSHI_BASE_URLS = (
 )
 EXTERNAL_TIMEOUT_S = 8.0
 EXTERNAL_READS_PER_MIN = 30  # per host, our own politeness budget (the hosts allow far more)
+# per host while the outside-move watcher also polls the same provider every 15 s (docs/OUTSIDE_MOVES.md §4.3):
+# steady use Polymarket 25/min (20 poll + 5 refresh), Kalshi 15/min (12 + 3); discovery bursts stay under it
+OUTSIDE_READS_PER_MIN_WITH_MOVES = 45
 POLYMARKET_IDS_PER_CALL = 50  # GET /markets?id=..&id=..&limit=<n>
 KALSHI_TICKERS_PER_CALL = 100  # GET /markets?tickers=a,b,c
 DISCOVERY_EVERY_S = 6 * 3600.0  # unmatched races are searched for at most this often
@@ -241,6 +245,9 @@ class ProviderResult(_Serializable):
     next_try_at: Optional[float] = None  # set while backing off
     # exchange_id -> why a pinned / discovered market was dropped this refresh (one plain sentence)
     rejected: Dict[str, str] = field(default_factory=dict)
+    # exchange_id -> venue-reported liquidity in USD (Polymarket ``liquidityNum``); filled by ``poll`` only
+    # (docs/OUTSIDE_MOVES.md §4.1), empty for ``refresh``
+    liquidity: Dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -1294,6 +1301,7 @@ class _HttpVenue:
         self._failures = 0
         self._next_try_at: Optional[float] = None
         self._last_error: Optional[str] = None
+        self._last_stop_status: Optional[str] = None  # status of the failure that started the current backoff
         self._last_discovery_at: Optional[float] = None
         self._matches: Dict[str, VenueMatch] = {}  # exchange_id -> the last validated match
         self._discovered: Dict[str, VenueMatch] = {}  # exchange_id -> a match found by discovery
@@ -1301,6 +1309,11 @@ class _HttpVenue:
         self._failed_now: set = set()  # (exchange_id, external id) that failed validation in this refresh
         self._closed = False
         self._state_lock = threading.Lock()
+        # docs/OUTSIDE_MOVES.md §4.2: serialises refresh (blocking, whole duration) and poll (waits at most
+        # poll_lock_wait_s, else "busy"): one host, one client, one backoff at a time. A leaf lock: nothing else
+        # is taken while it is held except the limiter's and _state_lock (both leaves).
+        self._io_lock = threading.Lock()
+        self.poll_lock_wait_s = MOVES_POLL_LOCK_WAIT_S
         self.requests_total = 0
 
     # -- plumbing
@@ -1372,8 +1385,16 @@ class _HttpVenue:
         if self._closed:
             return ProviderResult(venue=self.name, status="disabled", errors=[f"{self.label} provider is closed."])
         if self._next_try_at is not None and now < self._next_try_at:
-            msg = f"{self.label} is backing off after an error: next try at {iso_ts(self._next_try_at)}."
-            errors = [msg] + ([self._last_error] if self._last_error else [])
+            when = iso_ts(self._next_try_at)
+            if self._last_stop_status == "offline" and self._last_error:
+                # live-4: the venue is still unreachable from this machine as far as we know: say so (with the
+                # real cause first) on every refresh, not a transient-looking "backing off"
+                errors = [self._last_error, f"No request to {self.label} until {when} (waiting after repeated "
+                                            "failures)."]
+                return ProviderResult(venue=self.name, status="offline", errors=errors[:5], next_try_at=self._next_try_at)
+            msg = f"{self.label} is backing off after an error: next try at {when}."
+            # the real cause first: it is what the status line and the problem banner show
+            errors = ([self._last_error] if self._last_error else []) + [msg]
             return ProviderResult(venue=self.name, status="backoff", errors=errors[:5], next_try_at=self._next_try_at)
         return None
 
@@ -1383,12 +1404,14 @@ class _HttpVenue:
             wait = stop.retry_after if stop.retry_after is not None else self._backoff_s(self._failures)
             self._next_try_at = now + wait
             self._last_error = stop.message
+            self._last_stop_status = stop.status
             result.status = stop.status
             result.next_try_at = self._next_try_at
             result.errors.insert(0, stop.message)
         else:
             self._failures = 0
             self._next_try_at = None
+            self._last_stop_status = None
             if partial:
                 result.status = "partial"
                 result.errors.insert(0, f"{self.label} refresh stopped at the {REFRESH_DEADLINE_S:g} s deadline: "
@@ -1450,6 +1473,150 @@ class _HttpVenue:
     def _discovery_due(self, now: float) -> bool:
         return self._last_discovery_at is None or now - self._last_discovery_at >= DISCOVERY_EVERY_S
 
+    # -- outside-move polling (docs/OUTSIDE_MOVES.md §4, package "core")
+
+    def budget(self) -> Dict[str, int]:
+        """``{"used", "limit"}``: requests in the last minute summed over this provider's hosts (poll and refresh
+        together) and the per-host limit (``reads_per_min``). Lock-safe, no I/O."""
+        with self._state_lock:
+            limiters = list(self._limiters.values())
+        return {"used": int(sum(lim.used for lim in limiters)), "limit": int(self._reads_per_min)}
+
+    # subclass hooks of poll (one batched GET per chunk of validated external ids)
+    _poll_per_call = 50
+
+    def _poll_key(self, external_id: str) -> str:
+        return str(external_id)
+
+    def _poll_host(self) -> str:  # pragma: no cover - every provider overrides it
+        raise NotImplementedError
+
+    def _poll_get(self, chunk: Sequence[str], deadline: Optional[float], result: ProviderResult) -> Any:  # pragma: no cover
+        raise NotImplementedError
+
+    def _poll_markets(self, data: Any) -> Dict[str, Mapping[str, Any]]:  # pragma: no cover
+        raise NotImplementedError
+
+    def _poll_reject(self, market: Mapping[str, Any], key: str) -> Optional[str]:  # pragma: no cover
+        raise NotImplementedError
+
+    def _poll_liquidity(self, market: Mapping[str, Any]) -> Optional[float]:
+        return None
+
+    def _poll_reset(self) -> None:
+        """Per-poll state (Kalshi: the base-URL fallback is tried once per poll)."""
+
+    def _poll_matches(self, targets: Sequence[MatchTarget]) -> Dict[str, VenueMatch]:
+        """exchange id -> the validated match to poll: the last refresh validated it AND it is still the id the
+        target asks for (a pin the user changed or removed since is not polled until the next refresh decides)."""
+        wanted, _need = self._wanted(targets, self.name)
+        out: Dict[str, VenueMatch] = {}
+        for eid, (_target, ext, _source) in wanted.items():
+            match = self._matches.get(eid)
+            if match is None or self._poll_key(match.external_id) != self._poll_key(ext):
+                continue
+            out[eid] = match
+        return out
+
+    def _poll(self, targets: Sequence[MatchTarget], now: float, deadline: Optional[float],
+              result: ProviderResult) -> Tuple[Optional[_StopRefresh], Optional[str]]:
+        """(the failure that ended the poll, the reason it stopped early) after reading every batch it could."""
+        polled = self._poll_matches(targets)
+        keys: List[str] = []
+        for match in polled.values():
+            key = self._poll_key(match.external_id)
+            if key not in keys:
+                keys.append(key)
+        label = self.label
+        for chunk in _chunks(keys, self._poll_per_call):
+            if deadline is not None and self._clock() >= deadline:
+                return None, self._deadline_text(now, deadline)
+            limiter = self.limiter(self._poll_host())
+            if limiter.limit - limiter.used < MOVES_POLL_HEADROOM + 1:
+                # the 60-s fair-value refresh keeps its room on this host (docs/OUTSIDE_MOVES.md §4.2)
+                return None, (f"{label}'s per-minute budget is kept for the fair-value refresh: some outcomes were not "
+                              "polled.")
+            try:
+                data = self._poll_get(chunk, deadline, result)
+                fetched = self._clock()  # lookahead-2: this batch's response has arrived and was parsed
+                markets = self._poll_markets(data)
+            except _DeadlineReached:
+                return None, self._deadline_text(now, deadline)
+            except _StopRefresh as exc:
+                return exc, None
+            in_chunk = set(chunk)
+            for eid, match in polled.items():
+                key = self._poll_key(match.external_id)
+                if key not in in_chunk:
+                    continue
+                market = markets.get(key)
+                if market is None:
+                    continue  # the venue did not return it: simply not quoted (the next refresh decides)
+                why = self._poll_reject(market, key)
+                if why:
+                    result.rejected[eid] = why  # the match is kept: the next refresh decides
+                    continue
+                result.matches[eid] = _copy_match(match)
+                result.quotes[eid] = self._quote(market, match, fetched)
+                liquidity = self._poll_liquidity(market)
+                if liquidity is not None:
+                    result.liquidity[eid] = liquidity
+        return None, None
+
+    def _deadline_text(self, now: float, deadline: Optional[float]) -> str:
+        span = max(0.0, float(deadline) - float(now)) if deadline is not None else 0.0
+        return f"{self.label} poll stopped at the {span:.0f} s deadline: some outcomes were not read this time."
+
+    def poll(self, targets: Sequence[MatchTarget], now: float, *, deadline: Optional[float] = None) -> ProviderResult:
+        """Quote-only read of the matches the last ``refresh`` VALIDATED for ``targets`` (never an unvalidated pin,
+        never discovery), batched like ``refresh``, for the outside-move watcher (docs/OUTSIDE_MOVES.md §4.1).
+
+        Shares this provider's client, per-host limiters, Retry-After / backoff state and first-failure stop with
+        ``refresh`` (one host, one budget, one backoff), under one I/O lock (``refresh`` takes it blocking; ``poll``
+        waits at most MOVES_POLL_LOCK_WAIT_S, else returns status "busy" with no request). A batch starts only while
+        the host limiter has at least MOVES_POLL_HEADROOM + 1 free slots (the fair-value refresh keeps its room),
+        else the poll ends "partial". Each quote's ``fetched_at`` is the clock read right after ITS batch's response
+        arrived and parsed. Light checks only (Polymarket: active, not closed, outcomes ["Yes", "No"]; Kalshi:
+        status active/open): a failing market is not quoted and is listed in ``rejected`` but its match is kept
+        (the next ``refresh`` decides). Status: "pending" (nothing validated yet, no request) | "ok" | "partial" |
+        "busy" | "offline" | "backoff" | "error" | "disabled". Never raises (except ReadOnlyViolation)."""
+        if self._closed:
+            return ProviderResult(venue=self.name, status="disabled", errors=[f"{self.label} provider is closed."])
+        if not self._io_lock.acquire(timeout=max(0.0, float(self.poll_lock_wait_s))):
+            # the fair-value refresh is reading the same host right now: no new sample this step, no queueing
+            return ProviderResult(venue=self.name, status="busy", requests=0)
+        try:
+            early = self._begin(now)
+            if early is not None:
+                return early
+            if not self._matches:
+                return ProviderResult(venue=self.name, status="pending", requests=0,
+                                      errors=[f"No validated {self.label} match yet: waiting for the first fair-value "
+                                              "refresh."])
+            self._poll_reset()
+            result = ProviderResult(venue=self.name, status="ok")
+            stop: Optional[_StopRefresh] = None
+            early_stop: Optional[str] = None
+            try:
+                stop, early_stop = self._poll(targets, now, deadline, result)
+            except ReadOnlyViolation:
+                raise
+            except Exception as exc:  # never raise
+                log.warning("%s poll failed: %s", self.label, exc, exc_info=True)
+                stop = _StopRefresh("error", f"{self.label} data could not be read ({type(exc).__name__}): no outside "
+                                             f"quotes from {self.label} this time.", kind="data")
+            if stop is not None:
+                return self._finish(result, now, stop, False)  # one host, one backoff: refresh waits too
+            if early_stop:
+                result.errors.insert(0, early_stop)
+            if result.requests > 0:
+                self._finish(result, now, None, False)  # an answered poll resets the failure count, like a refresh
+            result.status = "partial" if early_stop else "ok"
+            result.errors = result.errors[:5]
+            return result
+        finally:
+            self._io_lock.release()
+
     def close(self) -> None:
         self._closed = True
         try:
@@ -1474,9 +1641,46 @@ class PolymarketProvider(_HttpVenue):
         self.base_url = base_url.rstrip("/")
         self.clob_url = clob_url.rstrip("/")
 
+    # -- outside-move poll hooks (docs/OUTSIDE_MOVES.md §4.1): GET /markets?id=..&id=..&limit=<n>, <= 50 ids
+
+    _poll_per_call = POLYMARKET_IDS_PER_CALL
+
+    def _poll_host(self) -> str:
+        return httpx.URL(self.base_url).host
+
+    def _poll_get(self, chunk: Sequence[str], deadline: Optional[float], result: ProviderResult) -> Any:
+        params = [("id", i) for i in chunk] + [("limit", len(chunk))]  # limit = ids, exactly like refresh (D57)
+        return self._get(f"{self.base_url}/markets", params, deadline=deadline, result=result)
+
+    def _poll_markets(self, data: Any) -> Dict[str, Mapping[str, Any]]:
+        if not isinstance(data, list):
+            raise _StopRefresh("error", "Polymarket sent an unexpected response (not a list of markets): ignored.",
+                               kind="data")
+        return {str(m["id"]): m for m in data if isinstance(m, dict) and m.get("id") is not None}
+
+    def _poll_reject(self, market: Mapping[str, Any], key: str) -> Optional[str]:
+        if market.get("closed") is True:
+            return f"Polymarket market {key} is closed: not polled."
+        if market.get("closed") is not False:
+            return f"Polymarket market {key} does not say it is open: not polled."
+        if market.get("active") is not True:
+            return f"Polymarket market {key} is not active: not polled."
+        outcomes = _json_list(market.get("outcomes"))
+        if outcomes is None or [str(o).strip().lower() for o in outcomes] != ["yes", "no"]:
+            return f"Polymarket market {key} has outcomes {outcomes!r}, not [\"Yes\", \"No\"]: not polled."
+        return None
+
+    def _poll_liquidity(self, market: Mapping[str, Any]) -> Optional[float]:
+        value = _num(market.get("liquidityNum"))
+        return value if value is not None and math.isfinite(value) and value >= 0 else None
+
     # -- refresh
 
     def refresh(self, targets: Sequence[MatchTarget], now: float, *, deadline: Optional[float] = None) -> ProviderResult:
+        with self._io_lock:  # docs/OUTSIDE_MOVES.md §4.2: blocking; a concurrent poll waits <= 3 s, then "busy"
+            return self._refresh_locked(targets, now, deadline)
+
+    def _refresh_locked(self, targets: Sequence[MatchTarget], now: float, deadline: Optional[float]) -> ProviderResult:
         early = self._begin(now)
         if early is not None:
             return early
@@ -1806,9 +2010,42 @@ class KalshiProvider(_HttpVenue):
         # Independent legs name a candidate, not a party: they are pinned by ticker only (never discovered)
         return target.race is not None and target.race.party in ("D", "R")
 
+    # -- outside-move poll hooks (docs/OUTSIDE_MOVES.md §4.1): GET /markets?tickers=a,b,..&limit=100, <= 100 tickers
+
+    _poll_per_call = KALSHI_TICKERS_PER_CALL
+
+    def _poll_key(self, external_id: str) -> str:
+        return str(external_id).upper()
+
+    def _poll_host(self) -> str:
+        return httpx.URL(self.base_url).host
+
+    def _poll_reset(self) -> None:
+        self._fell_back = False  # the base-URL fallback is tried once per poll, on a connect error only
+
+    def _poll_get(self, chunk: Sequence[str], deadline: Optional[float], result: ProviderResult) -> Any:
+        params = [("tickers", ",".join(chunk)), ("limit", KALSHI_TICKERS_PER_CALL)]
+        return self._kget("/markets", params, deadline=deadline, result=result)
+
+    def _poll_markets(self, data: Any) -> Dict[str, Mapping[str, Any]]:
+        items = data.get("markets") if isinstance(data, dict) else None
+        if not isinstance(items, list):
+            raise _StopRefresh("error", "Kalshi sent an unexpected response (no markets list): ignored.", kind="data")
+        return {str(m["ticker"]).upper(): m for m in items if isinstance(m, dict) and m.get("ticker")}
+
+    def _poll_reject(self, market: Mapping[str, Any], key: str) -> Optional[str]:
+        status = str(market.get("status") or "").strip().lower()
+        if status not in ("active", "open"):
+            return f"Kalshi ticker {key} is {status or 'of unknown status'}, not open: not polled."
+        return None
+
     # -- refresh
 
     def refresh(self, targets: Sequence[MatchTarget], now: float, *, deadline: Optional[float] = None) -> ProviderResult:
+        with self._io_lock:  # docs/OUTSIDE_MOVES.md §4.2: blocking; a concurrent poll waits <= 3 s, then "busy"
+            return self._refresh_locked(targets, now, deadline)
+
+    def _refresh_locked(self, targets: Sequence[MatchTarget], now: float, deadline: Optional[float]) -> ProviderResult:
         early = self._begin(now)
         if early is not None:
             return early
@@ -2605,9 +2842,18 @@ class FairValueService:
 
     def refresh(self, now: Optional[float] = None) -> FairValueSnapshot:
         with self._refresh_lock:
-            when = float(self._clock() if now is None else now)
+            started: Optional[float]
+            if now is None:
+                started = float(self._clock())
+                when = started
+            else:
+                when = float(now)
+                try:  # the service clock measures how long the providers take (lookahead-2)
+                    started = float(self._clock())
+                except Exception:
+                    started = None
             try:
-                self._refresh(when)
+                self._refresh(when, started)
             except ReadOnlyViolation:
                 raise
             except Exception as exc:  # never raise
@@ -2665,7 +2911,28 @@ class FairValueService:
             q.spread = q.ask - q.bid
         return q
 
-    def _refresh(self, now: float) -> None:
+    def _published_at(self, now: float, started: Optional[float], results: Sequence[Tuple[str, ProviderResult]]) -> float:
+        """When this refresh's values exist for a reader (lookahead-2): the refresh time ``now`` plus the time the
+        providers took on the service clock (a refresh may run up to the 30-s deadline plus one 8-s request, per
+        provider set), and never before the newest quote it holds was fetched. Records and the refresh row are
+        stamped with it, so a replay (which uses a record at ``ts <= t - latency``) never trades on a value
+        before the live service had it; ``now`` stays the provider deadline base and the blend age."""
+        at = float(now)
+        if started is not None:
+            try:
+                elapsed = float(self._clock()) - float(started)
+            except Exception:  # a broken clock never breaks the refresh
+                elapsed = 0.0
+            if math.isfinite(elapsed) and elapsed > 0.0:
+                at += elapsed
+        for _name, res in results:
+            for q in res.quotes.values():
+                fetched = _num(q.fetched_at) if q is not None else None
+                if fetched is not None and fetched > at:
+                    at = fetched
+        return at
+
+    def _refresh(self, now: float, started: Optional[float] = None) -> None:
         if not self.enabled:
             with self._lock:
                 self._snapshot = FairValueSnapshot(at=now, mode=self.mode, enabled=False, races=dict(self._races))
@@ -2688,8 +2955,10 @@ class FairValueService:
         ids = {t.exchange_id for t in targets}
         manual_values = {eid: fv for eid, fv in self._manual.resolve(targets, now).items() if eid in ids}
         results: List[Tuple[str, ProviderResult]] = []
-        if self.mode == "auto":
-            active = [t for t in targets if not t.disabled]
+        active = [t for t in targets if not t.disabled]
+        if self.mode == "auto" and active:
+            # live-4: no outcome to price (e.g. the tracker's first refresh, before the market list is read): the
+            # providers are not asked, so their status stays "pending" instead of an "ok" nobody answered
             for provider in self._providers:
                 results.append((self._pname(provider), self._call_provider(provider, active, now)))
         per_eid: Dict[str, List[FairValueQuote]] = {}
@@ -2740,9 +3009,10 @@ class FairValueService:
         for eid in [e for e in rejections if not rejections[e]]:
             rejections.pop(eid)
         known = {k: v for k, v in known.items() if k[0] in ids}
+        published = self._published_at(now, started, results)  # lookahead-2: when these values exist
         self._update_provider_status(results, now)
-        self._record(combined, now, errors)
-        self._record_refresh(results, now, errors)
+        self._record(combined, published, errors)
+        self._record_refresh(results, published, errors, fetched_default=now)
         self._save_matches(fresh, results, now, errors)
         manual_status = self._manual.status()
         map_status = self._map.status()
@@ -2751,13 +3021,13 @@ class FairValueService:
             self._prev = new_prev
             self._known_matches = known
             self._rejections = rejections
-            self._last_refresh_at = now
+            self._last_refresh_at = published
             cups = {t.exchange_id: t.cup_mid for t in targets}
             for t in self._targets:
                 if t.exchange_id in cups:
                     t.cup_mid = cups[t.exchange_id]
             self._snapshot = FairValueSnapshot(
-                at=now, mode=self.mode, enabled=True, values=combined, races=races, providers=pstatus,
+                at=published, mode=self.mode, enabled=True, values=combined, races=races, providers=pstatus,
                 manual=manual_status, errors=errors[:5], map=map_status)
 
     def _empty(self, target: MatchTarget, reason: str) -> FairValue:
@@ -2816,8 +3086,13 @@ class FairValueService:
                                    if q is not None and (q.raw_value is not None or q.value is not None
                                                          or (q.bid is not None and q.ask is not None)))
                 st["next_try_at"] = res.next_try_at
-                if res.status in ("ok", "partial"):
+                # live-4: "last answer" only when the venue actually answered (a request came back, or it gave
+                # quotes / matches / rejections); a refresh that asked nothing is not an answer
+                answered = int(res.requests or 0) > 0 or bool(res.quotes) or bool(res.matches) or bool(res.rejected)
+                if res.status in ("ok", "partial") and answered:
                     st["last_ok_at"] = now
+                elif res.status == "ok" and not res.errors and st.get("last_ok_at") is None:
+                    st["status"] = "pending"  # nothing was asked yet: never shown as "answering"
                 if res.errors:
                     st["last_error"] = res.errors[0]
                 elif res.status == "ok":
@@ -2868,17 +3143,21 @@ class FairValueService:
         with self._lock:
             self._recorded.update(states)
 
-    def _record_refresh(self, results: Sequence[Tuple[str, ProviderResult]], now: float, errors: List[str]) -> None:
+    def _record_refresh(self, results: Sequence[Tuple[str, ProviderResult]], now: float, errors: List[str], *,
+                        fetched_default: Optional[float] = None) -> None:
+        """One FairValueRefresh row stamped ``now`` (the publish time, lookahead-2). ``fetched_default`` (the refresh
+        start, when the manual file was read; default ``now``) is the ``fetched_at`` of a venue without quotes."""
         if self._refresh_recorder is None:
             return
+        start = float(now if fetched_default is None else min(float(fetched_default), float(now)))
         venues: Dict[str, Dict[str, Any]] = {}
         for name, res in results:
             times = [float(q.fetched_at) for q in res.quotes.values() if q is not None and q.fetched_at is not None]
-            fetched = min(times) if times else (now if res.status == "ok" else None)
+            fetched = min(times) if times else (start if res.status == "ok" else None)
             venues[res.venue or name] = {"status": res.status, "fetched_at": fetched}
         manual = self._manual.status()
         if manual.get("exists"):
-            venues["manual"] = {"status": "ok" if not manual.get("errors") else "error", "fetched_at": now}
+            venues["manual"] = {"status": "ok" if not manual.get("errors") else "error", "fetched_at": start}
         try:
             self._refresh_recorder(FairValueRefresh(ts=now, venues=venues))
         except Exception as exc:
@@ -3011,11 +3290,13 @@ def _record_changed(old: Tuple[Any, ...], new: Tuple[Any, ...]) -> bool:
     return tuple(old[3:]) != tuple(new[3:])
 
 
-def default_providers(mode: str, *, transport: Any = None) -> List[FairValueProvider]:
-    """``[PolymarketProvider(), KalshiProvider()]`` for mode "auto", else []."""
+def default_providers(mode: str, *, transport: Any = None, reads_per_min: int = EXTERNAL_READS_PER_MIN) -> List[FairValueProvider]:
+    """``[PolymarketProvider(), KalshiProvider()]`` for mode "auto", else []. ``reads_per_min`` is each host's
+    budget (OUTSIDE_READS_PER_MIN_WITH_MOVES when the outside-move watcher polls them too)."""
     if mode != "auto":
         return []
-    return [PolymarketProvider(transport=transport), KalshiProvider(transport=transport)]
+    return [PolymarketProvider(transport=transport, reads_per_min=reads_per_min),
+            KalshiProvider(transport=transport, reads_per_min=reads_per_min)]
 
 
 def _history_bucket_s(record: FairValueRecord) -> float:

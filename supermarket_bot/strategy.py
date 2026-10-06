@@ -56,6 +56,7 @@ from .models import (
     BetShape,
     ExchangeInfo,
     ExitPlan,
+    ExposureSummary,
     FairValue,
     HighBand,
     Opportunity,
@@ -94,6 +95,12 @@ ASSUMED_SPREAD = 0.02  # when no live bid/ask is known (marks, candles): the spr
 SLOW_COUNT_STATES = frozenset({"AK", "AZ", "NV", "CA", "WA", "OR", "UT", "ME"})
 RCV_STATES = frozenset({"AK", "ME"})
 RCV_CALLED_PROB = 0.80  # a safe seat in a ranked-choice state can still go to a runoff
+# Chamber control (House / Senate majority, state "US") is decided by the LAST seats counted, which sit in the
+# slow-count states above (House control was called on Nov 16 in 2022 and Nov 13 in 2024; the Cup closes at noon
+# ET the day after the election): it counts as a slow count everywhere (called_prob, riskless sets, regime exits).
+CHAMBER_OFFICES = frozenset({"HOUSE_CONTROL", "SENATE_CONTROL"})
+CHAMBER_STATE = "US"
+CHAMBER_SAFE_CALLED_PROB = 0.80  # even a 0.95+ chamber favourite can hinge on late-counted seats
 # Option labels that make a multi-outcome market exhaustive (a catch-all outcome exists).
 CATCH_ALL_RE = re.compile(r"\b(any other|other|someone else|field|none of the above)\b", re.IGNORECASE)
 
@@ -292,13 +299,32 @@ def _settles_before(info_date: Optional[str], cup_end: Optional[float],
     return settles_before(info_date, cup_end, margin_s), settle
 
 
+def is_chamber(race: Optional[RaceRef]) -> bool:
+    """A chamber-control race (House / Senate majority): office HOUSE_CONTROL / SENATE_CONTROL or state "US"."""
+    return race is not None and (race.office in CHAMBER_OFFICES or race.state == CHAMBER_STATE)
+
+
+def _slow_state(state: Optional[str]) -> bool:
+    """A slow count: a state in SLOW_COUNT_STATES, or chamber control (state "US"), decided by the last seats."""
+    return bool(state) and (state in SLOW_COUNT_STATES or state == CHAMBER_STATE)
+
+
+def _slow_race(race: Optional[RaceRef]) -> bool:
+    return race is not None and (is_chamber(race) or _slow_state(race.state))
+
+
 def called_prob(race: Optional[RaceRef], favourite_price: Optional[float], params: StrategyParams) -> float:
     """P(the race is called, so prices go to ~0/1, before the Cup's closeout window):
-    favourite >= 0.95 -> called_prob_safe (0.80 in RCV_STATES); state in SLOW_COUNT_STATES ->
-    called_prob_slow; known race elsewhere -> called_prob_fast; unknown race -> the mean of fast and slow."""
+    chamber control (House / Senate majority) -> CHAMBER_SAFE_CALLED_PROB (0.80) for a favourite >= 0.95, else
+    called_prob_slow (it hinges on the slow-count seats); favourite >= 0.95 -> called_prob_safe (0.80 in
+    RCV_STATES); state in SLOW_COUNT_STATES -> called_prob_slow; known race elsewhere -> called_prob_fast;
+    unknown race -> the mean of fast and slow."""
     fav = _num(favourite_price)
     state = race.state if race is not None else None
-    if fav is not None and fav >= 0.95 - 1e-9:
+    safe = fav is not None and fav >= 0.95 - 1e-9
+    if is_chamber(race):
+        return min(CHAMBER_SAFE_CALLED_PROB, params.called_prob_safe) if safe else params.called_prob_slow
+    if safe:
         return RCV_CALLED_PROB if state in RCV_STATES else params.called_prob_safe
     if race is None:
         return (params.called_prob_fast + params.called_prob_slow) / 2.0
@@ -557,11 +583,12 @@ def _usable_fv(fv: Optional[FairValue], now: float, params: StrategyParams) -> O
 def _exit_before(regime: str, states: Sequence[Optional[str]], settles_before_end: Optional[bool],
                  cup_end: Optional[float], params: StrategyParams) -> Optional[float]:
     """The regime exit rule (all kinds, §5.2): flat ``closeout_buffer_s`` before the Cup end under a VWAP
-    closeout, or under an unknown rule in a slow-count state; markets settling before the end never."""
+    closeout, or under an unknown rule in a slow-count state (chamber control, state "US", counts as one);
+    markets settling before the end never."""
     if settles_before_end is True or cup_end is None:
         return None
     regime = _regime(regime)
-    if regime == REGIME_VWAP or (regime == REGIME_UNKNOWN and any(s in SLOW_COUNT_STATES for s in states if s)):
+    if regime == REGIME_VWAP or (regime == REGIME_UNKNOWN and any(_slow_state(s) for s in states if s)):
         return round(float(cup_end) - params.closeout_buffer_s, 3)
     return None
 
@@ -1318,9 +1345,11 @@ def _set_bet(legs: Sequence[Mapping[str, Any]], cost: float, floor: Optional[flo
              races: Mapping[str, RaceRef], latest: Mapping[str, PricePoint],
              params: StrategyParams) -> Tuple[BetShape, float, str]:
     """(bet, called probability, why) for a set: riskless only under ``resolved_outcomes`` or when every
-    leg's race is a fast count; otherwise bounded (refund tail, uncalled branch priced as no gain, D27)."""
+    leg's race is a fast count (never chamber control); otherwise bounded (refund tail, uncalled branch priced
+    as no gain, D27)."""
     calls: List[float] = []
     fast = True
+    chamber = False
     for leg in legs:
         eid = str(leg.get("exchange_id"))
         race = races.get(eid)
@@ -1331,7 +1360,8 @@ def _set_bet(legs: Sequence[Mapping[str, Any]], cost: float, floor: Optional[flo
         fav = max(mid, 1.0 - mid) if mid is not None else None
         c = called_prob(race, fav, params)
         calls.append(c)
-        if race is None or race.state in SLOW_COUNT_STATES or c < params.called_prob_fast - 1e-9:
+        chamber = chamber or is_chamber(race)
+        if race is None or _slow_race(race) or c < params.called_prob_fast - 1e-9:
             fast = False
     called = min(calls) if calls else (params.called_prob_fast + params.called_prob_slow) / 2.0
     regime = _regime(regime)
@@ -1344,7 +1374,10 @@ def _set_bet(legs: Sequence[Mapping[str, Any]], cost: float, floor: Optional[flo
     tail = params.basket_refund_prob
     states = sorted({races[str(leg.get('exchange_id'))].state for leg in legs if str(leg.get("exchange_id")) in races})
     slow = [s for s in states if s in SLOW_COUNT_STATES]
-    if slow:
+    if chamber:
+        why = (f"chamber control is decided by the last seats counted (slow counts such as CA, AZ and NV), so it is "
+               f"often uncalled at the closeout ({called:.0%} called before it)")
+    elif slow:
         why = f"{', '.join(slow)} counts slowly (called before the closeout {called:.0%})"
     elif not all(str(leg.get("exchange_id")) in races for leg in legs):
         why = f"the race is not known, so it may not be called before the closeout ({called:.0%})"
@@ -2349,6 +2382,10 @@ def _resolve_conflicts(opps: List[Opportunity], infos: Mapping[str, ExchangeInfo
       multi-outcome book's arbitrage: only the arbitrage (it was there first).
     * Two value ideas on different legs of one race that bet on different winners (YES on two legs, or
       NO on two legs): only the higher-scored one (an unbalanced partial set, D38).
+    * Two value ideas on different legs of one race that bet on the SAME winner (YES on one leg and NO on
+      another: in a two-way race YES-D and NO-R are one bet that D wins, and in any race both lose when the NO
+      leg wins): only the higher-scored one. Kept together they were sized as two Kelly bets (2x the stated
+      Kelly fraction on one result) and took two of the chaser's slots.
     * A tradable arbitrage or basket buys one side of each leg; a carry on the other side of the same
       outcome is dropped (holding both pays exactly 1.00 for more than 1.00), and a fade or
       watch on it is flagged.
@@ -2368,13 +2405,13 @@ def _resolve_conflicts(opps: List[Opportunity], infos: Mapping[str, ExchangeInfo
         if opp.kind == KIND_BASKET and opp.side == "yes" and legs in book_arb_sets:
             continue  # the flagged book's arbitrage is the same trade
         kept.append(opp)
-    # value ideas on different winners of one race
+    # value ideas on other legs of one race: different winners (same side, D38) or the same winner (YES on one leg,
+    # NO on another): either way the better-scored idea is the race's one value bet
     out: List[Opportunity] = []
     value_bets: Dict[str, List[Opportunity]] = {}
     for opp in kept:
         if opp.kind == KIND_VALUE and opp.race_key and opp.exchange_id is not None:
-            clash = next((o for o in value_bets.get(opp.race_key, [])
-                          if o.exchange_id != opp.exchange_id and o.side == opp.side), None)
+            clash = next((o for o in value_bets.get(opp.race_key, []) if o.exchange_id != opp.exchange_id), None)
             if clash is not None:
                 continue
             value_bets.setdefault(opp.race_key, []).append(opp)
@@ -2841,6 +2878,84 @@ def _policy_pair(sizing: str, kelly_mult: float, max_position_pct: float) -> Tup
     return (conservative, chaser) if name == POLICY_CONSERVATIVE else (chaser, conservative)
 
 
+JOINT_SIZING_LINE = ("The cards are sized together, best score first, the way the simulator sizes them: their sizes add "
+                     "up, and following every card stays inside the caps above (a weaker idea gets less, or nothing, "
+                     "when better ones use the room)")
+RESORT_LINE = ("The risk mode re-ranks the cards after sizing: the sizes follow the plain growth score, the order the "
+               "simulator funds them in")
+BOLD_CARD_LINE = ("As the chaser's bold bet it is held to settlement: the exit target above does not apply, because only "
+                  "a 1/0 win reaches the bar")
+_JOINT_CAPS = frozenset({"total_cap", "race_cap", "tilt_cap", "swing_cap", "cash", "factor", "top_k"})
+
+
+def _joint_lines(signals: Sequence[Opportunity], decisions: Mapping[str, SizeDecision]) -> None:
+    """Tell each card it was sized after the ideas before it (in the order ``size_all`` funds them: the chaser's
+    bold bet first, then best score first), and how much they take, so nobody re-adds the sizes."""
+    order = sizing_mod._ordered(signals)
+    bold_ids = {key for key, dec in decisions.items() if dec.bold}
+    seq = [o for o in order if str(o.idea_id) in bold_ids] + [o for o in order if str(o.idea_id) not in bold_ids]
+    committed = 0.0
+    seen_bold = False
+    others = 0
+    for o in seq:
+        dec = decisions.get(str(o.idea_id))
+        if dec is None:
+            continue
+        sized = o.kind != KIND_WATCH and o.bet is not None
+        if sized and committed > 0.005 and (dec.units > 0 or _JOINT_CAPS.intersection(dec.capped_by)):
+            ideas = "the idea funded before it" if others == 1 else f"the {others} ideas funded before it"
+            if seen_bold and others:
+                before = f"the bold bet and {ideas}, which take"
+            elif seen_bold:
+                before = "the bold bet, which takes"
+            else:
+                before = f"{ideas}, which {'takes' if others == 1 else 'take'}"
+            dec.lines.append(f"Sized after {before} {committed:,.0f} SUSQies: the card sizes add up")
+        if dec.units > 0:
+            committed += float(dec.stake or 0.0)
+            seen_bold = seen_bold or dec.bold
+            others += 0 if dec.bold else 1
+
+
+def _hold_bold(opp: Opportunity) -> None:
+    """The bold card's exit plan holds to settlement (sizing.bold_exit_plan): no target, no stop."""
+    opp.exit_plan = sizing_mod.bold_exit_plan(opp)
+    opp.target_price = None
+    opp.stop_price = None
+
+
+def _basis_lines(bal: Optional[float], value: Optional[float], held: float, resorted: bool = False) -> List[str]:
+    """The sizing panel's extra lines: what "your value" is, what the bot knows of open positions, and that the cards
+    are sized together (the last line, ``JOINT_SIZING_LINE``, plus ``RESORT_LINE`` when the risk mode re-ranks)."""
+    out: List[str] = []
+    if value is not None and value > 0:
+        cash = f"; your cash ({bal:,.0f}) caps what can be bought" if bal is not None else ""
+        out.append(f"Your value here is your account value ({value:,.0f}: cash plus positions at market prices), the "
+                   f"same basis as the leaderboard's values and the bar{cash}")
+    elif bal is not None:
+        out.append(f"Your value here is your cash ({bal:,.0f}): the account value is unknown, so open positions are not "
+                   "counted and M may be overstated")
+    if held > 0.5:
+        out.append(f"Your open positions ({held:,.0f} SUSQies at market prices) count against the total cap only: the bot "
+                   "cannot see which races they are in, so the race, swing and slot caps cover only these new ideas")
+    out.append(JOINT_SIZING_LINE)
+    if resorted:
+        out.append(RESORT_LINE)
+    return out
+
+
+def _with_lines(explain: Mapping[str, Any], extra: Sequence[str]) -> Dict[str, Any]:
+    """``explain`` with ``extra`` lines: the basis right after the "M = ..." line (else at the end)."""
+    out = dict(explain)
+    lines = list(out.get("lines") or [])
+    tail = (JOINT_SIZING_LINE, RESORT_LINE)
+    at = next((i + 1 for i, line in enumerate(lines) if str(line).startswith("M = ")), len(lines))
+    lines[at:at] = [x for x in extra if x not in tail]
+    lines.extend(x for x in extra if x in tail)
+    out["lines"] = lines
+    return out
+
+
 def _report(inputs: StrategyInputs, *, sizing: str = POLICY_CONSERVATIVE,
             fair_value_status: Optional[Mapping[str, Any]] = None, top_n: int = TOP_N,
             kelly_mult: float = KELLY_MULT, max_position_pct: float = MAX_POSITION_PCT) -> StrategyReport:
@@ -2861,15 +2976,31 @@ def _report(inputs: StrategyInputs, *, sizing: str = POLICY_CONSERVATIVE,
     bar = inputs.bar
     if bar is None and inputs.leaderboard is not None:
         bar = sizing_mod.estimate_bar(inputs.leaderboard, (), initial, days_left)
-    ctx = SizingContext(now=now, equity=max(0.0, basis), cash=max(0.0, basis), free_cash=max(0.0, basis),
-                        start_capital=initial, cup_end=cup_end, days_left=days_left, bar=bar, my_rank=rank,
-                        regime=regime, params=params, races=dict(inputs.races or {}))
+    # Like with like (the paper engine sizes on equity_liq): your value for M and Kelly is the ACCOUNT VALUE (cash plus
+    # positions), the basis of the bar and the leaderboard; cash only caps what can be bought. Positions are known
+    # here only as a total (account value - cash), which counts against the total cap.
+    equity = value if value is not None and value > 0 else basis
+    held = max(0.0, value - bal) if value is not None and bal is not None else 0.0
+    exposure = ExposureSummary(gross_cost=round(held, 6))
+    ctx = SizingContext(now=now, equity=max(0.0, equity), cash=max(0.0, basis), free_cash=max(0.0, basis),
+                        start_capital=initial, cup_end=cup_end, days_left=days_left, exposure=exposure, bar=bar,
+                        my_rank=rank, regime=regime, params=params, races=dict(inputs.races or {}))
     built = _collect(inputs, params)
+    signals = [b.opp for b in built]
+    # Every card is sized TOGETHER with the others (size_all, best score first), exactly as the paper engine sizes the
+    # same ideas: following every card stays inside the total, race and swing caps, the slate rule, top_k and the one
+    # bold bet. Sized one by one, 12 cards each "within 8%" added up to 75% of equity.
+    decisions = policy.size_all(signals, ctx)
+    alts = other.size_all(signals, ctx)
+    _joint_lines(signals, decisions)
     opps: List[Opportunity] = []
     for b in built:
         opp = b.opp
-        dec = policy.size(opp, ctx)
-        alt = other.size(opp, ctx)
+        key = str(opp.idea_id)
+        dec = decisions.get(key) or policy.size(opp, ctx)
+        alt = alts.get(key) or other.size(opp, ctx)
+        if dec.bold:
+            _hold_bold(opp)
         opp.suggested_shares = int(dec.units)
         opp.suggested_cost = round(dec.units * (dec.avg_cost or opp.entry_price or 0.0), 2) if dec.units else 0.0
         opp.sizing = dec.to_dict()
@@ -2879,6 +3010,8 @@ def _report(inputs: StrategyInputs, *, sizing: str = POLICY_CONSERVATIVE,
             b.render(_size_info(opp, dec, policy, ctx, now))
         elif opp.kind in NEW_KINDS and dec.lines:
             opp.rationale.append(dec.lines[0])
+        if dec.bold:
+            opp.rationale.append(BOLD_CARD_LINE)
         if bal is None and opp.suggested_shares > 0:
             opp.rationale.append(f"Balance unknown: this size assumes the {basis:,.0f} starting balance")
         opps.append(opp)
@@ -2889,8 +3022,9 @@ def _report(inputs: StrategyInputs, *, sizing: str = POLICY_CONSERVATIVE,
     opps.sort(key=lambda o: (-o.score, _KIND_ORDER.get(o.kind, 9), -o.confidence, o.title, o.exchange_id or "",
                              str(o.idea_id or "")))
     opps = opps[: max(0, top_n)]
-    explain = dict(policy.explain(ctx))
-    explain["alternative"] = other.explain(ctx)
+    extra = _basis_lines(bal, value, held, resorted=any(abs(m - 1.0) > 1e-9 for m in multipliers.values()))
+    explain = _with_lines(policy.explain(ctx), extra)
+    explain["alternative"] = _with_lines(other.explain(ctx), extra)
     return StrategyReport(
         generated_at=now,
         risk_mode=mode,
@@ -2931,8 +3065,12 @@ def build_report(*, now: float, surges: Sequence[Surge], bands: Sequence[HighBan
     non-reversion surge per exchange -> fade or watch, every stable band -> carry, every arbitrage flag,
     value ideas from ``fair_values``, baskets from race/market groups, liquidity holes), then sizes every
     idea with the ``sizing`` policy (``"conservative"``: quarter-Kelly on the expected average fill, capped
-    at ``max_position_pct`` per idea; ``"chaser"``: goal-based) on an empty portfolio worth the sizing basis
-    (``balance``, else ``initial_balance``, else 100,000). ``alt_sizing`` holds the other policy's size.
+    at ``max_position_pct`` per idea; ``"chaser"``: goal-based) JOINTLY (``size_all``, best score first, as
+    the paper engine does), so the cards add up within the portfolio caps, the slate rule, top_k and the one
+    bold bet. Your value (M, Kelly, caps) is ``account_value`` (cash plus positions) when known, else
+    ``balance``, else ``initial_balance``, else 100,000; the cash (``balance``) caps what can be bought, and
+    the positions' value (account value - cash) counts against the total cap. ``alt_sizing`` holds the other
+    policy's size.
     Scores are :func:`growth_score` times the risk-mode multiplier; the top ``top_n`` are kept, best first.
     ``assumptions`` lists what was assumed for unknown inputs (balance, rank, leader value), and sized
     ideas say so too.
@@ -2942,9 +3080,10 @@ def build_report(*, now: float, surges: Sequence[Surge], bands: Sequence[HighBan
     the reversion of a recent opposite surge on the same outcome. Ideas that contradict a
     tradable arbitrage are dropped or flagged (see :func:`_resolve_conflicts`).
 
-    ``balance`` is cash (it sizes the ideas); ``account_value`` (cash + open positions) is what
-    the risk mode compares with the leader's value, falling back to cash when unknown. Sizes
-    are capped by the order-book depth on the ``latest`` points when known.
+    ``balance`` is cash (it caps the sizes); ``account_value`` (cash + open positions) is the value
+    the sizes, M and the risk mode use (compared like with like with the leader's value and the
+    bar), falling back to cash when unknown. Sizes are capped by the order-book depth on the
+    ``latest`` points when known.
     """
     inputs = StrategyInputs(
         now=now, cup_end=cup_end, infos=dict(infos or {}), latest=dict(latest or {}), surges=list(surges or ()),

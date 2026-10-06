@@ -15,6 +15,7 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -126,6 +127,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--no-paper", action="store_true", help="do not run the paper trader (the Simulation view)")
     _fair_value_options(s)
     _simulation_options(s)
+    _moves_options(s)
 
     s = sub.add_parser(
         "paper",
@@ -189,7 +191,42 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--import-history", action="store_true",
                    help="import outside price history into the tracker database for backtests (GET only)")
     s.add_argument("--days", type=positive_float, default=7.0, help="--import-history: days to import (default 7)")
+
+    # docs/OUTSIDE_MOVES.md §17 (package "wiring")
+    s = sub.add_parser(
+        "moves",
+        help="watch Polymarket and Kalshi for the Cup's races and flag significant moves (alerts only)",
+        description="Track the outside markets matched to every Cup outcome every 15 s (GET only, no account), flag "
+                    "significant moves, compare them with the Cup at the same moment, suggest a hand trade when the "
+                    "Cup lags, and measure how often and how fast the Cup follows. Nothing is traded.",
+    )
+    s.add_argument("--demo", action="store_true", help="use the demo market and its scripted outside venues (no API key)")
+    s.add_argument("--fast", action="store_true", help="demo only: run on a simulated clock, as fast as the CPU allows")
+    s.add_argument("--hours", type=positive_float, default=None,
+                   help="stop after this many hours (default: until Ctrl-C; --fast: 2)")
+    s.add_argument("--poll", type=float, default=15.0, help="seconds between outside polls (default 15; 5 to 120)")
+    s.add_argument("--interval", type=float, default=30.0, help="seconds between Cup price snapshots (default 30)")
+    s.add_argument("--book-reads", type=bounded_int(0, 30), default=4,
+                   help="Cup order-book reads per minute for the suggested trade's depth (default 4; 0 = none)")
+    s.add_argument("--bell", action="store_true", help="ring the terminal bell on each new lagging alert with a suggestion")
+    s.add_argument("--only-lagging", action="store_true", help="print only lagging alerts and what became of them")
+    s.add_argument("--summary-every", type=positive_float, default=15.0, help="minutes between lag summaries (default 15)")
+    s.add_argument("--replay", action="store_true",
+                   help="print the stored alerts and the lag study from the database, then exit (offline)")
+    s.add_argument("--since", help="--replay: only alerts detected since (ISO-8601, UTC)")
+    s.add_argument("--store", help="--replay: the tracker database (default data/<tournament>/tracker.sqlite3)")
+    s.add_argument("--no-news", action="store_true", help="do not search online news for surges")
     return p
+
+
+def _moves_options(s: argparse.ArgumentParser) -> None:
+    """The dashboard's outside-move options (docs/OUTSIDE_MOVES.md §17.1)."""
+    s.add_argument("--no-moves", action="store_true",
+                   help="do not watch Polymarket and Kalshi for outside moves (the Outside moves view)")
+    s.add_argument("--moves-poll", type=float, default=15.0,
+                   help="seconds between outside polls for move alerts (default 15; 5 to 120)")
+    s.add_argument("--moves-book-reads", type=bounded_int(0, 30), default=4,
+                   help="Cup order-book reads per minute for alert trade suggestions (default 4; 0 = none)")
 
 
 def _fair_value_options(s: argparse.ArgumentParser) -> None:
@@ -776,13 +813,21 @@ def paper_summary_lines(body: Mapping[str, Any]) -> List[str]:
         f"[paper] {_utc_text(body.get('now'))}  {hours:.1f} h observed of {target:g} h (wall {wall:.1f} h)  "
         f"steps {int(run.get('steps') or 0)}  reads {int(budget.get('reads_used') or 0)}/{int(budget.get('reads_limit') or 0)} per min"
     ]
+    if str(run.get("capital_source") or "").startswith("default"):
+        # ui-4: the account was not known before something filled, so the run kept the default capital
+        lines.append(f"  Start capital: the default {_num(run.get('start_capital')) or 100_000:,.0f} (your account value was not "
+                     "known when this run started; reset it to start on your account value)")
     for p in body.get("portfolios") or []:
         if not isinstance(p, Mapping):
             continue
         pnl, pct = _num(p.get("pnl_liq")) or 0.0, _num(p.get("pnl_liq_pct")) or 0.0
+        legging = int(p.get("legging_trades") or 0)
         lines.append(
             f"  {p.get('label') or p.get('portfolio_id')}: {pnl:+,.0f} ({pct:+.2%}) at liquidation  fills {int(p.get('fills') or 0)}  "
             f"closed {int(p.get('trades_closed') or 0)}  open {int(p.get('positions_open') or 0)}"
+            # ui-7: legging exits of sets still held are not closed ideas
+            + (f"  (+{legging} legging exit{'s' if legging != 1 else ''} {_num(p.get('legging_pnl')) or 0.0:+,.0f}, not closed ideas)"
+               if legging > 0 else "")
         )
     head = body.get("headline") if isinstance(body.get("headline"), Mapping) else None
     verdict = head.get("verdict") if head and isinstance(head.get("verdict"), Mapping) else None
@@ -897,8 +942,13 @@ def _paper(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
         raise UsageError("--fast needs --demo (a live simulation runs in real time)")
     if not math.isfinite(args.interval) or args.interval < 1:
         raise UsageError("--interval must be at least 1 second")
+    import threading
+
     temp_dir: Optional[str] = None
     runtime: Any = None
+    # SIGTERM and SIGHUP (the terminal window was closed) stop like Ctrl-C: the tracker stops and releases its
+    # lease, so starting again at once continues the run (live-5)
+    previous_handlers = web._install_sigterm(threading.Event())
     try:
         if args.demo:
             if args.data_dir:
@@ -919,10 +969,13 @@ def _paper(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
             return _paper_fast(runtime, args, out, err, pipeline)
         return _paper_live(runtime, args, out, err)
     finally:
-        if runtime is not None:
-            runtime.close()
-        if temp_dir is not None:
-            shutil.rmtree(temp_dir, ignore_errors=True)
+        try:
+            if runtime is not None:
+                runtime.close()
+            if temp_dir is not None:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+        finally:
+            web._restore_sigterm(previous_handlers)
 
 
 def _paper_capital(args: argparse.Namespace) -> Optional[float]:
@@ -986,16 +1039,23 @@ def _paper_live(runtime: Any, args: argparse.Namespace, out: TextIO, err: TextIO
             time.sleep(1.0)
     except KeyboardInterrupt:
         interrupted = True
-        print("\nStopping the simulation…", file=err, flush=True)
     if reached and not args.keep_running:
         tracker.paper_end("completed")
-    elif not args.json:
-        print("The run stays open: the next `paper` or `dashboard` on this database continues it.", file=out, flush=True)
-    body = runtime.app.paper()
-    if args.json:
-        _dump_json(out, body)
-    else:
-        _say(out, paper_final_lines(body))
+    try:
+        if interrupted:
+            print("\nStopping the simulation…", file=err, flush=True)
+        if not (reached and not args.keep_running) and not args.json:
+            print("The run stays open: the next `paper` or `dashboard` on this database continues it.", file=out,
+                  flush=True)
+        body = runtime.app.paper()
+        if args.json:
+            _dump_json(out, body)
+        else:
+            _say(out, paper_final_lines(body))
+    except (OSError, ValueError):
+        if not interrupted:
+            raise
+        # after SIGHUP the terminal is gone (writes fail): the run is still stopped cleanly by the caller
     return EXIT_INTERRUPTED if interrupted else EXIT_OK
 
 
@@ -1091,6 +1151,9 @@ def _backtest(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
             raise UsageError(str(exc))
         try:
             report = bt.sweep(source, config, grid) if grid else bt.run_backtest(source, config)
+            # lookahead-1: the overlap with every stored paper run (for --demo: its own simulation, a paper run
+            # over exactly this window), not only a live run's start
+            pipeline.apply_paper_overlap(report, pipeline.paper_run_intervals(source, now=time.time()))
         except ValueError as exc:
             raise UsageError(str(exc))
         finally:
@@ -1155,6 +1218,7 @@ def backtest_lines(report: Any, path: Optional[Path] = None) -> List[str]:
     verdicts = data.get("verdicts") or {}
     if head_id and head_id in verdicts:
         lines.append(f"Headline verdict ({head_id}): {verdicts[head_id].get('sentence')}")
+    lines.extend(_backtest_caveat_lines(data, verdicts.get(head_id) if head_id else None, len(rows)))
     study = study_lines(data.get("study"))
     if study:
         lines.append("Signal study:")
@@ -1169,7 +1233,392 @@ def backtest_lines(report: Any, path: Optional[Path] = None) -> List[str]:
     return lines
 
 
+def _backtest_caveat_lines(data: Mapping[str, Any], verdict: Optional[Mapping[str, Any]], n_portfolios: int) -> List[str]:
+    """lookahead-5: what ``paper`` prints with its verdict, for the backtest text too: the multi-portfolio table
+    warning, the headline verdict's caveats (the ones shown next to a verdict) and, for demo data, DEMO_CAVEAT
+    (the demo's outside prices lead the Cup by design, so a "value" result there is built-in look-ahead)."""
+    from .paper import CAVEATS, DEMO_CAVEAT, TABLE_WARNING, VERDICT_CAVEATS
+
+    config = data.get("config") if isinstance(data.get("config"), Mapping) else {}
+    paper_cfg = config.get("paper") if isinstance(config.get("paper"), Mapping) else {}
+    own = [str(c) for c in (verdict or {}).get("caveats") or []]
+    demo = bool(paper_cfg.get("demo")) or str(config.get("label") or "") == "demo" or DEMO_CAVEAT in own
+    lines: List[str] = []
+    if demo:
+        lines.append(f"Note: {DEMO_CAVEAT}")
+    if n_portfolios > 1:
+        lines.append(TABLE_WARNING.format(n=n_portfolios))
+    shown = [CAVEATS[i] for i in VERDICT_CAVEATS]
+    caveats = [c for c in shown if c in own] if own else []
+    if caveats:
+        lines.append("Read the verdict with these in mind:")
+        lines.extend(f"  - {c}" for c in caveats)
+    return lines
+
+
 # ------------------------------------------------------------------ fairvalue
+
+
+# ------------------------------------------------------------------ moves (docs/OUTSIDE_MOVES.md §17)
+
+
+def cmd_moves(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
+    """``python -m supermarket_bot moves`` (docs/OUTSIDE_MOVES.md §17): the tracker headless with the outside-move
+    watcher (no paper trader, no web server), one block of lines per alert event (moves.format_event_lines), a
+    summary every --summary-every minutes, the final lag study; or --replay from the database. Package "wiring"."""
+    return _guarded(lambda: _moves(args, out, err), err)
+
+
+def _moves_poll(args: argparse.Namespace) -> float:
+    from .moves import MOVES_POLL_MAX_S, MOVES_POLL_MIN_S
+
+    poll = _num(getattr(args, "poll", None))
+    if poll is None or not MOVES_POLL_MIN_S <= poll <= MOVES_POLL_MAX_S:
+        raise UsageError(f"--poll must be between {MOVES_POLL_MIN_S:g} and {MOVES_POLL_MAX_S:g} seconds")
+    return poll
+
+
+def _moves(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
+    from . import pipeline, web
+    from .demo import SIM_T0, SimClock
+
+    if args.fast and not args.demo:
+        raise UsageError("--fast needs --demo")
+    poll = _moves_poll(args)
+    if not math.isfinite(args.interval) or args.interval < 1:
+        raise UsageError("--interval must be at least 1 second")
+    if args.replay:
+        if args.demo or args.fast:
+            raise UsageError("--replay reads a stored database: leave out --demo and --fast")
+        return _moves_replay(args, out)
+    if args.since or args.store:
+        raise UsageError("--since and --store are for --replay")
+    hours = args.hours if args.hours is not None else (2.0 if args.fast else None)
+    temp_dir: Optional[str] = None
+    runtime: Any = None
+    previous_handlers = web._install_sigterm(threading.Event())  # SIGTERM/SIGHUP stop like Ctrl-C (live-5)
+    try:
+        if args.demo:
+            if args.data_dir:
+                data_dir = Path(args.data_dir)
+            else:  # never the dashboard's data/demo: a running `dashboard --demo` keeps its database (D46)
+                temp_dir = tempfile.mkdtemp(prefix="supermarket-moves-")
+                data_dir = Path(temp_dir)
+            clock = SimClock(SIM_T0) if args.fast else None
+            runtime = web.build_demo(data_dir, args.interval, news=not args.no_news, out=err, clock=clock, paper=False,
+                                     fair_value="auto", moves=True, moves_poll_s=poll,
+                                     moves_book_reads_per_min=args.book_reads)
+        else:
+            args.no_paper, args.no_moves = True, False  # the watcher, never the paper trader
+            args.fair_value, args.no_fair_value = "auto", False  # the watcher polls the validated outside matches
+            args.moves_poll, args.moves_book_reads = poll, args.book_reads
+            runtime = web.build_live(_settings_for(args), args, out=err)
+        watcher = getattr(runtime, "moves", None) or getattr(runtime.tracker, "moves", None)
+        if watcher is None:
+            print("error: the outside-move watcher is not available in this build.", file=err, flush=True)
+            return EXIT_ERROR
+        printer = _MovesPrinter(args, out, demo=bool(args.demo))
+        watcher.add_listener(printer.event)
+        printer.start_lines(watcher, temp_dir)
+        if args.fast:
+            return _moves_fast(runtime, watcher, printer, args, hours, poll, pipeline)
+        return _moves_realtime(runtime, watcher, printer, args, hours, err)
+    finally:
+        try:
+            if runtime is not None:
+                runtime.close()
+            if temp_dir is not None:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+        finally:
+            web._restore_sigterm(previous_handlers)
+
+
+class _MovesPrinter:
+    """Prints the ``moves`` command's events and summaries (text or one JSON object per line). Events arrive from
+    the watcher's thread in real time and summaries from the main thread: one lock keeps their lines together."""
+
+    def __init__(self, args: argparse.Namespace, out: TextIO, demo: bool) -> None:
+        self.args = args
+        self.out = out
+        self.demo = demo
+        self.json = bool(getattr(args, "json", False))
+        self.bell = bool(getattr(args, "bell", False))
+        self.only_lagging = bool(getattr(args, "only_lagging", False))
+        self.lagging_ids: set = set()  # alerts that were lagging when they opened (--only-lagging)
+        self.events = 0
+        self._lock = threading.Lock()
+
+    def _emit(self, lines: Sequence[str]) -> None:
+        with self._lock:
+            for line in lines:
+                print(line, file=self.out, flush=True)
+
+    def start_lines(self, watcher: Any, temp_dir: Optional[str]) -> None:
+        from .moves import VENUE_LABELS
+
+        poll = float(getattr(watcher, "poll_s", 15.0) or 15.0)
+        path = getattr(watcher, "alerts_path", None)
+        if self.json:
+            return
+        if self.demo:
+            labels = ", ".join(VENUE_LABELS[v] for v in ("demo-a", "demo-b"))
+            lines = [f"Watching the demo's scripted outside venues ({labels}) every {poll:g} s. Demo data: the moves are "
+                     "scripted. Nothing is traded."]
+            if path is not None:
+                lines.append(f"Alerts are written to {path} (a temporary folder removed at exit; use --data-dir to keep it)."
+                             if temp_dir is not None else f"Alerts are written to {path}.")
+        else:
+            matched = _moves_matched(watcher)
+            what = f"for {matched} matched outcomes" if matched else "for every matched outcome"
+            where = f" Alerts also go to {path}." if path is not None else ""
+            lines = [f"Watching outside prices: Polymarket and Kalshi every {poll:g} s {what} (GET only, no account).{where} "
+                     "Nothing is traded. Ctrl-C to stop."]
+        self._emit(lines)
+
+    def event(self, event: Any) -> None:
+        from .moves import format_event_lines
+
+        kind = getattr(event, "kind", "")
+        alert = getattr(event, "alert", None) or {}
+        alert_id = getattr(event, "alert_id", None) or alert.get("alert_id")
+        if kind == "opened" and (alert.get("opened_status") or getattr(event, "status", alert.get("status"))) == "lagging":
+            self.lagging_ids.add(alert_id)
+        if self.only_lagging and alert_id not in self.lagging_ids:
+            return
+        self.events += 1
+        if self.json:
+            self._emit([json.dumps(_json_safe({"type": "event", "event": kind, "alert": alert}), ensure_ascii=True,
+                                   sort_keys=True)])
+            return
+        if kind == "closed":
+            return  # closed events are in alerts.jsonl and --json only
+        self._emit(format_event_lines(event, bell=self.bell))
+
+    def summary(self, body: Optional[Mapping[str, Any]], now: float, *, final: bool) -> None:
+        from .moves import MOVES_CAVEATS, MOVES_DEMO_CAVEAT
+
+        body = body if isinstance(body, Mapping) else {}
+        lag = body.get("summary") if isinstance(body.get("summary"), Mapping) else {}
+        venues = [v for v in body.get("venues") or [] if isinstance(v, Mapping)]
+        caveats = list(body.get("caveats") or MOVES_CAVEATS)
+        if self.demo and MOVES_DEMO_CAVEAT not in caveats:
+            caveats.append(MOVES_DEMO_CAVEAT)
+        if self.json:
+            payload: Dict[str, Any] = {"type": "summary", "at": now, "summary": dict(lag), "venues": venues,
+                                       "counts": body.get("counts")}
+            if final:
+                payload.update(final=True, caveats=caveats)
+            self._emit([json.dumps(_json_safe(payload), ensure_ascii=True, sort_keys=True)])
+            return
+        lines = moves_summary_lines(body, now)
+        if final:
+            from .moves import lag_table_lines
+
+            lines += lag_table_lines(lag)  # the numbers and their sample sizes behind the sentence
+            lines += [f"  - {c}" for c in caveats]
+        self._emit(lines)
+
+
+def moves_summary_lines(body: Mapping[str, Any], now: float) -> List[str]:
+    """``moves.summary_lines`` for the watcher's published summary body (or a replay's ``{"summary": LagSummary}``):
+    the lag sentence, the venue line and the filtered-out counts (§17.2)."""
+    from .moves import summary_lines
+
+    lag = body.get("summary") if isinstance(body.get("summary"), Mapping) else {}
+    venues = [v for v in body.get("venues") or [] if isinstance(v, Mapping)]
+    return list(summary_lines({**body, **lag}, venues, now))
+
+
+def _moves_matched(watcher: Any) -> Optional[int]:
+    try:
+        watching = (watcher.summary() or {}).get("watching") or {}
+    except Exception:
+        return None
+    matched = watching.get("matched") if isinstance(watching, Mapping) else None
+    return int(matched) if isinstance(matched, int) and matched > 0 else None
+
+
+def _moves_fast(runtime: Any, watcher: Any, printer: _MovesPrinter, args: argparse.Namespace, hours: float, poll: float,
+                pipeline: Any) -> int:
+    clock = runtime.clock
+    tracker = runtime.tracker
+    interrupted = False
+    end_at = float(clock()) + float(hours) * 3600.0
+
+    def on_summary(body: Mapping[str, Any]) -> None:
+        if float(clock()) >= end_at - 1e-9:
+            return  # the final block (with the caveats) follows at the same time: print it once
+        printer.summary(tracker.moves_view(), float(clock()), final=False)
+
+    try:
+        pipeline.run_simulation(runtime, clock, hours=hours, step_s=args.interval, summary_every_s=args.summary_every * 60.0,
+                                on_summary=on_summary, moves_every_s=poll, end_run=False)
+    except KeyboardInterrupt:
+        interrupted = True
+    printer.summary(tracker.moves_view(), float(clock()), final=True)
+    return EXIT_INTERRUPTED if interrupted else EXIT_OK
+
+
+def _moves_realtime(runtime: Any, watcher: Any, printer: _MovesPrinter, args: argparse.Namespace, hours: Optional[float],
+                    err: TextIO) -> int:
+    """Real time (live, or the demo without --fast): the tracker's threads (snapshots, fair values, the watcher)."""
+    from .fairvalue import OUTSIDE_READS_PER_MIN_WITH_MOVES
+
+    tracker = runtime.tracker
+    runtime.start()  # TrackerBusy (exit 2) when another process tracks this database
+    clock = getattr(tracker, "_clock", None) or time.time
+    every = float(args.summary_every) * 60.0
+    started = time.monotonic()
+    next_summary = started + every
+    deadline = started + hours * 3600.0 if hours else None
+    warned = bool(args.demo)
+    interrupted = False
+    try:
+        while deadline is None or time.monotonic() < deadline:
+            if not tracker.running:
+                fatal = (tracker.status() or {}).get("fatal_error")
+                print(f"error: the tracker stopped: {fatal or 'see the log'}", file=err, flush=True)
+                printer.summary(tracker.moves_view(), float(clock()), final=True)
+                return EXIT_ERROR
+            if not warned:
+                warned = _moves_budget_warning(watcher, float(watcher.poll_s), OUTSIDE_READS_PER_MIN_WITH_MOVES, err,
+                                               time.monotonic() - started)
+            if time.monotonic() >= next_summary:
+                printer.summary(tracker.moves_view(), float(clock()), final=False)
+                next_summary += every
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        interrupted = True
+    try:
+        if interrupted:
+            print("\nStopping the outside-move watcher…", file=err, flush=True)
+        printer.summary(tracker.moves_view(), float(clock()), final=True)
+    except (OSError, ValueError):
+        if not interrupted:
+            raise  # after SIGHUP the terminal is gone: the watcher still stops cleanly
+    return EXIT_INTERRUPTED if interrupted else EXIT_OK
+
+
+def _moves_budget_warning(watcher: Any, poll: float, limit: int, err: TextIO, waited: float) -> bool:
+    """The §4.3 start-up warning once the Polymarket match count is known: True when done (warned or not needed)."""
+    try:
+        venues = (watcher.summary() or {}).get("venues") or []
+    except Exception:
+        venues = []
+    poly = next((v for v in venues if isinstance(v, Mapping) and v.get("venue") == "polymarket"), None)
+    matched = poly.get("matched") if isinstance(poly, Mapping) else None
+    if not isinstance(matched, int) or matched <= 0:
+        return waited > 300.0  # nothing matched yet (or no Polymarket): stop checking after 5 minutes
+    reads = math.ceil(matched / 50) * 60.0 / poll + 5
+    if reads > limit - 9:  # the poll keeps 8 + 1 slots for the fair-value refresh (§4.2)
+        print(f"warning: A {poll:g}-second poll needs about {reads:.0f} Polymarket reads a minute, more than the {limit} "
+              "this bot allows itself: some polls will be skipped.", file=err, flush=True)
+    return True
+
+
+def _moves_replay(args: argparse.Namespace, out: TextIO) -> int:
+    """``moves --replay``: the stored alerts and the lag study from the database (read-only, offline, no key)."""
+    from .moves import MOVES_ALERTS_FILE, MOVES_DEMO_CAVEAT, MoveEvent, format_event_lines, summarise
+    from .store import TrackerStore
+
+    path = backtest_store_path(args)
+    since = _iso_arg(args.since, "--since")
+    try:
+        source = TrackerStore.open_read_only(path)
+    except RuntimeError as exc:  # an older schema
+        raise UsageError(str(exc))
+    try:
+        alerts = source.move_alerts(since=since, limit=100_000)
+    finally:
+        source.close()
+    if args.only_lagging:
+        alerts = [a for a in alerts if _was_lagging(a)]
+    times = [t for a in alerts for t in (_num(a.get("updated_at")), _num(a.get("detected_at"))) if t is not None]
+    now = max(times) if times else time.time()
+    lag = summarise(alerts, now).to_dict()
+    demo = any(bool(a.get("demo")) for a in alerts)
+    if args.json:
+        for alert in alerts:
+            print(json.dumps(_json_safe({"type": "alert", "alert": alert}), ensure_ascii=True, sort_keys=True), file=out)
+        payload = {"type": "summary", "at": now, "summary": lag, "venues": [], "final": True, "path": str(path)}
+        print(json.dumps(_json_safe(payload), ensure_ascii=True, sort_keys=True), file=out, flush=True)
+        return EXIT_OK
+    # The store keeps each alert's latest state (a closed alert no longer carries its trade suggestion); the
+    # append-only alerts.jsonl next to the database has every alert as it was when it opened.
+    as_opened = _opened_alerts_from_jsonl(path.parent / MOVES_ALERTS_FILE)
+    lines = [f"Replaying {len(alerts)} stored outside-move alert(s) from {path} (read-only; nothing is traded)."]
+    for alert in alerts:
+        lag_info = alert.get("lag") if isinstance(alert.get("lag"), Mapping) else {}
+        alert_id = str(alert.get("alert_id"))
+        at_open = as_opened.get(alert_id)
+        opened = MoveEvent(kind="opened", at=float(alert.get("detected_at") or 0.0), alert_id=alert_id,
+                           status=str((at_open or alert).get("status") or ""),
+                           lag_outcome=str(lag_info.get("outcome") or "pending"), alert=dict(at_open or alert))
+        block = format_event_lines(opened)
+        kept = isinstance(alert.get("opened_trade"), Mapping) or bool(alert.get("opened_trade_note"))
+        if (at_open is None and not kept and _was_lagging(alert) and not isinstance(alert.get("trade"), Mapping)
+                and len(block) >= 3):
+            # an alert stored without its opening suggestion (opened_trade) and no alerts.jsonl to recover it from
+            block[2] = ("    suggestion at the time: not kept with the closed alert in the database "
+                        f"(see {MOVES_ALERTS_FILE})")
+        lines += block
+        outcome = lag_info.get("outcome")
+        if outcome in _REPLAY_STATUS_OUTCOMES and _num(lag_info.get("resolved_at")) is not None:
+            resolved = MoveEvent(kind="status", at=float(lag_info["resolved_at"]), alert_id=alert_id,
+                                 status=str(alert.get("status") or ""), lag_outcome=str(outcome), alert=dict(alert))
+            lines += format_event_lines(resolved)
+    from .moves import MOVES_CAVEATS, lag_table_lines
+
+    summary = moves_summary_lines({"summary": lag, "venues": []}, now)
+    # the replay has neither the venues nor the suppressed moves (filtered-out moves are not stored): say so rather
+    # than "nothing"
+    replaced = {"    venues: ": "    venues: not read (a replay of the stored alerts)",
+                "    filtered out today: ": "    filtered out: not kept in the database (a replay shows the alerts only)"}
+    lines += [next((v for k, v in replaced.items() if line.startswith(k)), line) for line in summary]
+    lines += lag_table_lines(lag)
+    lines += [f"  - {c}" for c in list(MOVES_CAVEATS) + ([MOVES_DEMO_CAVEAT] if demo else [])]
+    _say(out, lines)
+    return EXIT_OK
+
+
+# lag outcomes that are "status" events of their own in a live run (cup_first and excluded resolve at the opening)
+_REPLAY_STATUS_OUTCOMES = ("followed", "reverted", "not_followed", "censored")
+
+
+def _opened_alerts_from_jsonl(path: Path) -> Dict[str, Dict[str, Any]]:
+    """alert id -> the alert as it was when it opened, from an alerts.jsonl ("opened" lines); {} when the file is
+    missing or unreadable (a damaged line is skipped)."""
+    out: Dict[str, Dict[str, Any]] = {}
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                alert = row.get("alert") if isinstance(row, dict) else None
+                if row.get("event") == "opened" and isinstance(alert, dict) and alert.get("alert_id"):
+                    # the file is append-only across runs (a fresh demo database keeps it): the LAST opening of an
+                    # id belongs to the database being replayed
+                    out[str(alert["alert_id"])] = alert
+    except OSError:
+        return {}
+    return out
+
+
+def _was_lagging(alert: Mapping[str, Any]) -> bool:
+    """Whether a stored alert was lagging when it opened (--only-lagging on a replay): its ``opened_status``; for an
+    alert stored without one, its lag gap at detection was most of the move and it was neither a Cup-moved-first
+    nor an excluded (converging) move."""
+    if alert.get("opened_status"):
+        return alert.get("opened_status") == "lagging"
+    lag = alert.get("lag") if isinstance(alert.get("lag"), Mapping) else {}
+    if alert.get("status") == "moved_first" or lag.get("outcome") in ("cup_first", "excluded"):
+        return False
+    if alert.get("status") == "lagging" or lag.get("capture_4m") is not None:
+        return True
+    move, gap = _num(alert.get("move")), _num(alert.get("lag_gap"))
+    return move is not None and gap is not None and move > 0 and gap > 0.5 * move
 
 
 def cmd_fairvalue(args: argparse.Namespace, out: TextIO, err: TextIO, transport: Any = None) -> int:
@@ -1416,8 +1865,14 @@ def main(argv: Optional[Sequence[str]] = None, out: Optional[TextIO] = None, tra
     configure_logging(args.verbose)
     out = out or sys.stdout
     if args.command == "dashboard":
+        from .moves import MOVES_POLL_MAX_S, MOVES_POLL_MIN_S
         from .web import run_dashboard  # loads settings itself; --demo needs no API key
 
+        poll = _num(getattr(args, "moves_poll", None))
+        if poll is None or not MOVES_POLL_MIN_S <= poll <= MOVES_POLL_MAX_S:  # (run_dashboard checks it too)
+            print(f"error: --moves-poll must be between {MOVES_POLL_MIN_S:g} and {MOVES_POLL_MAX_S:g} seconds",
+                  file=sys.stderr)
+            return EXIT_USAGE
         return run_dashboard(None, args, out=out)
     # The simulation commands load settings themselves: ``paper --demo``, ``fairvalue --demo`` and every
     # ``backtest`` need no API key.
@@ -1427,6 +1882,8 @@ def main(argv: Optional[Sequence[str]] = None, out: Optional[TextIO] = None, tra
         return cmd_backtest(args, out, sys.stderr)
     if args.command == "fairvalue":
         return cmd_fairvalue(args, out, sys.stderr, transport)
+    if args.command == "moves":
+        return cmd_moves(args, out, sys.stderr)
     try:
         overrides: Dict[str, Any] = {}
         if args.data_dir:

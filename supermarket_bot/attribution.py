@@ -807,4 +807,11 @@ class Attributor:
                     # Claude saw the same "news search failed" evidence; the outage cap still applies.
                     result.confidence = round(min(result.confidence, OUTAGE_MAX_CONFIDENCE), 4)
                     result.reversion_odds = round(min(result.reversion_odds, OUTAGE_MAX_REVERSION), 4)
+        # lookahead-3: the verdict exists only once the reads, the news search and the judge have returned, so it is
+        # stamped with the completion time (never earlier than the start); `now` stays the base of the news window.
+        try:
+            done_at = float(self._clock())
+        except Exception:  # pragma: no cover - defensive: a failing clock keeps the start stamp
+            done_at = now
+        result.analyzed_at = max(done_at, float(now))
         return result

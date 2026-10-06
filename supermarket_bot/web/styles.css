@@ -1243,6 +1243,14 @@ th[aria-sort] .sort-btn { color: var(--text); }
   overflow-wrap: break-word;
 }
 .table-warning .icon { margin-top: 0.2em; flex: none; }
+/* the previous run and the backtest put the warning between their heading/verdict and the table */
+.sim-previous .table-warning, .sim-backtest .table-warning { margin: 12px 0 8px; }
+.sim-previous .demo-caveat { margin-top: 10px; }
+/* integration round: what the headline / tables cannot count is said where the number is */
+.sim-untested { margin-top: 4px; }
+.leg-naked { color: var(--text-2); font-style: italic; }
+.positions-table .unvalued { font-style: italic; }
+.cell-sub.legging-sub, .cell-sub.assumed-sub, .cell-sub.basket-naked { white-space: normal; }
 .footnote { margin-top: 8px; }
 
 .sim-details { margin-top: 6px; }
@@ -1266,6 +1274,8 @@ th[aria-sort] .sort-btn { color: var(--text); }
 .fact-lines { padding-left: 1.1em; display: flex; flex-direction: column; gap: 2px; font-weight: 500; }
 .facts .full { grid-column: 1 / -1; }
 .facts dd .fact-lines li { overflow-wrap: anywhere; }
+/* the touch-price figure beside an idea's edge and return at its expected average fill */
+.facts dd .fact-sub { font-weight: 500; font-size: 0.8125rem; color: var(--text-2); }
 .sizing-lines { margin-top: 12px; }
 .chaser-block + .chaser-block { margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--grid); }
 .sim-sub-title { margin-top: 18px; }
@@ -1407,4 +1417,107 @@ th[aria-sort] .sort-btn { color: var(--text); }
   .eq-toggle[aria-pressed="true"] { outline: 2px solid CanvasText; }
   .sim-chart .ref-label { fill: CanvasText; }
   .sim-chart .ref-line { stroke: CanvasText; }
+}
+
+/* ------------------------------------------------------------------ outside moves (docs/OUTSIDE_MOVES.md §19) */
+
+/* the nav badge counts open lagging alerts with a suggestion (its sentence is in the sr-only text beside it) */
+.nav-count-alert { background: var(--accent); color: var(--surface); }
+.moves-note:empty { display: none; }
+.moves-note + .panel { margin-top: 0; }
+.moves-note > * { margin-bottom: 16px; }
+.moves-panel .panel-title { margin-bottom: 10px; }
+
+.venue-list, .venue-facts { list-style: none; display: flex; flex-direction: column; gap: 4px; font-size: 0.9375rem; }
+.venue-facts { margin-top: 8px; color: var(--text-2); font-size: 0.875rem; }
+.venue-list li, .venue-facts li { display: flex; align-items: flex-start; gap: 7px; overflow-wrap: anywhere; }
+.venue-list .icon, .venue-facts .icon { margin-top: 0.25em; flex: none; color: var(--text-2); }
+.venue-ok .icon { color: var(--good-text); }
+.venue-offline .icon, .venue-error .icon { color: var(--critical); }
+.venue-backoff .icon, .venue-partial .icon { color: var(--serious); }
+.moves-venues .inline-error { margin-top: 10px; }
+
+.moves-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px; margin-bottom: 14px; }
+.moves-alerting { display: flex; flex-wrap: wrap; gap: 8px; }
+.moves-controls .btn:disabled { cursor: not-allowed; color: var(--text-2); background: transparent; border-style: dashed; }
+.moves-filter .seg { min-height: 32px; }
+.moves-controls .result-count { margin: 0; }
+.moves-alert-note { flex-basis: 100%; font-size: 0.8125rem; }
+
+.move-cards { gap: 12px; }
+.move-card { border-left: 4px solid var(--border-strong); }
+.move-card.ms-card-lagging { border-left-color: var(--series-2); }
+.move-card.ms-card-already_moved { border-left-color: var(--series-1); }
+.move-card.is-closed { border-left-style: dashed; background: var(--page); box-shadow: none; }
+.move-race { font-size: 1.0625rem; }
+.move-title a { color: var(--text); }
+.move-title a:hover { color: var(--link); }
+.move-status.ms-lagging { background: var(--crowd-wash); border-color: var(--series-2); }
+.move-status.ms-lagging .icon { color: var(--series-2); }
+.move-status.ms-already_moved .icon { color: var(--series-1); }
+.move-meta { margin-top: 4px; font-size: 0.875rem; color: var(--text-2); }
+.move-outside, .move-cup { margin-top: 8px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.move-outside strong, .move-cup strong { font-weight: 650; }
+.move-flags { margin-top: 6px; }
+.move-flags .flag { white-space: normal; }
+.move-reason { margin-top: 8px; overflow-wrap: break-word; }
+.move-lag, .move-captures { margin-top: 8px; font-size: 0.9rem; color: var(--text-2); display: flex; align-items: flex-start; gap: 6px; flex-wrap: wrap; }
+.move-captures { display: block; }
+.move-captures strong { color: var(--text); }
+.move-lag .icon { margin-top: 0.2em; flex: none; }
+.move-lag > span { flex: 1 1 0; min-width: 0; }
+.move-opened-trade { margin-top: 8px; font-size: 0.875rem; }
+
+.trade-box {
+  margin-top: 12px;
+  padding: 10px 14px;
+  border-radius: 8px;
+  border: 1px solid var(--accent);
+  background: var(--accent-wash);
+  overflow-wrap: break-word;
+}
+.trade-box p + p { margin-top: 6px; }
+.trade-action { font-weight: 700; font-variant-numeric: tabular-nums; }
+.trade-edge { font-variant-numeric: tabular-nums; }
+.trade-note { display: flex; align-items: flex-start; gap: 6px; font-size: 0.875rem; color: var(--text-2); }
+.trade-stale { display: flex; align-items: flex-start; gap: 6px; font-size: 0.875rem; font-weight: 600; }
+.trade-stale .icon { margin-top: 0.2em; flex: none; color: var(--serious); }
+.trade-note .icon, .no-trade-box .icon { margin-top: 0.2em; flex: none; }
+.no-trade-box { border-color: var(--border-strong); background: var(--surface-2); }
+.no-trade-box p { display: flex; align-items: flex-start; gap: 6px; }
+
+.lag-badges { margin-bottom: 8px; }
+.small-sample { background: var(--warning-wash); border-color: var(--warning); }
+.small-sample .icon { color: var(--text); }
+.lag-sentence { overflow-wrap: break-word; max-width: 72ch; }
+.moves-summary .sim-table-wrap { max-width: 900px; }
+.lag-table th[scope="row"] { min-width: 13rem; width: 40%; white-space: normal; }
+.lag-table td { white-space: normal; min-width: 14rem; font-variant-numeric: tabular-nums; }
+.lag-table td .cell-sub { display: block; white-space: normal; }
+.lag-excluded { margin-top: 10px; }
+.moves-summary .muted-note + .muted-note { margin-top: 4px; }
+
+.filtered-counts, .suppressed-list { list-style: none; display: flex; flex-direction: column; gap: 4px; font-size: 0.9rem; margin-top: 8px; overflow-wrap: anywhere; }
+.moves-filtered .card-section-title { margin-top: 12px; }
+
+.flag-move { text-decoration: none; color: var(--text); border-color: var(--series-2); background: var(--crowd-wash); }
+.flag-move .icon { color: var(--series-2); }
+.flag-move:hover { text-decoration: underline; }
+.fv-move { margin-top: 4px; }
+.move-fact-link { display: inline-flex; align-items: center; gap: 5px; flex-wrap: wrap; }
+.move-fact-link .icon { color: var(--series-2); }
+
+@media (max-width: 640px) {
+  .moves-controls { align-items: stretch; }
+  .moves-alerting { flex-direction: column; width: 100%; }
+  .moves-controls .btn { white-space: normal; text-align: left; justify-content: flex-start; width: 100%; }
+  .moves-filter { width: 100%; }
+  .moves-filter .seg { flex: 1 1 0; }
+  .lag-table th[scope="row"] { min-width: 8.5rem; }
+  .lag-table td { min-width: 10rem; }
+  .trade-box { padding: 10px 12px; }
+}
+@media (forced-colors: active) {
+  .nav-count-alert { background: Highlight; color: HighlightText; }
+  .move-card, .trade-box { border-color: CanvasText; }
 }
