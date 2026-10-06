@@ -20,6 +20,7 @@ Implemented by the architect; package E owns bug fixes.
 
 from __future__ import annotations
 
+from http.cookiejar import CookieJar, DefaultCookiePolicy
 from typing import Any, Callable, Iterable, Optional
 
 import httpx
@@ -89,8 +90,12 @@ def outside_client(*, label: str, transport: Optional[httpx.BaseTransport] = Non
     """An anonymous, GET-only ``httpx.Client`` for an outside venue (Polymarket, Kalshi). ``transport`` is
     for tests (``httpx.MockTransport``); without it httpx uses its default transport and the environment's
     proxy settings."""
+    # Venues (Polymarket's CDN in particular) answer with Set-Cookie. A jar whose policy accepts no
+    # domain never stores them, so later requests stay anonymous instead of tripping the guard.
+    no_cookies = CookieJar(policy=DefaultCookiePolicy(allowed_domains=[]))
     return httpx.Client(
         base_url=base_url,
+        cookies=no_cookies,
         timeout=timeout,
         follow_redirects=False,
         transport=transport,

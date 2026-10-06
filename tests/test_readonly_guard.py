@@ -63,3 +63,23 @@ def test_outside_client_is_anonymous_and_get_only() -> None:
         assert not c.follow_redirects
     assert len(seen) == 1 and "authorization" not in seen[0].headers and "cookie" not in seen[0].headers
     assert "read-only" in seen[0].headers["user-agent"]
+
+
+def test_outside_client_never_stores_or_sends_venue_cookies():
+    """Polymarket's CDN sets a cookie on the first answer; the next request must stay anonymous
+    (it used to carry the cookie and trip the guard, crashing `fairvalue`)."""
+    import httpx
+
+    from supermarket_bot.readonly import outside_client
+
+    seen = []
+
+    def handler(request):
+        seen.append(request.headers.get("cookie"))
+        return httpx.Response(200, json=[], headers={"Set-Cookie": "__cf_bm=abc; Path=/; Domain=.polymarket.com"})
+
+    client = outside_client(label="Polymarket", transport=httpx.MockTransport(handler),
+                            base_url="https://gamma-api.polymarket.com")
+    client.get("/markets")
+    client.get("/markets")
+    assert seen == [None, None]
